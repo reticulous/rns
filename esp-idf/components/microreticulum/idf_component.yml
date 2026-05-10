@@ -1,0 +1,37 @@
+## microReticulum vendored fork — see components/microreticulum/README.md
+##
+## Pinned at upstream commit 5642ae7fe17de6a8be9dc4891e95cf8a47c6ebe9
+## ("Restored fallback heap-based path storage", 2026-05-09 — one commit
+## past tag 0.3.1). The heap-store fallback is essential because we do
+## NOT define RNS_USE_FS / RNS_PERSIST_PATHS — see docs/component-plan.md §2.
+##
+## Hard deps required by the swap list in plan §3:
+##   - mbedTLS:        AES-CBC, HMAC, HKDF, SHA-256/512, RNG. Already linked
+##                     via diptych-core for TLS + WG. Pulled transitively
+##                     via REQUIRES mbedtls in CMakeLists.txt — declared
+##                     here for documentation.
+##   - esp_wireguard:  software Curve25519 (X25519 ECDH). Currently vendored
+##                     under diptych-core/src/esp_wireguard with PRIV_INCLUDE_DIRS,
+##                     so we can't pull in `x25519` without diptych-core
+##                     exporting the symbol. Open issue — see README.
+##
+## NOTE on Ed25519: esp_wireguard ships ONLY X25519, not Ed25519. The plan §3
+## description ("esp_wireguard's Curve25519 (X25519 ECDH, Ed25519 sign/verify)")
+## conflates the two. Ed25519 sign/verify needs a separate source — open
+## design question, see README.
+
+description: "Reticulum Network Stack (microReticulum) — vendored fork for diptych"
+version: "0.0.1-dev"
+license: "Apache-2.0"
+url: "https://github.com/attermann/microReticulum"
+targets:
+  - esp32s3
+
+dependencies:
+  idf:
+    version: ">=5.5"
+  diptych/diptych-core:
+    version: "^0.1.0"
+    # manifest sits in reticulous/components/microreticulum/; ../../../ = parent
+    # project root containing diptych/. Mirrors the pattern in main/idf_component.yml.
+    path: "../../../diptych/diptych-core"
