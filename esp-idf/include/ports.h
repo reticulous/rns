@@ -23,17 +23,24 @@ constexpr uint16_t RNSD_PORT_MAP = 2;
  *  import/export. */
 constexpr uint16_t RNSD_PORT_CTL = 3;
 
-/** Destination registration for protocol consumers (lxmf, etc.):
- *  connect with destination hash; thereafter receives inbound packets
- *  for that dest, sends outbound from it. */
-constexpr uint16_t RNSD_PORT_DEST = 4;
+/** Raw-packet API for protocol consumers (rnprobe today, lxmf later).
+ *  Connect payload (rnsd_packet_connect_t) specifies the target dest hash,
+ *  aspect, dest type, and storage key for the sender identity. Thereafter
+ *  each ITS packet app→rnsd is the *payload* to wrap in an RNS Packet (rnsd
+ *  constructs / encrypts / sends via Transport — apps never touch mR
+ *  internals). Each ITS packet rnsd→app is a 6-byte result for the most
+ *  recent send: status (0=delivery, 1=timeout) + rtt_ms (big-endian u32)
+ *  + hops_at_send (u8). */
+constexpr uint16_t RNSD_PORT_PACKET = 4;
 
 /** Datagram send. Aux for small (≤ITS aux cap), stream for larger
  *  payloads. */
 constexpr uint16_t RNSD_PORT_DGRAM = 5;
 
-/** Generic Link socket — opens an RNS Link, ITS bytes flow over
- *  Channel/Buffer. Requires Link upstream (deferred). */
+/** Generic Reticulum Link → ITS connection. Connect payload identifies the
+ *  remote destination; rnsd establishes a Link and bridges in/out packets
+ *  to/from the ITS connection. Deferred — needs mR Link support, which
+ *  isn't there yet. */
 constexpr uint16_t RNSD_PORT_LINK = 10;
 
 /** RNS interface modes — mirrors Type::Interface::modes in microreticulum. */
@@ -59,6 +66,19 @@ typedef struct {
     uint8_t  rpt;           /* 1 if iface repeats announces */
     uint8_t  reserved[3];
 } rnsd_register_t;
+
+/** Connect payload for RNSD_PORT_PACKET. Identifies the target destination,
+ *  aspect, dest type, and the storage key holding the sender identity's
+ *  private key. Fixed 96 B (== ITS_MAX_MSG_DATA), so it always fits in the
+ *  itsConnect aux slot exactly once. */
+typedef struct {
+    uint8_t dest_hash[16];       /* RNS::Type::Reticulum::DESTINATION_LENGTH */
+    char    aspect[32];          /* dotted name, e.g. "lxmf.delivery"; NUL-terminated */
+    char    identity_key[40];    /* storage key (e.g. "secrets.rnsd.identity"); NUL-terminated; empty → default */
+    uint8_t dest_type;           /* 0=SINGLE, 1=PLAIN, 2=GROUP */
+    uint8_t reserved[7];         /* pad to 96 */
+} rnsd_packet_connect_t;
+static_assert(sizeof(rnsd_packet_connect_t) == 96, "rnsd_packet_connect_t must fit ITS_MAX_MSG_DATA");
 
 /* ---- lxmf task ports ---- */
 
