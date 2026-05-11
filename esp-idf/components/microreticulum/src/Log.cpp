@@ -89,10 +89,12 @@ void RNS::doLog(LogLevel level, const char* msg) {
 		break;
 	case LOG_VERBOSE:
 	case LOG_MEM:
+	case LOG_TRACE:
+		/* TRACE is per-packet/per-call flow chatter — verbose, not debug,
+		 * so default builds aren't drowned in it. */
 		ESP_LOGV(tag, "%s", msg);
 		break;
 	case LOG_DEBUG:
-	case LOG_TRACE:
 	default:
 		ESP_LOGD(tag, "%s", msg);
 		break;
