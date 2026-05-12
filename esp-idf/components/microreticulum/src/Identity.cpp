@@ -402,7 +402,9 @@ Recall last heard app_data for a destination hash.
 					break;
 				}
 			}
-			DEBUGF("Removed %d path(s) from known destinations", count);
+			/* Diptych: announce-driven cleanup → demote under only_local. */
+			if (Transport::demote_dbg()) VERBOSEF("Removed %d path(s) from known destinations", count);
+			else                         DEBUGF   ("Removed %d path(s) from known destinations", count);
 		}
 		catch (const std::bad_alloc& e) {
 			ERROR("cull_known_destinations: bad_alloc - OUT OF MEMORY building sort index, falling back to single erase");

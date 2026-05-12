@@ -34,6 +34,19 @@ using namespace RNS::Type::Transport;
 using namespace RNS::Utilities;
 using namespace RNS::Persistence;
 
+/* Diptych: announce/path-request DEBUGFs route through this — when
+ * Transport::_demote_dbg is set (mirrors `s.rnsd.debug.only_local`),
+ * they fire at VERBOSE instead of DEBUG. Used at:
+ *   - "Destination X is now N hops away ..."         (every announce)
+ *   - "Path request for destination X ..."           (every received PR)
+ *   - "Ignoring path request for destination X ..."  (no-path PR drops)
+ * Logs about local-destination DATA hits and answered path requests
+ * keep their normal level (DEBUGF/INFOF) so they're never suppressed. */
+#define DBGF_DEMOTE(...) \
+	do { if (Transport::demote_dbg()) VERBOSEF(__VA_ARGS__); else DEBUGF(__VA_ARGS__); } while (0)
+#define DBG_DEMOTE(msg) \
+	do { if (Transport::demote_dbg()) VERBOSE(msg); else DEBUG(msg); } while (0)
+
 #ifndef RNS_PATH_TABLE_MAX
 #define RNS_PATH_TABLE_MAX 100
 #endif
@@ -92,6 +105,7 @@ using namespace RNS::Persistence;
 /*static*/ uint16_t Transport::_LOCAL_CLIENT_CACHE_MAXSIZE = 512;
 
 /*static*/ double Transport::_start_time				= 0.0;
+/*static*/ bool Transport::_demote_dbg					= false;
 /*static*/ bool Transport::_jobs_locked					= false;
 /*static*/ bool Transport::_jobs_running				= false;
 /*static*/ float Transport::_job_interval				= 0.250;
@@ -622,7 +636,7 @@ DestinationEntry empty_destination_entry;
 
 				// CBA TODO perform path expiry in microStore!!!
 				// Cull the path table
-				DEBUG("Culling path table...");
+				if (_demote_dbg) VERBOSE("Culling path table..."); else DEBUG("Culling path table...");
 				try {
 					std::vector<Bytes> stale_paths;
 					stale_paths.reserve(_path_table.size());
@@ -641,11 +655,11 @@ DestinationEntry empty_destination_entry;
 
 						if (OS::time() > destination_expiry) {
 							stale_paths.push_back(destination_hash);
-							DEBUGF("Path to %s timed out and was removed", destination_hash.toHex().c_str());
+							DBGF_DEMOTE("Path to %s timed out and was removed", destination_hash.toHex().c_str());
 						}
 						else if (_interfaces.count(attached_interface.get_hash()) == 0) {
 							stale_paths.push_back(destination_hash);
-							DEBUGF("Path to %s was removed since the attached interface no longer exists", destination_hash.toHex().c_str());
+							DBGF_DEMOTE("Path to %s was removed since the attached interface no longer exists", destination_hash.toHex().c_str());
 						}
 					}
 					remove_paths(stale_paths);
@@ -1243,7 +1257,7 @@ DestinationEntry empty_destination_entry;
 				return true;
 			}
 			else {
-				DEBUG("Dropped invalid announce packet");
+				DBG_DEMOTE("Dropped invalid announce packet");
 				return false;
 			}
 		}
@@ -1280,7 +1294,7 @@ DestinationEntry empty_destination_entry;
 	if (packet.destination_type() == Type::Destination::PLAIN) {
 		if (packet.packet_type() != Type::Packet::ANNOUNCE) {
 			if (packet.hops() > 1) {
-				DEBUGF("Dropped PLAIN packet %s with %u hops", packet.packet_hash().toHex().c_str(), packet.hops());
+				DBGF_DEMOTE("Dropped PLAIN packet %s with %u hops", packet.packet_hash().toHex().c_str(), packet.hops());
 				return false;
 			}
 			else {
@@ -1288,7 +1302,7 @@ DestinationEntry empty_destination_entry;
 			}
 		}
 		else {
-			DEBUG("Dropped invalid PLAIN announce packet");
+			DBG_DEMOTE("Dropped invalid PLAIN announce packet");
 			return false;
 		}
 	}
@@ -1296,7 +1310,7 @@ DestinationEntry empty_destination_entry;
 	if (packet.destination_type() == Type::Destination::GROUP) {
 		if (packet.packet_type() != Type::Packet::ANNOUNCE) {
 			if (packet.hops() > 1) {
-				DEBUGF("Dropped GRPUP packet %s with %u hops", packet.packet_hash().toHex().c_str(), packet.hops());
+				DBGF_DEMOTE("Dropped GRPUP packet %s with %u hops", packet.packet_hash().toHex().c_str(), packet.hops());
 				return false;
 			}
 			else {
@@ -1304,7 +1318,7 @@ DestinationEntry empty_destination_entry;
 			}
 		}
 		else {
-			DEBUG("Dropped invalid GROUP announce packet");
+			DBG_DEMOTE("Dropped invalid GROUP announce packet");
 			return false;
 		}
 	}
@@ -1321,7 +1335,7 @@ DestinationEntry empty_destination_entry;
 				return true;
 			}
 			else {
-				DEBUG("Dropped invalid announce packet");
+				DBG_DEMOTE("Dropped invalid announce packet");
 				return false;
 			}
 		}
@@ -1845,10 +1859,10 @@ DestinationEntry empty_destination_entry;
 
 						bool announce_erased = false;
 						if ((packet.hops() - 1) == announce_entry._hops) {
-							DEBUGF("Heard a local rebroadcast of announce for %s", packet.destination_hash().toHex().c_str());
+							DBGF_DEMOTE("Heard a local rebroadcast of announce for %s", packet.destination_hash().toHex().c_str());
 							announce_entry._local_rebroadcasts += 1;
 							if (announce_entry._local_rebroadcasts >= LOCAL_REBROADCASTS_MAX) {
-								DEBUGF("Max local rebroadcasts of announce for %s reached, dropping announce from our table", packet.destination_hash().toHex().c_str());
+								DBGF_DEMOTE("Max local rebroadcasts of announce for %s reached, dropping announce from our table", packet.destination_hash().toHex().c_str());
 								_announce_table.erase(packet.destination_hash());
 								announce_erased = true;
 							}
@@ -1858,7 +1872,7 @@ DestinationEntry empty_destination_entry;
 						if (!announce_erased && (packet.hops() - 1) == (announce_entry._hops + 1) && announce_entry._retries > 0) {
 							double now = OS::time();
 							if (now < announce_entry._timestamp) {
-								DEBUGF("Rebroadcasted announce for %s has been passed on to another node, no further tries needed", packet.destination_hash().toHex().c_str());
+								DBGF_DEMOTE("Rebroadcasted announce for %s has been passed on to another node, no further tries needed", packet.destination_hash().toHex().c_str());
 								_announce_table.erase(packet.destination_hash());
 								announce_erased = true;
 							}
@@ -1936,7 +1950,7 @@ DestinationEntry empty_destination_entry;
 								if (random_blobs.find(random_blob) == random_blobs.end()) {
 									// TODO: Check that this ^ approach actually
 									// works under all circumstances
-									DEBUGF("Replacing destination table entry for %s with new announce due to expired path", packet.destination_hash().toHex().c_str());
+									DBGF_DEMOTE("Replacing destination table entry for %s with new announce due to expired path", packet.destination_hash().toHex().c_str());
 									should_add = true;
 								}
 								else {
@@ -1946,7 +1960,7 @@ DestinationEntry empty_destination_entry;
 							else {
 								if (announce_emitted > path_announce_emitted) {
 									if (random_blobs.find(random_blob) == random_blobs.end()) {
-										DEBUGF("Replacing destination table entry for %s with new announce, since it was more recently emitted", packet.destination_hash().toHex().c_str());
+										DBGF_DEMOTE("Replacing destination table entry for %s with new announce, since it was more recently emitted", packet.destination_hash().toHex().c_str());
 										should_add = true;
 									}
 									else {
@@ -2028,7 +2042,7 @@ DestinationEntry empty_destination_entry;
 							// Insert announce into announce table for retransmission
 
 							if (rate_blocked) {
-								DEBUGF("Blocking rebroadcast of announce from %s due to excessive announce rate", packet.destination_hash().toHex().c_str());
+								DBGF_DEMOTE("Blocking rebroadcast of announce from %s due to excessive announce rate", packet.destination_hash().toHex().c_str());
 							}
 							else {
 								if (Transport::from_local_client(packet)) {
@@ -2150,7 +2164,7 @@ DestinationEntry empty_destination_entry;
 							PathRequestEntry& pr_entry = (*iter).second;
 							attached_interface = pr_entry._requesting_interface;
 
-							DEBUGF("Got matching announce, answering waiting discovery path request for %s on %s", packet.destination_hash().toHex().c_str(), attached_interface.toString().c_str());
+							DBGF_DEMOTE("Got matching announce, answering waiting discovery path request for %s on %s", packet.destination_hash().toHex().c_str(), attached_interface.toString().c_str());
 							Identity announce_identity(Identity::recall(packet.destination_hash()));
 							//Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, "unknown", "unknown");
 							//announce_destination.hash(packet.destination_hash());
@@ -2247,7 +2261,7 @@ DestinationEntry empty_destination_entry;
 							ERRORF("inbound: exception storing destination entry: %s", e.what());
 						}
 
-						DEBUGF("Destination %s is now %d hops away via %s on %s", packet.destination_hash().toHex().c_str(), announce_hops, received_from.toHex().c_str(), packet.receiving_interface().toString().c_str());
+						DBGF_DEMOTE("Destination %s is now %d hops away via %s on %s", packet.destination_hash().toHex().c_str(), announce_hops, received_from.toHex().c_str(), packet.receiving_interface().toString().c_str());
 						//TRACEF("Transport::inbound: Destination %s has data: %s", packet.destination_hash().toHex().c_str(), packet.data().toHex().c_str());
 						//TRACEF("Transport::inbound: Destination %s has text: %s", packet.destination_hash().toHex().c_str(), packet.data().toString().c_str());
 
@@ -2261,7 +2275,7 @@ DestinationEntry empty_destination_entry;
 							paths[packet.destination_hash] = destination_table_entry;
 							expires = OS::time() + Transport::DESTINATION_TIMEOUT;
 							tunnel_entry[3] = expires;
-							DEBUGF("Path to %s associated with tunnel %s", packet.destination_hash().toHex().c_str(), packet.receiving_interface().tunnel_id().toHex().c_str());
+							DBGF_DEMOTE("Path to %s associated with tunnel %s", packet.destination_hash().toHex().c_str(), packet.receiving_interface().tunnel_id().toHex().c_str());
 						}
 */
 
@@ -2350,10 +2364,37 @@ DestinationEntry empty_destination_entry;
 			else {
 				// Data is basic (not destined for a link)
 				auto iter = _destinations.find(packet.destination_hash());
+				if (iter == _destinations.end()) {
+					/* Diptych diagnostic: log every DATA packet that reaches
+					 * us but doesn't match a registered local destination.
+					 * Transit traffic that we'd forward has already been
+					 * handled by the transport block above and would not
+					 * fall through here unless we were not the designated
+					 * next-hop. Useful for diagnosing "echo never replies"
+					 * by distinguishing "packet never arrived" from "packet
+					 * arrived for a hash we don't own". */
+					INFOF("DATA arrived for dest %s (hops=%u, %zuB) — no local destination",
+					      packet.destination_hash().toHex().c_str(),
+					      packet.hops(), packet.data().size());
+				}
 				if (iter != _destinations.end()) {
-					// Data is for a local destination
-					DEBUGF("Packet destination %s found, destination is local", packet.destination_hash().toHex().c_str());
+					/* Diptych: INFOF for app destinations (LXMF, mailbox,
+					 * etc.) — this is the "a DATA packet for us arrived"
+					 * signal. For mR's own control destinations (path.request,
+					 * tunnel.synthesize) the hit fires on every incoming
+					 * path request and is just path-request scaffolding,
+					 * so route it through DBGF_DEMOTE. */
+					if (_control_hashes.find(packet.destination_hash()) != _control_hashes.end()) {
+						DBGF_DEMOTE("Packet destination %s found, destination is local (control)", packet.destination_hash().toHex().c_str());
+					} else {
+						INFOF("Packet destination %s found, destination is local", packet.destination_hash().toHex().c_str());
+					}
 					auto& destination = (*iter).second;
+					if (destination.type() != packet.destination_type()) {
+						INFOF("DATA for dest %s: type mismatch (got=%d want=%d)",
+						      packet.destination_hash().toHex().c_str(),
+						      (int)packet.destination_type(), (int)destination.type());
+					}
 					if (destination.type() == packet.destination_type()) {
 						TRACEF("Transport::inbound: Packet destination type %d matched, processing", packet.destination_type());
 						packet.destination(destination);
@@ -3258,7 +3299,7 @@ will announce it.
 		interface_str = " on " + attached_interface.toString();
 	}
 
-	DEBUGF("Path request for destination %s%s", destination_hash.toHex().c_str(), interface_str.c_str());
+	DBGF_DEMOTE("Path request for destination %s%s", destination_hash.toHex().c_str(), interface_str.c_str());
 
 	bool destination_exists_on_local_client = false;
 	if (_local_client_interfaces.size() > 0) {
@@ -3288,7 +3329,7 @@ will announce it.
 	if (destinations_iter != _destinations.end()) {
 		auto& local_destination = (*destinations_iter).second;
 		local_destination.announce({Bytes::NONE}, true, attached_interface, tag);
-		DEBUGF("Answering path request for destination %s%s, destination is local to this system", destination_hash.toHex().c_str(), interface_str.c_str());
+		INFOF("Answering path request for destination %s%s, destination is local to this system", destination_hash.toHex().c_str(), interface_str.c_str());
 	}
     //p elif (RNS.Reticulum.transport_enabled() or is_from_local_client) and (destination_hash in Transport.destination_table):
 	else if ((Reticulum::transport_enabled() || is_from_local_client) && destination_entry) {
@@ -3314,7 +3355,7 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 				DEBUGF("Not answering path request for destination %s%s, since next hop is the requestor", destination_hash.toHex().c_str(), interface_str.c_str());
 			}
 			else {
-				DEBUGF("Answering path request for destination %s%s, path is known", destination_hash.toHex().c_str(), interface_str.c_str());
+				INFOF("Answering path request for destination %s%s, path is known", destination_hash.toHex().c_str(), interface_str.c_str());
 
 				double now = OS::time();
 				uint8_t retries = Type::Transport::PATHFINDER_R;
@@ -3462,7 +3503,7 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 		}
 	}
 	else {
-		DEBUGF("Ignoring path request for destination %s%s, no path known", destination_hash.toHex().c_str(), interface_str.c_str());
+		DBGF_DEMOTE("Ignoring path request for destination %s%s, no path known", destination_hash.toHex().c_str(), interface_str.c_str());
 	}
 }
 
@@ -4192,7 +4233,7 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 					break;
 				}
 			}
-			DEBUGF("Removed %d path(s) from path table", count);
+			DBGF_DEMOTE("Removed %d path(s) from path table", count);
 		}
 		catch (const std::bad_alloc& e) {
 			ERROR("cull_path_table: bad_alloc - out of memory building sort index, falling back to single erase");
@@ -4240,7 +4281,7 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 					break;
 				}
 			}
-			DEBUGF("Removed %d path(s) from path table", count);
+			DBGF_DEMOTE("Removed %d path(s) from path table", count);
 		}
 		catch (const std::bad_alloc& e) {
 			ERROR("cull_announce_table: bad_alloc - out of memory building sort index, falling back to single erase");

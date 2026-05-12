@@ -371,12 +371,22 @@ namespace RNS {
 		// CBA TEST
 		static inline void identity(Identity& identity) { _identity = identity; }
 
+		/* Diptych: when true, the high-volume announce/path-request
+		 * DEBUGFs in Transport.cpp are emitted at VERBOSE instead of
+		 * DEBUG, so that running rnsd at debug level surfaces only
+		 * traffic affecting this node directly. Toggled by rnsd's
+		 * `s.rnsd.debug.only_local` subscription. */
+		static inline bool demote_dbg() { return _demote_dbg; }
+		static inline void demote_dbg(bool v) { _demote_dbg = v; }
+
 		inline static const PathTable& get_path_table() { return _path_table; }
 		inline static NewPathTable& get_new_path_table() { return _new_path_table; }
 		inline static const RateTable& get_announce_rate_table() { return _announce_rate_table; }
 		inline static const LinkTable& get_link_table() { return _link_table; }
 
 	private:
+		static bool _demote_dbg;
+
 		// CBA MUST use references to interfaces here in order for virtul overrides for send/receive to work
 		// map is sorted, can use find
 		static InterfaceTable _interfaces;			// All active interfaces
