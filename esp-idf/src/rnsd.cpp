@@ -65,6 +65,15 @@
 
 static const char* TAG = "rnsd";
 
+static std::string formatAnnounceAppData(const RNS::Bytes& app_data);
+
+/* Cached `s.rnsd.debug.only_local` — when true, the dbg() lines that
+ * describe announces (everyone's traffic) are demoted to verb() so
+ * they only show at log level verbose. dbg-level then surfaces just
+ * the traffic that affects this node directly. Live-mirrored from
+ * storage via subscription, so writes take effect immediately. */
+static bool s_dbg_only_local = false;
+
 #define RNSD_VERSION 1
 
 /* Up to N concurrent registered transport ifaces. Each TCP peer is its
@@ -133,13 +142,13 @@ static TickType_t s_lastPublishTick = 0;
 
 /* ─────────────── RNSD_PORT_DEST state ───────────────
  *
- * Per-connection state for the bidirectional mailbox API. Apps connect
- * with a rnsd_mailbox_connect_t naming an aspect and the storage key of
- * the listener's private identity. rnsd:
+ * Per-connection state for the bidirectional destination API. Apps
+ * open via rnsdDestOpen() (rnsd.h), which sends an rnsd_dest_connect_t
+ * — defined privately here since no consumer constructs one. rnsd:
  *   - loads the identity, registers a SINGLE-IN Destination on that
  *     aspect (mR's Destination ctor auto-registers with Transport),
  *   - sets a packet callback that fans inbound plaintexts to the
- *     matching mailbox handle as 0x04 IN_PACKET frames,
+ *     matching handle as 0x04 IN_PACKET frames,
  *   - parses 0x01 OUT_PACKET frames; if a path is known sends
  *     immediately and emits 0x02 OUT_RESULT status=sent; if no path,
  *     emits 0x05 OUT_STATUS REQUESTING_PATH, requests the path, and
@@ -148,6 +157,17 @@ static TickType_t s_lastPublishTick = 0;
  * One pending send slot per conn keeps the state machine bounded for
  * Phase 4a. The lxmf task throttles its own OUT_PACKET cadence via the
  * stage-driven lifecycle. */
+
+/* Connect payload for RNSD_PORT_DEST — rnsd-private. Consumers go
+ * through rnsdDestOpen(), which fills this from typed args. Fixed size
+ * (≤ ITS_MAX_MSG_DATA) so it fits in the itsConnect aux slot. */
+typedef struct {
+    char    aspect[32];          /* "lxmf.delivery", "rnprobe", … */
+    char    identity_key[40];    /* storage path of 128-hex private key; empty → default */
+    uint8_t dest_type;           /* 0=SINGLE, 1=PLAIN, 2=GROUP */
+} rnsd_dest_connect_t;
+static_assert(sizeof(rnsd_dest_connect_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_dest_connect_t must fit ITS_MAX_MSG_DATA");
 
 #define RNSD_MAX_MAILBOX_CONNS    4
 
@@ -167,7 +187,7 @@ struct mailbox_pending_t {
 struct mailbox_conn_t {
     bool                       used;
     int                        handle;
-    rnsd_mailbox_connect_t     req;
+    rnsd_dest_connect_t     req;
 
     /* Listener identity + IN destination — built in onMailboxConnect.
      * Empty (Type::NONE) on failure; that conn drops all OUT/IN traffic
@@ -284,6 +304,13 @@ static int s_iface_event_seq = 0;
  * No packet callback yet — inbound probes silently land at the
  * destination and get dropped. Probe-reply is a separate change. */
 static RNS::Destination s_management_dest{RNS::Type::NONE};
+/* Probe responder. When `s.rnsd.respond_to_probes != 0` we host an
+ * IN/SINGLE destination at aspect `rnstransport.probe` with
+ * accepts_links(false) + PROVE_ALL — same shape as upstream rnsd. mR
+ * auto-proves every DATA packet that reaches the destination, so
+ * `rnprobe` from a peer round-trips at the protocol level (no
+ * application code involved). */
+static RNS::Destination s_probe_dest{RNS::Type::NONE};
 static TickType_t       s_rnsd_announce_due_tick  = 0;
 static TickType_t       s_rnsd_last_announce_tick = 0;
 #define RNSD_ANNOUNCE_DEBOUNCE_MS 10000
@@ -296,9 +323,10 @@ static void publishIfaceUp(const iface_t& i)
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.bitrate", i.info.name);     storageSet(key, (int)i.info.bitrate);
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.mode", i.info.name);        storageSet(key, mode_name(i.info.mode));
     storageSet("rnsd.iface_event_seq", ++s_iface_event_seq);
-    /* If we're hosting a management destination, (re)arm the announce
-     * debounce. Same 10 s rate-limit shape as lxmf's. */
-    if (s_management_dest) {
+    /* If we're hosting any rnsd-side destination (management and/or
+     * probe), (re)arm the announce debounce. Same 10 s rate-limit
+     * shape as lxmf's. */
+    if (s_management_dest || s_probe_dest) {
         s_rnsd_announce_due_tick = xTaskGetTickCount() +
             pdMS_TO_TICKS(RNSD_ANNOUNCE_DEBOUNCE_MS);
     }
@@ -485,6 +513,8 @@ static int mailboxTrySend(mailbox_conn_t& c, uint16_t send_id,
     RNS::Bytes dh(bytes, 16);
 
     if (!RNS::Transport::has_path(dh)) {
+        info("mailbox: send_id=%u requesting path for %s (no entry)",
+             (unsigned)send_id, dh.toHex().c_str());
         try { RNS::Transport::request_path(dh); }
         catch (const std::exception& e) { warn("mailbox: request_path threw: %s", e.what()); }
         mailboxSendOutStatusBare(c, send_id, RNSD_DEST_AUX_REQUESTING_PATH);
@@ -493,6 +523,8 @@ static int mailboxTrySend(mailbox_conn_t& c, uint16_t send_id,
 
     RNS::Identity target = RNS::Identity::recall(dh);
     if (!target) {
+        info("mailbox: send_id=%u requesting path for %s (have path, no identity)",
+             (unsigned)send_id, dh.toHex().c_str());
         try { RNS::Transport::request_path(dh); }
         catch (const std::exception& e) { warn("mailbox: request_path threw: %s", e.what()); }
         mailboxSendOutStatusBare(c, send_id, RNSD_DEST_AUX_REQUESTING_PATH);
@@ -516,9 +548,14 @@ static int mailboxTrySend(mailbox_conn_t& c, uint16_t send_id,
     try {
         RNS::Destination out_dest(target, RNS::Type::Destination::OUT, dtype,
                                   app_name.c_str(), aspects.c_str());
-        /* For LXMF the payload is the full LXM wire (dest||src||sig||packed).
-         * The outer RNS layer encrypts to the recipient's X25519 key. */
-        RNS::Bytes payload(bytes, n);
+        /* Opportunistic LXMF wire on the network strips the leading 16-byte
+         * destination hash; the recipient prepends `packet.destination.hash`
+         * back before parsing the LXM wire. See LXMF reference
+         * LXMessage.__packed_packet() / LXMRouter.delivery_packet(). The
+         * incoming `bytes` here is the full wire `dest || src || sig ||
+         * packed` (n >= 16 already gated above); send `bytes + 16` as the
+         * RNS Packet payload. */
+        RNS::Bytes payload(bytes + 16, n - 16);
         RNS::Packet pkt(out_dest, payload);
         uint8_t hops = (uint8_t)RNS::Transport::hops_to(dh);
         RNS::PacketReceipt receipt = pkt.send();
@@ -531,6 +568,8 @@ static int mailboxTrySend(mailbox_conn_t& c, uint16_t send_id,
         /* Opportunistic: there is no native ack, so we promote "sent" the
          * moment Transport accepted the packet. See lxmf.md §15. */
         mailboxSendOutResult(c, send_id, RNSD_DEST_STATUS_SENT, 0, hops);
+        info("mailbox: send_id=%u sent to %s (hops=%u, %zuB payload)",
+             (unsigned)send_id, dh.toHex().c_str(), (unsigned)hops, n);
         return 1;
     } catch (const std::exception& e) {
         err("mailbox: send threw: %s", e.what());
@@ -546,25 +585,34 @@ static void onMailboxInbound(const RNS::Bytes& plaintext, const RNS::Packet& pac
 {
     mailbox_conn_t* c = mailboxFindByDestHash(packet.destination().hash());
     if (!c) {
-        verb("mailbox inbound: no conn for dest %s", packet.destination().hash().toHex().c_str());
+        info("mailbox inbound: no conn for dest %s (%zuB plaintext)",
+             packet.destination().hash().toHex().c_str(), plaintext.size());
         return;
     }
-    if (plaintext.size() + 1 > RNSD_MAILBOX_INBOUND_MAX) {
+    /* Opportunistic LXMF wire on the network omits the leading 16-byte
+     * destination hash; reconstruct the full LXM wire by prepending our
+     * own destination hash (the IN destination that received this packet)
+     * before handing off to the consumer. Symmetric with the strip done
+     * in mailboxTrySend. See LXMF LXMRouter.delivery_packet(). */
+    if (plaintext.size() + 1 + 16 > RNSD_MAILBOX_INBOUND_MAX) {
         warn("mailbox inbound: oversize plaintext %zu B (dropping)", plaintext.size());
         return;
     }
+    info("mailbox inbound: %zuB for dest %s → handle=%d",
+         plaintext.size(), packet.destination().hash().toHex().c_str(), c->handle);
     uint8_t f[RNSD_MAILBOX_INBOUND_MAX];
     f[0] = RNSD_DEST_IN_PACKET;
-    memcpy(f + 1, plaintext.data(), plaintext.size());
-    if (itsSend(c->handle, f, 1 + plaintext.size(), pdMS_TO_TICKS(100)) == 0)
+    memcpy(f + 1,      packet.destination().hash().data(), 16);
+    memcpy(f + 1 + 16, plaintext.data(), plaintext.size());
+    if (itsSend(c->handle, f, 1 + 16 + plaintext.size(), pdMS_TO_TICKS(100)) == 0)
         warn("mailbox inbound: ITS send dropped (%zu B)", plaintext.size());
 }
 
 static int onMailboxConnect(int handle, const void* data, size_t len)
 {
-    if (len != sizeof(rnsd_mailbox_connect_t)) {
+    if (len != sizeof(rnsd_dest_connect_t)) {
         err("mailbox connect: bad payload len %zu (want %zu)",
-            len, sizeof(rnsd_mailbox_connect_t));
+            len, sizeof(rnsd_dest_connect_t));
         return -1;
     }
     mailbox_conn_t* slot = mailboxAlloc();
@@ -572,7 +620,7 @@ static int onMailboxConnect(int handle, const void* data, size_t len)
 
     slot->used   = true;
     slot->handle = handle;
-    memcpy(&slot->req, data, sizeof(rnsd_mailbox_connect_t));
+    memcpy(&slot->req, data, sizeof(rnsd_dest_connect_t));
     slot->req.aspect[sizeof(slot->req.aspect) - 1] = '\0';
     slot->req.identity_key[sizeof(slot->req.identity_key) - 1] = '\0';
     slot->listener_identity = RNS::Identity(RNS::Type::NONE);
@@ -708,8 +756,10 @@ static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
             if (n > 1) app_data.assign(buf + 1, n - 1);
             try {
                 c->listener_dest.announce(app_data, /*path_response=*/false);
-                info("mailbox: announced %s (%zu B app_data)",
-                     c->listener_hash.toHex().c_str(), app_data.size());
+                info("announced %s aspect=%s app_data %s",
+                     c->listener_hash.toHex().c_str(),
+                     c->req.aspect,
+                     formatAnnounceAppData(app_data).c_str());
             } catch (const std::exception& e) {
                 err("mailbox: announce threw: %s", e.what());
             }
@@ -741,6 +791,9 @@ static void mailboxTickPending(void)
         }
 
         if (now - c.pending.last_request_path_at >= RNSD_MAILBOX_PATH_RETRY_INTERVAL_S) {
+            info("mailbox: send_id=%u retrying path request for %s (attempt %u)",
+                 (unsigned)c.pending.send_id, dh.toHex().c_str(),
+                 (unsigned)(c.pending.attempts + 1));
             try { RNS::Transport::request_path(dh); }
             catch (const std::exception& e) { warn("mailbox: request_path threw: %s", e.what()); }
             c.pending.attempts++;
@@ -915,6 +968,61 @@ static std::string appDataMsgPack(const RNS::Bytes& app_data) {
     return appDataMsgPackAt(app_data, 0);
 }
 
+/* Render an announce app_data blob into a human-readable suffix for a
+ * single log line. Recognises (in order):
+ *   - empty                                      → "(0B)"
+ *   - pure msgpack                               → "(NB) mp=…"
+ *   - 32B ratchet || msgpack                     → "(NB) ratchet=… mp=…"
+ *   - 32B ratchet || UTF-8 text                  → "(NB) ratchet=… name=\"…\""
+ *   - version byte || msgpack || trailing ratchet→ "(NB) v=XX mp=… ratchet=…"
+ *   - otherwise                                  → "(NB)=\"<printable>\""
+ *
+ * Used by both incoming announces (AnnounceDebugLogger) and outgoing
+ * announces (mailbox ANNOUNCE / management dest) so they format the
+ * same way. Returns a self-contained suffix; callers prepend whatever
+ * destination/identity/hops context they have. */
+static std::string formatAnnounceAppData(const RNS::Bytes& app_data)
+{
+    char buf[64];
+    if (app_data.size() == 0) return "(0B)";
+
+    std::string out;
+    out.reserve(64 + app_data.size() * 2);
+    snprintf(buf, sizeof(buf), "(%zuB) ", app_data.size());
+    out += buf;
+
+    std::string mp = appDataMsgPack(app_data);
+    if (!mp.empty()) {
+        out += "mp=" + mp;
+        return out;
+    }
+    if (app_data.size() >= 32 &&
+        !(mp = appDataMsgPackAt(app_data, 32)).empty()) {
+        RNS::Bytes ratchet(app_data.data(), 32);
+        out += "ratchet=" + ratchet.toHex() + " mp=" + mp;
+        return out;
+    }
+    if (app_data.size() >= 32 &&
+        isPlausibleText(app_data.data() + 32, app_data.size() - 32)) {
+        RNS::Bytes ratchet(app_data.data(), 32);
+        std::string name((const char*)app_data.data() + 32,
+                         app_data.size() - 32);
+        out += "ratchet=" + ratchet.toHex() + " name=\"" + name + "\"";
+        return out;
+    }
+    if (app_data.size() >= 33 &&
+        !(mp = appDataMsgPackRange(app_data, 1, app_data.size() - 32)).empty()) {
+        uint8_t prefix = app_data.data()[0];
+        RNS::Bytes ratchet(app_data.data() + app_data.size() - 32, 32);
+        snprintf(buf, sizeof(buf), "v=%02x ", prefix);
+        out += buf;
+        out += "mp=" + mp + " ratchet=" + ratchet.toHex();
+        return out;
+    }
+    out += "=\"" + appDataPrintable(app_data) + "\"";
+    return out;
+}
+
 /* Logs every announce mR sees at dbg-level. No persistence — that's the
  * application layer's job (LXMF, etc.) and would scale badly on busy
  * networks. See feedback notes on TCP-relay announce volume. */
@@ -924,55 +1032,26 @@ public:
     void received_announce(const RNS::Bytes& destination_hash,
                            const RNS::Identity& announced_identity,
                            const RNS::Bytes& app_data) override {
-        /* All output here is dbg() — short-circuit when this tag's
-         * level isn't at debug. logIsDebug(TAG) checks the per-tag
-         * level first (`s.log.tag.rnsd`), falling back to global
-         * (`s.log.level`). The msgpack walker / shape detectors
-         * below cost a few hundred µs per announce; on a busy
-         * testnet that's a measurable chunk of rnsd's per-announce
-         * budget. */
-        if (!logIsDebug(TAG)) return;
+        /* All output here is dbg() — or verb() when `s.rnsd.debug.only_local`
+         * is set, which demotes announce noise so it only shows at the
+         * verbose level. Gate against the level we'd actually fire at so
+         * the msgpack walker / shape detectors in formatAnnounceAppData
+         * (a few hundred µs per announce — measurable on a busy testnet)
+         * aren't paid when the output would be suppressed anyway. */
+        esp_log_level_t lvl = esp_log_level_get(TAG);
+        esp_log_level_t needed = s_dbg_only_local ? ESP_LOG_VERBOSE : ESP_LOG_DEBUG;
+        if (lvl < needed) return;
 
         int hops = (int)RNS::Transport::hops_to(destination_hash);
-        std::string dest = destination_hash.toHex();
-        std::string id   = announced_identity.hexhash();
-
-        std::string mp = appDataMsgPack(app_data);
-        if (!mp.empty()) {
-            dbg("announce dest=%s id=%s hops=%d app_data(%zuB) mp=%s",
-                dest.c_str(), id.c_str(), hops, app_data.size(), mp.c_str());
-        } else if (app_data.size() >= 32 &&
-                   !(mp = appDataMsgPackAt(app_data, 32)).empty()) {
-            /* Ratchet (32 B X25519 pubkey) + msgpack payload. */
-            RNS::Bytes ratchet(app_data.data(), 32);
-            std::string ratchetHex = ratchet.toHex();
-            dbg("announce dest=%s id=%s hops=%d app_data(%zuB) ratchet=%s mp=%s",
-                dest.c_str(), id.c_str(), hops, app_data.size(),
-                ratchetHex.c_str(), mp.c_str());
-        } else if (app_data.size() >= 32 &&
-                   isPlausibleText(app_data.data() + 32, app_data.size() - 32)) {
-            /* Ratchet + raw UTF-8/ASCII display name (no msgpack wrap). */
-            RNS::Bytes ratchet(app_data.data(), 32);
-            std::string ratchetHex = ratchet.toHex();
-            std::string name((const char*)app_data.data() + 32,
-                             app_data.size() - 32);
-            dbg("announce dest=%s id=%s hops=%d app_data(%zuB) ratchet=%s name=\"%s\"",
-                dest.c_str(), id.c_str(), hops, app_data.size(),
-                ratchetHex.c_str(), name.c_str());
-        } else if (app_data.size() >= 33 &&
-                   !(mp = appDataMsgPackRange(app_data, 1, app_data.size() - 32)).empty()) {
-            /* version-byte + msgpack metadata + trailing 32-byte ratchet
-             * (Reticulum interface advertisements with location etc.). */
-            uint8_t prefix = app_data.data()[0];
-            RNS::Bytes ratchet(app_data.data() + app_data.size() - 32, 32);
-            dbg("announce dest=%s id=%s hops=%d app_data(%zuB) v=%02x mp=%s ratchet=%s",
-                dest.c_str(), id.c_str(), hops, app_data.size(),
-                prefix, mp.c_str(), ratchet.toHex().c_str());
-        } else {
-            dbg("announce dest=%s id=%s hops=%d app_data(%zuB)=\"%s\"",
-                dest.c_str(), id.c_str(), hops, app_data.size(),
-                appDataPrintable(app_data).c_str());
-        }
+        std::string body = formatAnnounceAppData(app_data);
+        if (s_dbg_only_local)
+            verb("announce dest=%s id=%s hops=%d app_data %s",
+                 destination_hash.toHex().c_str(),
+                 announced_identity.hexhash().c_str(), hops, body.c_str());
+        else
+            dbg ("announce dest=%s id=%s hops=%d app_data %s",
+                 destination_hash.toHex().c_str(),
+                 announced_identity.hexhash().c_str(), hops, body.c_str());
         if (app_data.size() > 0)
             verb("announce hex %s", app_data.toHex().c_str());
     }
@@ -1083,9 +1162,9 @@ static void rnsdManagementDestDown(void)
     if (!s_management_dest) return;
     try { RNS::Transport::deregister_destination(s_management_dest); }
     catch (const std::exception& e) { warn("deregister_destination threw: %s", e.what()); }
-    s_management_dest         = RNS::Destination(RNS::Type::NONE);
-    s_rnsd_announce_due_tick  = 0;
-    s_rnsd_last_announce_tick = 0;
+    s_management_dest = RNS::Destination(RNS::Type::NONE);
+    /* Don't zero the shared announce ticks here — probe may still be
+     * up and needing them. The scheduling loop guards on dest presence. */
     info("management dest down");
 }
 
@@ -1097,8 +1176,9 @@ static void sendManagementAnnounce(void)
         s_management_dest.announce(empty, /*path_response=*/false);
         TickType_t t = xTaskGetTickCount();
         s_rnsd_last_announce_tick = (t == 0) ? 1 : t;  /* 0 = never */
-        info("management announce sent (%s)",
-             s_management_dest.hash().toHex().c_str());
+        info("announced %s aspect=rnstransport.remote.management app_data %s",
+             s_management_dest.hash().toHex().c_str(),
+             formatAnnounceAppData(empty).c_str());
     } catch (const std::exception& e) {
         err("management announce threw: %s", e.what());
     }
@@ -1111,6 +1191,60 @@ static void onRemoteManagementChange(const char* /*key*/, const char* val)
     bool enabled = val && std::atoi(val) != 0;
     if (enabled) rnsdManagementDestUp();
     else         rnsdManagementDestDown();
+}
+
+static void rnsdProbeDestUp(void)
+{
+    if (s_probe_dest) return;
+    if (!s_identity)  return;
+    try {
+        s_probe_dest = RNS::Destination(*s_identity,
+            RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE,
+            "rnstransport", "probe");
+        /* Opportunistic SINGLE only — no Link establishment. mR auto-
+         * proves every incoming DATA packet so `rnprobe` round-trips
+         * without needing any callback or app-level handler. */
+        s_probe_dest.accepts_links(false);
+        s_probe_dest.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
+        info("probe dest up: %s (auto-proves incoming packets)",
+             s_probe_dest.hash().toHex().c_str());
+        s_rnsd_announce_due_tick = xTaskGetTickCount() +
+            pdMS_TO_TICKS(RNSD_ANNOUNCE_DEBOUNCE_MS);
+    } catch (const std::exception& e) {
+        err("probe dest construct threw: %s", e.what());
+    }
+}
+
+static void rnsdProbeDestDown(void)
+{
+    if (!s_probe_dest) return;
+    try { RNS::Transport::deregister_destination(s_probe_dest); }
+    catch (const std::exception& e) { warn("deregister_destination threw: %s", e.what()); }
+    s_probe_dest = RNS::Destination(RNS::Type::NONE);
+    info("probe dest down");
+}
+
+static void sendProbeAnnounce(void)
+{
+    if (!s_probe_dest) return;
+    try {
+        RNS::Bytes empty;
+        s_probe_dest.announce(empty, /*path_response=*/false);
+        TickType_t t = xTaskGetTickCount();
+        s_rnsd_last_announce_tick = (t == 0) ? 1 : t;
+        info("announced %s aspect=rnstransport.probe app_data %s",
+             s_probe_dest.hash().toHex().c_str(),
+             formatAnnounceAppData(empty).c_str());
+    } catch (const std::exception& e) {
+        err("probe announce threw: %s", e.what());
+    }
+}
+
+static void onRespondToProbesChange(const char* /*key*/, const char* val)
+{
+    bool enabled = val && std::atoi(val) != 0;
+    if (enabled) rnsdProbeDestUp();
+    else         rnsdProbeDestDown();
 }
 
 static int onAnnouncesConnect(int handle, const void* data, size_t len)
@@ -1626,7 +1760,8 @@ static void cliRnprobe(const char* args)
     (void)wait;
 
     /* Single-positional shortcut: a 32-char all-hex string is the hash;
-     * default aspect to the conventional transport management endpoint. */
+     * default aspect to the conventional probe endpoint (rnstransport.probe,
+     * which any node with `respond_to_probes = yes` hosts with PROVE_ALL). */
     auto isHexHash = [](const std::string& s) {
         if (s.size() != (size_t)RNS::Type::Reticulum::DESTINATION_LENGTH * 2) return false;
         for (char c : s) {
@@ -1637,13 +1772,13 @@ static void cliRnprobe(const char* args)
     };
     if (hash_hex.empty() && isHexHash(aspect)) {
         hash_hex = aspect;
-        aspect   = "rnstransport.remote.management";
+        aspect   = "rnstransport.probe";
     }
 
     if (show_help || aspect.empty() || hash_hex.empty()) {
         cliPrintf("  %-*s probe destination, measure RTT\n",
                   CLI_HELP_COL, "rnprobe [aspect] <hash>");
-        cliPrintf("    aspect    default: rnstransport.remote.management\n");
+        cliPrintf("    aspect    default: rnstransport.probe\n");
         cliPrintf("    -s SIZE   payload bytes (default %d)\n", RNPROBE_DEFAULT_SIZE);
         cliPrintf("    -n N      probe count (only 1 supported for now)\n");
         cliPrintf("    -t SECS   timeout (default %d)\n", RNPROBE_DEFAULT_TIMEOUT);
@@ -1662,13 +1797,9 @@ static void cliRnprobe(const char* args)
         return;
     }
 
-    /* Build connect payload. identity_key empty → rnsd uses its own. */
-    rnsd_mailbox_connect_t req = {};
-    safeStrncpy(req.aspect, aspect.c_str(), sizeof(req.aspect));
-    req.dest_type = 0;   /* SINGLE */
-
-    int handle = itsConnect("rnsd", RNSD_PORT_DEST,
-                            &req, sizeof(req), pdMS_TO_TICKS(2000));
+    /* identity_key=nullptr → rnsd uses its default identity. */
+    int handle = rnsdDestOpen(aspect.c_str(), nullptr, /*SINGLE*/ 0,
+                              /*ref*/ 0, nullptr, nullptr);
     if (handle < 0) {
         cliPrintf("rnprobe: connect to rnsd failed\n");
         return;
@@ -1943,6 +2074,51 @@ void rnsdRequestPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN])
     storageSet("rnsd.cmd.request_path", hex);
 }
 
+/* ──────────────── destination / link client API ──────────────── */
+
+int rnsdDestOpen(const char* aspect,
+                 const char* identity_key,
+                 uint8_t     dest_type,
+                 int         ref,
+                 void (*on_recv)(int, size_t),
+                 void (*on_disconnect)(int))
+{
+    if (!aspect || !*aspect) {
+        warn("rnsdDestOpen: aspect required");
+        return -1;
+    }
+    rnsd_dest_connect_t req = {};
+    safeStrncpy(req.aspect, aspect, sizeof(req.aspect));
+    if (identity_key && *identity_key)
+        safeStrncpy(req.identity_key, identity_key, sizeof(req.identity_key));
+    req.dest_type = dest_type;
+    return itsConnect("rnsd", RNSD_PORT_DEST,
+                      &req, sizeof(req), pdMS_TO_TICKS(2000),
+                      ref, on_recv, on_disconnect);
+}
+
+int rnsdLinkOpen(const uint8_t /*dest_hash*/[RNSD_DEST_HASH_LEN],
+                 const char* /*aspect*/,
+                 const char* /*identity_key*/,
+                 uint32_t    /*timeout_ms*/,
+                 int         /*ref*/,
+                 void (*/*on_recv*/)(int, size_t),
+                 void (*/*on_disconnect*/)(int))
+{
+    /* mR's Link layer is stubbed in our fork — Link::validate_request
+     * et al. are no-ops. Defined here so callers compile cleanly today
+     * and can switch on availability later. See rnsd.h. */
+    err("rnsdLinkOpen: Link layer not yet implemented in this build");
+    return -1;
+}
+
+bool rnsdDestListenLinks(int      /*dest_handle*/,
+                         uint16_t /*target_port*/)
+{
+    err("rnsdDestListenLinks: Link layer not yet implemented in this build");
+    return false;
+}
+
 /* Subscription handler for rnsdRequestPath. Runs on rnsd's task. */
 static void onCmdRequestPath(const char* key, const char* val)
 {
@@ -1957,7 +2133,7 @@ static void onCmdRequestPath(const char* key, const char* val)
         dh.assignHex((const uint8_t*)val, std::strlen(val));
         if (dh.size() == RNSD_DEST_HASH_LEN) {
             RNS::Transport::request_path(dh);
-            dbg("cmd.request_path: %s", val);
+            info("cmd.request_path: %s", val);
         }
     } catch (const std::exception& e) {
         warn("cmd.request_path threw: %s", e.what());
@@ -2050,11 +2226,29 @@ static void rnsdTaskMain(void*)
         storageSubscribeChanges("s.rnsd.remote_management",
                                 onRemoteManagementChange);
 
+        /* Probe responder. Same lifecycle pattern as the management
+         * dest, gated by s.rnsd.respond_to_probes (default 0 — opt-in). */
+        if (storageGetInt("s.rnsd.respond_to_probes", 0))
+            rnsdProbeDestUp();
+        storageSubscribeChanges("s.rnsd.respond_to_probes",
+                                onRespondToProbesChange);
+
         /* Async-path-request endpoint for the rnsd.h API. Callers
          * write `rnsd.cmd.request_path = <32-hex>`; we process it on
          * this task (mR's Transport::request_path silently drops when
          * called from any other task — see memory note). */
         storageSubscribeChanges("rnsd.cmd.request_path", onCmdRequestPath);
+
+        /* Live-mirror s.rnsd.debug.only_local into the cached bool so
+         * toggling at runtime takes effect on the next announce. Also
+         * push the same flag into mR's Transport so its high-volume
+         * announce/path-request DEBUGFs demote to VERBOSE. */
+        RNS::Transport::demote_dbg(s_dbg_only_local);
+        storageSubscribeChanges("s.rnsd.debug.only_local",
+            [](const char* /*key*/, const char* val) {
+                s_dbg_only_local = val && val[0] && std::atoi(val) != 0;
+                RNS::Transport::demote_dbg(s_dbg_only_local);
+            });
     } catch (const std::exception& e) {
         err("Reticulum::start threw: %s", e.what());
     }
@@ -2078,20 +2272,32 @@ static void rnsdTaskMain(void*)
                 catch (const std::exception& e) { warn("Transport::jobs threw: %s", e.what()); }
                 mailboxTickPending();
 
-                /* Management announce — debounce fire + periodic check.
-                 * Cheap (a tick compare each, an mR announce call when
-                 * actually due). Lives in phase 0 alongside jobs(). */
+                /* Rnsd-hosted announces — debounce fire + periodic check.
+                 * Each sendX() is a no-op when its destination is down,
+                 * so flipping mgmt/probe at runtime works cleanly. Cheap
+                 * either way (tick compare + maybe an mR announce). */
                 if (s_rnsd_announce_due_tick != 0 &&
                     (int32_t)(now - s_rnsd_announce_due_tick) >= 0) {
                     s_rnsd_announce_due_tick = 0;
                     sendManagementAnnounce();
+                    sendProbeAnnounce();
                 }
-                if (s_management_dest && s_rnsd_last_announce_tick != 0) {
+                if ((s_management_dest || s_probe_dest) &&
+                    s_rnsd_last_announce_tick != 0) {
                     int announce_s = storageGetInt("s.rnsd.announce.interval", 1800);
+                    /* Signed comparison: the sendX() helpers re-read
+                     * xTaskGetTickCount() after their mR announce()
+                     * (which takes a few ms), so s_rnsd_last_announce_tick
+                     * can be *just past* the outer `now`. Unsigned
+                     * `now - last` then underflows to ~UINT32_MAX and
+                     * spuriously passes the threshold — causing a
+                     * second announce right after the debounce fire. */
                     if (announce_s > 0 &&
-                        now - s_rnsd_last_announce_tick >=
-                            pdMS_TO_TICKS(announce_s * 1000))
+                        (int32_t)(now - s_rnsd_last_announce_tick) >=
+                            (int32_t)pdMS_TO_TICKS(announce_s * 1000)) {
                         sendManagementAnnounce();
+                        sendProbeAnnounce();
+                    }
                 }
             } else {
                 publishPathTable();
@@ -2126,12 +2332,16 @@ void rnsdInit(void)
         storageDefault("s.rnsd.name", "");
         storageDefault("s.rnsd.announce.interval", 1800);   /* 30 min */
         storageDefault("s.rnsd.remote_management", 1);      /* host rnstransport.remote.management */
+        storageDefault("s.rnsd.respond_to_probes", 0);      /* host rnstransport.probe (PROVE_ALL) */
+        storageDefault("s.rnsd.debug.only_local", 0);       /* demote announce-traffic dbg to verb */
         /* `s.rnsd.path.max` / `s.rnsd.path.ttl` removed: mR's path table is
          * unbounded (BasicHeapStore), pruned only by PATHFINDER_E (24 h).
          * Re-add when we implement post-process pruning or interface-mode
          * intake control. */
         storageSet("s.rnsd.version", RNSD_VERSION);
     }
+
+    s_dbg_only_local = storageGetInt("s.rnsd.debug.only_local", 0) != 0;
 
     cliRegisterCmd("rnsd",     cliRnsd);
     cliRegisterCmd("rnstatus", cliRnstatus);

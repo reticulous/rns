@@ -53,7 +53,7 @@ void rnsdSha256(const uint8_t* data, size_t n, uint8_t out[RNSD_HASH_LEN]);
 /** Compute the conventional 16-byte destination hash for
  *  (identity, app_name, aspect). The identity is loaded from
  *  `identity_key` (a storage path holding the 128-hex private key,
- *  same convention as `rnsd_mailbox_connect_t.identity_key`).
+ *  same convention as the `identity_key` arg to rnsdDestOpen).
  *  Returns true on success. */
 bool rnsdDestinationHash(const char* identity_key,
                          const char* app_name, const char* aspect,
@@ -108,3 +108,76 @@ bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
  *  has no return value — the caller polls via rnsdRecallPubkey or
  *  the path table. */
 void rnsdRequestPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
+
+/* ──────────────── destination / link client API ────────────────
+ *
+ * Higher-level protocols (lxmf, rnprobe, custom apps) talk to rnsd
+ * through typed ITS connections. The functions below wrap the
+ * itsConnect / aux-msg machinery so callers don't have to know about
+ * port numbers or connect-payload struct shapes — same pattern as
+ * net's TCP_DIAL or web's path registration in diptych-core.
+ *
+ * The handle returned is bidirectional and packet-mode. Disconnect
+ * with `itsDisconnect(handle)` — rnsd deregisters the underlying
+ * mR destination / link automatically. */
+
+/** Open an IN destination on rnsd (RNSD_PORT_DEST). The aspect is a
+ *  dotted name like "lxmf.delivery"; rnsd splits it at the first dot
+ *  for mR's `app_name` / `aspects` constructor arguments.
+ *
+ *  `identity_key` is the storage path of the 128-hex private key for
+ *  this destination's identity (e.g. "secrets.lxmf.id.0.privkey").
+ *  Pass nullptr or "" to use rnsd's default identity
+ *  ("secrets.rnsd.identity"), which is the right choice for things
+ *  like rnprobe.
+ *
+ *  `dest_type` is 0 = SINGLE (the usual choice), 1 = PLAIN, 2 = GROUP.
+ *
+ *  `ref` is opaque to rnsd; ITS passes it back to the callbacks so
+ *  callers can identify which destination an event belongs to.
+ *
+ *  Returns the ITS handle on success (≥ 0), or a negative value if the
+ *  connect failed (rnsd not up, slot full, identity load failed).
+ *
+ *  On the handle, exchange frames per the RNSD_DEST_* opcodes in
+ *  ports.h — OUT_PACKET / IN_PACKET / ANNOUNCE / OUT_RESULT / etc. */
+int rnsdDestOpen(const char* aspect,
+                 const char* identity_key,
+                 uint8_t     dest_type,
+                 int         ref,
+                 void (*on_recv)(int handle, size_t bytes_avail),
+                 void (*on_disconnect)(int handle));
+
+/** Open an outbound Reticulum Link to a remote destination
+ *  (RNSD_PORT_LINK). Returned ITS handle is packet-mode: each
+ *  itsSend is one Link packet, each itsRecv is one Link packet.
+ *  No framing bytes — the bytes are the Link plaintext.
+ *
+ *  NOT YET IMPLEMENTED: mR's Link layer is stubbed in our fork.
+ *  Returns -1 until Link support lands. The declaration is here so
+ *  callers can compile against the eventual surface. */
+int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+                 const char*   aspect,
+                 const char*   identity_key,
+                 uint32_t      timeout_ms,
+                 int           ref,
+                 void (*on_recv)(int handle, size_t bytes_avail),
+                 void (*on_disconnect)(int handle));
+
+/** Tell rnsd to forward incoming Reticulum Links for the destination
+ *  behind `dest_handle` (obtained from rnsdDestOpen) to ITS port
+ *  `target_port` on the *same task* that owns `dest_handle`. rnsd
+ *  flips accepts_links(true) on the destination and, when a remote
+ *  completes the LR/LRPROOF handshake, opens a fresh ITS connection
+ *  to (owning_task, target_port) with a `rnsd_link_incoming_t`
+ *  connect payload describing the remote.
+ *
+ *  No target_taskname argument because rnsd already knows the owning
+ *  task — the dest handle was created by an ITS connect from that
+ *  task. Registering links this way means you can't accidentally
+ *  forward Links for a destination you don't own.
+ *
+ *  NOT YET IMPLEMENTED: needs mR Link support. Returns false until
+ *  Link support lands. */
+bool rnsdDestListenLinks(int      dest_handle,
+                         uint16_t target_port);

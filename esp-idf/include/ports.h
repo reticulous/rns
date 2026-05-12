@@ -25,27 +25,11 @@ constexpr uint16_t RNSD_PORT_MAP = 2;
  *  import/export. */
 constexpr uint16_t RNSD_PORT_CTL = 3;
 
-/** Bidirectional mailbox API for protocol consumers (rnprobe, lxmf, …).
- *
- *  Connect payload (`rnsd_mailbox_connect_t`) names the listener's aspect
- *  (e.g. "lxmf.delivery") and the storage key for the listener's
- *  private identity. rnsd derives `dest_hash` from `identity_pub ||
- *  aspect`, registers an IN Destination for inbound dispatch, and from
- *  this point on the handle carries both directions framed by a type
- *  byte:
- *
- *    app → rnsd
- *      0x01 OUT_PACKET   send_id(2B) | lxm_wire_bytes
- *      0x03 OUT_CANCEL   send_id(2B)
- *
- *    rnsd → app
- *      0x02 OUT_RESULT   send_id(2B) | status(1B) | rtt_ms(4B BE) | hops(1B)
- *      0x04 IN_PACKET    lxm_wire_bytes
- *      0x05 OUT_STATUS   send_id(2B) | type(1B) | type-specific payload
- *
- *  OUT_RESULT.status: 0=sent (opportunistic egress acknowledged),
- *  1=delivered (DIRECT link-proof), 2=cancelled (after OUT_CANCEL),
- *  3=evicted (rnsd buffer/memory limit).
+/** Bidirectional destination API for protocol consumers (rnprobe, lxmf, …).
+ *  Open with `rnsdDestOpen()` from rnsd.h — connect payload is an
+ *  rnsd-private struct, callers never construct it directly. After
+ *  open, the handle carries type-tagged frames in both directions
+ *  per the RNSD_DEST_* opcodes below.
  *
  *  See [docs/plans/lxmf.md §5](../docs/plans/lxmf.md#5-its-port). */
 constexpr uint16_t RNSD_PORT_DEST = 4;
@@ -98,30 +82,6 @@ typedef struct {
     uint8_t  rpt;           /* 1 if iface repeats announces */
     uint8_t  reserved[3];
 } rnsd_transport_t;
-
-/** Connect payload for RNSD_PORT_DEST. Names the listener's aspect (the
- *  LXMF / probe / app endpoint) and the storage key holding the
- *  listener's Ed25519+X25519 private identity. Fixed 96 B (==
- *  ITS_MAX_MSG_DATA), so it always fits in the itsConnect aux slot
- *  exactly once.
- *
- *  rnsd will:
- *    - load the identity from `identity_key` (default
- *      "secrets.rnsd.identity"),
- *    - construct a SINGLE/PLAIN/GROUP destination on the given aspect,
- *      direction=IN, and register it with Transport,
- *    - dispatch inbound packets on that destination through this handle
- *      as 0x04 IN_PACKET frames,
- *    - accept 0x01 OUT_PACKET frames (one per outbound LXM/probe) and
- *      drive each via Transport, narrating progress as 0x05 OUT_STATUS
- *      aux frames and terminating with one 0x02 OUT_RESULT. */
-typedef struct {
-    char    aspect[32];          /* dotted name, e.g. "lxmf.delivery"; NUL-terminated */
-    char    identity_key[40];    /* storage key (e.g. "secrets.lxmf.id.0.privkey"); NUL-terminated; empty → default */
-    uint8_t dest_type;           /* 0=SINGLE, 1=PLAIN, 2=GROUP */
-} rnsd_mailbox_connect_t;
-static_assert(sizeof(rnsd_mailbox_connect_t) <= ITS_MAX_MSG_DATA,
-              "rnsd_mailbox_connect_t must fit ITS_MAX_MSG_DATA");
 
 /* ---- RNSD_PORT_DEST frame opcodes ---- */
 
