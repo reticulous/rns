@@ -665,6 +665,12 @@ static int onMailboxConnect(int handle, const void* data, size_t len)
     try {
         RNS::Destination d(id, RNS::Type::Destination::IN, dtype,
                            app_name.c_str(), aspects.c_str());
+        /* Phase A of docs/plans/link.md §4.3: mR defaults
+         * Destination::_accept_link_requests to true. Until Phase D's
+         * RNSD_DEST_LINK_LISTEN aux flips it back on per-consumer, every
+         * IN destination must explicitly refuse Link requests — otherwise
+         * inbound LRs spawn Link objects with no callbacks attached. */
+        d.accepts_links(false);
         d.set_packet_callback(onMailboxInbound);
         slot->listener_identity = id;
         slot->listener_dest     = d;
@@ -1145,6 +1151,10 @@ static void rnsdManagementDestUp(void)
         s_management_dest = RNS::Destination(*s_identity,
             RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE,
             "rnstransport", "remote.management");
+        /* Phase A of docs/plans/link.md §4.3: refuse Link requests until
+         * Phase G ports register_request_handler and we know how to
+         * service them. */
+        s_management_dest.accepts_links(false);
         info("management dest up: %s",
              s_management_dest.hash().toHex().c_str());
         /* Arm the debounce so the announce goes out after the usual

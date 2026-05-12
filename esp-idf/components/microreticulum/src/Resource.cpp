@@ -19,8 +19,13 @@
 #include "Transport.h"
 #include "Packet.h"
 #include "Log.h"
+#include "MsgPack.h"
 
 #include <algorithm>
+#include <cstring>
+#include <string>
+#include <type_traits>
+#include <vector>
 
 using namespace RNS;
 using namespace RNS::Type::Resource;
@@ -117,20 +122,208 @@ const Bytes& Resource::data() const {
 	return _object->_data;
 }
 
-const Type::Resource::status Resource::status() const {
+Type::Resource::status Resource::status() const {
 	assert(_object);
 	return _object->_status;
 }
 
-const size_t Resource::size() const {
+size_t Resource::size() const {
 	assert(_object);
 	return _object->_size;
 }
 
-const size_t Resource::total_size() const {
+size_t Resource::total_size() const {
 	assert(_object);
 	return _object->_total_size;
 }
 
 // setters
 
+// ----------------------------------------------------------------------
+// ResourceAdvertisement
+// ----------------------------------------------------------------------
+//
+// Wire format mirrors upstream `RNS/Resource.py::ResourceAdvertisement`
+// (an 11-key msgpack map). Key/value shapes per Reticulum 0.9.x:
+//
+//   "t" uint    transfer size (compressed/on-wire bytes)
+//   "d" uint    total uncompressed size
+//   "n" uint    number of parts
+//   "h" bin     resource hash (32 B)
+//   "r" bin     random hash (typically 16 B)
+//   "o" bin     original (first-segment) hash
+//   "m" bin     hashmap window
+//   "f" uint    flags byte (encrypted/compressed/split/req/resp/has_meta)
+//   "i" uint    segment index (1-based)
+//   "l" uint    total segments
+//   "q" bin|nil request id, or nil if not request/response
+//
+// Field semantics line up 1:1 with upstream's `__init__` and `unpack`.
+//
+// Wrapped in `namespace RNS` because Resource.cpp's top-level
+// `using namespace RNS::Type::Resource;` exposes the inner
+// `Type::Resource::ResourceAdvertisement` *namespace* (constants),
+// which would otherwise shadow our class name in qualified
+// definitions below.
+
+namespace RNS {
+
+ResourceAdvertisement::ResourceAdvertisement(const Resource& resource,
+                                             const Bytes& request_id /*= {Type::NONE}*/,
+                                             bool is_response /*= false*/) {
+	// Pull what the µR Resource currently exposes. Fields without an
+	// underlying accessor in our slim ResourceData (random_hash,
+	// original_hash, hashmap, segment_index, total_segments) stay at
+	// their default values until Phase F fleshes Resource out — wire
+	// shape is preserved either way (nil/0/empty bin on the wire).
+	t = static_cast<uint32_t>(resource.size());
+	d = static_cast<uint32_t>(resource.total_size());
+	n = 0;                          // total_parts: not yet tracked on the µR side
+	h = resource.hash();
+	// r, o, m: defaulted (empty Bytes / will pack as bin8 with len 0).
+	i = 1;
+	l = 1;
+	q = request_id;
+
+	if ((bool)q) {
+		if (is_response) { p = true;  u = false; }
+		else             { u = true;  p = false; }
+	}
+
+	// Assemble flag byte to match upstream's bit layout.
+	f = static_cast<uint8_t>(
+	      (x ? (1u << 5) : 0u) |
+	      (p ? (1u << 4) : 0u) |
+	      (u ? (1u << 3) : 0u) |
+	      (s ? (1u << 2) : 0u) |
+	      (c ? (1u << 1) : 0u) |
+	      (e ? (1u << 0) : 0u));
+}
+
+Bytes ResourceAdvertisement::pack(uint32_t /*segment*/) const {
+	// Single-segment pack: emit `m` verbatim. Multi-segment slicing is a
+	// Phase F concern; the field shape on the wire is identical.
+
+	std::vector<uint8_t> out;
+	MsgPack::detail::pack_map_header(out, 11);
+
+	auto put_key = [&](const char* k) {
+		MsgPack::detail::pack_fixstr(out, k, std::strlen(k));
+	};
+	auto put_uint = [&](const char* k, uint64_t v) {
+		put_key(k);
+		MsgPack::detail::pack_uint(out, v);
+	};
+	auto put_bin = [&](const char* k, const Bytes& b) {
+		put_key(k);
+		MsgPack::detail::pack_bin(out, b.data(), b.size());
+	};
+	auto put_bin_or_nil = [&](const char* k, const Bytes& b) {
+		put_key(k);
+		if ((bool)b) MsgPack::detail::pack_bin(out, b.data(), b.size());
+		else         MsgPack::detail::pack_nil(out);
+	};
+
+	put_uint("t", t);
+	put_uint("d", d);
+	put_uint("n", n);
+	put_bin ("h", h);
+	put_bin ("r", r);
+	put_bin ("o", o);
+	put_uint("i", i);
+	put_uint("l", l);
+	put_bin_or_nil("q", q);
+	put_uint("f", f);
+	put_bin ("m", m);
+
+	return Bytes(out.data(), out.size());
+}
+
+ResourceAdvertisement ResourceAdvertisement::unpack(const Bytes& data) {
+	ResourceAdvertisement adv;
+	const uint8_t* p = data.data();
+	size_t         n_left = data.size();
+	size_t         off = 0;
+
+	size_t count = 0;
+	off = MsgPack::detail::unpack_map_header(p, n_left, count);
+
+	auto read_uint_into = [&](auto& dst) {
+		uint64_t v = 0;
+		off += MsgPack::detail::unpack_uint(p + off, n_left - off, v);
+		dst = static_cast<typename std::remove_reference<decltype(dst)>::type>(v);
+	};
+
+	auto read_bin_into = [&](Bytes& dst) {
+		MsgPack::bin_t<uint8_t> tmp;
+		off += MsgPack::detail::unpack_bin(p + off, n_left - off, tmp);
+		dst = Bytes(tmp.data(), tmp.size());
+	};
+
+	auto read_bin_or_nil_into = [&](Bytes& dst) {
+		if (off >= n_left) throw std::runtime_error("ResourceAdvertisement: short value");
+		if (p[off] == 0xc0) { off += 1; dst = Bytes(); return; }   // nil
+		read_bin_into(dst);
+	};
+
+	for (size_t k = 0; k < count; ++k) {
+		std::string key;
+		off += MsgPack::detail::unpack_str(p + off, n_left - off, key);
+		if (key.size() != 1) {
+			// Unexpected multi-char key — skip its value defensively.
+			off += MsgPack::detail::skip_value(p + off, n_left - off);
+			continue;
+		}
+		switch (key[0]) {
+			case 't': read_uint_into(adv.t);          break;
+			case 'd': read_uint_into(adv.d);          break;
+			case 'n': read_uint_into(adv.n);          break;
+			case 'i': read_uint_into(adv.i);          break;
+			case 'l': read_uint_into(adv.l);          break;
+			case 'f': read_uint_into(adv.f);          break;
+			case 'h': read_bin_into(adv.h);           break;
+			case 'r': read_bin_into(adv.r);           break;
+			case 'o': read_bin_into(adv.o);           break;
+			case 'm': read_bin_into(adv.m);           break;
+			case 'q': read_bin_or_nil_into(adv.q);    break;
+			default:
+				off += MsgPack::detail::skip_value(p + off, n_left - off);
+				break;
+		}
+	}
+
+	// Re-derive flag bits from the assembled byte (matches upstream's
+	// unpack tail).
+	adv.e = (adv.f       & 0x01) != 0;
+	adv.c = ((adv.f >> 1) & 0x01) != 0;
+	adv.s = ((adv.f >> 2) & 0x01) != 0;
+	adv.u = ((adv.f >> 3) & 0x01) != 0;
+	adv.p = ((adv.f >> 4) & 0x01) != 0;
+	adv.x = ((adv.f >> 5) & 0x01) != 0;
+
+	return adv;
+}
+
+bool ResourceAdvertisement::is_request(const Packet& advertisement_packet) {
+	ResourceAdvertisement adv = unpack(const_cast<Packet&>(advertisement_packet).plaintext());
+	return adv.u && (bool)adv.q;
+}
+
+bool ResourceAdvertisement::is_response(const Packet& advertisement_packet) {
+	ResourceAdvertisement adv = unpack(const_cast<Packet&>(advertisement_packet).plaintext());
+	return adv.p && (bool)adv.q;
+}
+
+Bytes ResourceAdvertisement::read_request_id(const Packet& advertisement_packet) {
+	return unpack(const_cast<Packet&>(advertisement_packet).plaintext()).q;
+}
+
+uint32_t ResourceAdvertisement::read_transfer_size(const Packet& advertisement_packet) {
+	return unpack(const_cast<Packet&>(advertisement_packet).plaintext()).t;
+}
+
+uint32_t ResourceAdvertisement::read_size(const Packet& advertisement_packet) {
+	return unpack(const_cast<Packet&>(advertisement_packet).plaintext()).d;
+}
+
+} // namespace RNS

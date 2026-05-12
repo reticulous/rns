@@ -143,7 +143,7 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 
 /*static*/ uint16_t Link::mtu_from_lr_packet(const Packet& packet) {
 	if (packet.data().size() == ECPUBSIZE+LINK_MTU_SIZE) {
-		return (packet.data()[ECPUBSIZE] << 16) + (packet.data()[ECPUBSIZE+1] << 8) + (packet.data()[ECPUBSIZE+2]) & MTU_BYTEMASK;
+		return ((packet.data()[ECPUBSIZE] << 16) + (packet.data()[ECPUBSIZE+1] << 8) + (packet.data()[ECPUBSIZE+2])) & MTU_BYTEMASK;
 	}
 	return 0;
 }
@@ -152,7 +152,7 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 	//p if len(packet.data) == RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2+Link.LINK_MTU_SIZE:
 	if (packet.data().size() == RNS::Type::Identity::SIGLENGTH/8+ECPUBSIZE/2+LINK_MTU_SIZE) {
 		Bytes mtu_bytes = packet.data().mid(RNS::Type::Identity::SIGLENGTH/8+ECPUBSIZE/2, LINK_MTU_SIZE);
-		return (mtu_bytes[0] << 16) + (mtu_bytes[1] << 8) + (mtu_bytes[2]) & MTU_BYTEMASK;
+		return ((mtu_bytes[0] << 16) + (mtu_bytes[1] << 8) + (mtu_bytes[2])) & MTU_BYTEMASK;
 	}
 	return 0;
 }
@@ -849,10 +849,9 @@ void Link::handle_request(const Bytes& request_id, const ResourceRequest& resour
 		//p path_hash    = unpacked_request[1]
 		//p request_data = unpacked_request[2]
 
-		auto handler_iter = _object->_destination.request_handlers().find(resource_request._path_hash);
-		if (handler_iter != _object->_destination.request_handlers().end()) {
+		RequestHandler request_handler;
+		if (_object->_destination.find_request_handler(resource_request._path_hash, request_handler)) {
 			TRACE("Link::handle_request: Found handler");
-			RequestHandler request_handler = (*handler_iter).second;
 
 			bool allowed = false;
 			if (request_handler._allow != Type::Destination::ALLOW_NONE) {
@@ -1028,7 +1027,7 @@ void Link::receive(const Packet& packet) {
 			}
 
 			if (packet.packet_type() == Type::Packet::DATA) {
-				bool should_query = false;
+				[[maybe_unused]] bool should_query = false;
 				switch (packet.context()) {
 				case Type::Packet::CONTEXT_NONE:
 				{
@@ -1263,11 +1262,16 @@ void Link::receive(const Packet& packet) {
 				// of hash -> sequence map
 				case Type::Packet::RESOURCE:
 				{
-					for (auto& resource : _object->_incoming_resources) {
+					for ([[maybe_unused]] auto& resource : _object->_incoming_resources) {
 						//z resource.receive_part(packet);
 					}
 					break;
 				}
+				default:
+					/* Resource/proof/channel/control contexts not yet
+					 * wired in this fork (Phase A only ports the Link
+					 * wire shape; Phase F+ wires the resource paths). */
+					break;
 /*z
 				case Type::Packet::CHANNEL:
 				{

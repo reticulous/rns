@@ -357,25 +357,36 @@ Packet Destination::announce(const Bytes& app_data /*= {}*/, bool path_response 
 Registers a request handler.
 
 :param path: The path for the request handler to be registered.
-:param response_generator: A function or method with the signature *response_generator(path, data, request_id, link_id, remote_identity, requested_at)* to be called. Whatever this funcion returns will be sent as a response to the requester. If the function returns ``None``, no response will be sent.
-:param allow: One of ``RNS.Destination.ALLOW_NONE``, ``RNS.Destination.ALLOW_ALL`` or ``RNS.Destination.ALLOW_LIST``. If ``RNS.Destination.ALLOW_LIST`` is set, the request handler will only respond to requests for identified peers in the supplied list.
-:param allowed_list: A list of *bytes-like* :ref:`RNS.Identity<api-identity>` hashes.
-:raises: ``ValueError`` if any of the supplied arguments are invalid.
+:param response_generator: A callable with the signature *response_generator(path, data, request_id, link_id, remote_identity, requested_at)* to be called. Whatever this function returns will be sent as a response to the requester. If the function returns empty Bytes, no response will be sent.
+:param allow: One of ``ALLOW_NONE``, ``ALLOW_ALL`` or ``ALLOW_LIST``. If ``ALLOW_LIST`` is set, the request handler will only respond to requests for identified peers in the supplied list.
+:param allowed_list: A list of :ref:`Identity<api-identity>` hashes.
+:raises: ``std::invalid_argument`` if any of the supplied arguments are invalid.
 */
-/*
-void Destination::register_request_handler(const Bytes& path, response_generator = None, request_policies allow = ALLOW_NONE, allowed_list = None) {
-	if path == None or path == "":
-		raise ValueError("Invalid path specified")
-	elif not callable(response_generator):
-		raise ValueError("Invalid response generator specified")
-	elif not allow in Destination.request_policies:
-		raise ValueError("Invalid request policy")
-	else:
-		path_hash = RNS.Identity.truncated_hash(path.encode("utf-8"))
-		request_handler = [path, response_generator, allow, allowed_list]
-		self.request_handlers[path_hash] = request_handler
+void Destination::register_request_handler(const Bytes& path, RequestHandler::response_generator response_generator, request_policies allow /*= ALLOW_NONE*/, const std::vector<Bytes>& allowed_list /*= {}*/) {
+	assert(_object);
+	if (!path) {
+		throw std::invalid_argument("Invalid path specified");
+	}
+	if (!response_generator) {
+		throw std::invalid_argument("Invalid response generator specified");
+	}
+	if (allow != ALLOW_NONE && allow != ALLOW_ALL && allow != ALLOW_LIST) {
+		throw std::invalid_argument("Invalid request policy");
+	}
+
+	Bytes path_hash = Identity::truncated_hash(path);
+	RequestHandler handler;
+	handler._path = path;
+	handler._response_generator = std::move(response_generator);
+	handler._allow = allow;
+	for (const Bytes& id_hash : allowed_list) {
+		handler._allowed_list.insert(id_hash);
+	}
+
+	std::lock_guard<std::recursive_mutex> _lk(_object->_request_handlers_mux);
+	_object->_request_handlers[path_hash] = std::move(handler);
+	TRACEF("Destination::register_request_handler: registered path %s -> hash %s", path.toString().c_str(), path_hash.toHex().c_str());
 }
-*/
 
 /*
 Deregisters a request handler.
@@ -383,16 +394,28 @@ Deregisters a request handler.
 :param path: The path for the request handler to be deregistered.
 :returns: True if the handler was deregistered, otherwise False.
 */
-/*
 bool Destination::deregister_request_handler(const Bytes& path) {
-	path_hash = RNS.Identity.truncated_hash(path.encode("utf-8"))
-	if path_hash in self.request_handlers:
-		self.request_handlers.pop(path_hash)
-		return True
-	else:
-		return False
+	assert(_object);
+	Bytes path_hash = Identity::truncated_hash(path);
+	std::lock_guard<std::recursive_mutex> _lk(_object->_request_handlers_mux);
+	auto it = _object->_request_handlers.find(path_hash);
+	if (it != _object->_request_handlers.end()) {
+		_object->_request_handlers.erase(it);
+		return true;
+	}
+	return false;
 }
-*/
+
+bool Destination::find_request_handler(const Bytes& path_hash, RequestHandler& out) const {
+	assert(_object);
+	std::lock_guard<std::recursive_mutex> _lk(_object->_request_handlers_mux);
+	auto it = _object->_request_handlers.find(path_hash);
+	if (it == _object->_request_handlers.end()) {
+		return false;
+	}
+	out = it->second;
+	return true;
+}
 
 void Destination::receive(const Packet& packet) {
 	assert(_object);

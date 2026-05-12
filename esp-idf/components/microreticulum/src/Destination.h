@@ -28,6 +28,8 @@
 #include <map>
 #include <set>
 #include <cassert>
+#include <functional>
+#include <mutex>
 #include <stdint.h>
 
 namespace RNS {
@@ -39,18 +41,16 @@ namespace RNS {
 	class RequestHandler {
 	public:
 		//p response_generator(path, data, request_id, link_id, remote_identity, requested_at)
-		using response_generator = Bytes(*)(const Bytes& path, const Bytes& data, const Bytes& request_id, const Bytes& link_id, const Identity& remote_identity, double requested_at);
+		using response_generator = std::function<Bytes(const Bytes& path, const Bytes& data, const Bytes& request_id, const Bytes& link_id, const Identity& remote_identity, double requested_at)>;
 	public:
-		RequestHandler(const RequestHandler& handler) {
-			_path = handler._path;
-			_response_generator = handler._response_generator;
-			_allow = handler._allow;
-			_allowed_list = handler._allowed_list;
-		}
+		RequestHandler() = default;
+		RequestHandler(const RequestHandler& handler) = default;
+		RequestHandler& operator = (const RequestHandler& handler) = default;
 		Bytes _path;
-		response_generator _response_generator = nullptr;
+		response_generator _response_generator;
 		Type::Destination::request_policies _allow = Type::Destination::ALLOW_NONE;
 		std::set<Bytes> _allowed_list;
+		bool _auto_compress = true;
 	};
 
     /**
@@ -185,6 +185,33 @@ namespace RNS {
 			_object->_proof_strategy = proof_strategy;
 		}
 
+		/*
+			Registers a request handler.
+
+			:param path: The path for the request handler to be registered.
+			:param response_generator: A callable returning a Bytes response (or empty for no response).
+			:param allow: One of ``ALLOW_NONE``, ``ALLOW_ALL`` or ``ALLOW_LIST``.
+			:param allowed_list: A list of identity hashes permitted to invoke this handler when ``allow == ALLOW_LIST``.
+		*/
+		void register_request_handler(
+			const Bytes& path,
+			RequestHandler::response_generator response_generator,
+			Type::Destination::request_policies allow = Type::Destination::ALLOW_NONE,
+			const std::vector<Bytes>& allowed_list = {}
+		);
+		/*
+			Deregisters a request handler.
+
+			:param path: The path for the request handler to be deregistered.
+			:returns: True if the handler was deregistered, otherwise False.
+		*/
+		bool deregister_request_handler(const Bytes& path);
+
+		// CBA Diptych patch: thread-safe lookup helper used by Link::handle_request.
+		// Returns true and copies the entry into `out` under the registration mutex,
+		// false if no handler is registered for `path_hash`.
+		bool find_request_handler(const Bytes& path_hash, RequestHandler& out) const;
+
 		void receive(const Packet& packet);
 		void incoming_link_request(const Bytes& data, const Packet& packet);
 
@@ -232,6 +259,9 @@ namespace RNS {
 			bool _accept_link_requests = true;
 			Callbacks _callbacks;
 			std::map<Bytes, RequestHandler> _request_handlers;
+			// CBA Diptych patch: guards _request_handlers for safe (de)register vs
+			// dispatch. Recursive so a response_generator may itself touch the table.
+			mutable std::recursive_mutex _request_handlers_mux;
 			Type::Destination::types _type;
 			Type::Destination::directions _direction;
 			Type::Destination::proof_strategies _proof_strategy = Type::Destination::PROVE_NONE;

@@ -55,18 +55,13 @@ set(MICRORET_SRCS
     "src/Transport.cpp"
     "src/Reticulum.cpp"
 
-    # Link.cpp stays out until the Link/Resource/Channel/Buffer subsystem
-    # is wanted (plan §1: "No Link / Resource / propagation node support
-    # in v1"). When it comes in we'll hand-roll a small src/MsgPack.h
-    # shim covering Link.cpp's narrow API surface (Packer.serialize /
-    # to_array, Unpacker.deserialize / from_array, bin_t<uint8_t>) — see
-    # README issue C for the wire-format notes. ~80 LOC, no upstream
-    # patches, no msgpack-c vendor dep.
-    # "src/Link.cpp"
-    # Link_stub.cpp provides link-time stubs for Link methods that
-    # Transport.cpp references — none runtime-reachable since we never
-    # create Link instances. See file header for details.
-    "src/Link_stub.cpp"
+    # Phase A of docs/plans/link.md flipped this in: Link.cpp now builds
+    # against the hand-rolled src/MsgPack.h shim, which covers the narrow
+    # Packer.serialize / Packer.to_array / Unpacker.feed / Unpacker.deserialize
+    # / Unpacker.from_array / bin_t<uint8_t> surface upstream's Link.cpp
+    # uses from hideakitai/MsgPack. No msgpack-c vendor dep, no upstream
+    # patches to Link.cpp. Link_stub.cpp is gone.
+    "src/Link.cpp"
 )
 
 idf_component_register(
