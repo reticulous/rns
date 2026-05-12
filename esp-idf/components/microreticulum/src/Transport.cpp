@@ -1421,7 +1421,14 @@ DestinationEntry empty_destination_entry;
 		return;
 	}
 
+	/* Release the lock on every exit path — this function has multiple
+	 * early returns (malformed packet, cache request, link MTU clamp);
+	 * a leaked _jobs_locked = true permanently disables Transport::jobs()
+	 * because it gates on `if (!_jobs_locked)`. RAII guard ensures the
+	 * lock matches the function's scope. */
+	struct JobsLockGuard { ~JobsLockGuard() { _jobs_locked = false; } };
 	_jobs_locked = true;
+	JobsLockGuard _jl;
 
 	Packet packet(RNS::Destination(RNS::Type::NONE), raw);
 	if (!packet.unpack()) {
@@ -2527,7 +2534,7 @@ DestinationEntry empty_destination_entry;
 		}
 	}
 
-	_jobs_locked = false;
+	/* _jobs_locked = false handled by JobsLockGuard dtor at scope exit. */
 }
 
 /*static*/ void Transport::synthesize_tunnel(const Interface& interface) {

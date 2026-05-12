@@ -42,6 +42,7 @@ using namespace RNS::Utilities;
 // CBA
 // CBA ACCUMULATES
 /*static*/ uint16_t Identity::_known_destinations_maxsize = RNS_KNOWN_DESTINATIONS_MAX;
+/*static*/ std::recursive_mutex Identity::_known_destinations_mux;
 
 Identity::Identity(bool create_keys /*= true*/) : _object(new Object()) {
 	if (create_keys) {
@@ -211,6 +212,7 @@ Can be used to load previously created and saved identities into Reticulum.
 		throw std::invalid_argument("Can't remember " + destination_hash.toHex() + ", the public key size of " + std::to_string(public_key.size()) + " is not valid.");
 	}
 	else {
+		std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
 		//p _known_destinations[destination_hash] = {OS::time(), packet_hash, public_key, app_data};
 		// CBA ACCUMULATES
 		try {
@@ -235,6 +237,7 @@ Recall identity for a destination hash.
 */
 /*static*/ Identity Identity::recall(const Bytes& destination_hash) {
 	TRACE("Identity::recall...");
+	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
 	auto iter = _known_destinations.find(destination_hash);
 	if (iter != _known_destinations.end()) {
 		TRACEF("Identity::recall: Found identity entry for destination %s", destination_hash.toHex().c_str());
@@ -267,6 +270,7 @@ Recall last heard app_data for a destination hash.
 */
 /*static*/ Bytes Identity::recall_app_data(const Bytes& destination_hash) {
 	TRACE("Identity::recall_app_data...");
+	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
 	auto iter = _known_destinations.find(destination_hash);
 	if (iter != _known_destinations.end()) {
 		TRACEF("Identity::recall_app_data: Found identity entry for destination %s", destination_hash.toHex().c_str());
@@ -286,6 +290,7 @@ Recall last heard app_data for a destination hash.
 	// simply overwrite on exit now that every local client
 	// disconnect triggers a data persist.
 
+	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
 	bool success = false;
 	try {
 		if (_saving_known_destinations) {
@@ -348,6 +353,7 @@ Recall last heard app_data for a destination hash.
 }
 
 /*static*/ void Identity::load_known_destinations() {
+	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
 // TODO
 /*
 	if os.path.isfile(RNS.Reticulum.storagepath+"/known_destinations"):
@@ -372,6 +378,7 @@ Recall last heard app_data for a destination hash.
 
 /*static*/ void Identity::cull_known_destinations() {
 	TRACE("Identity::cull_known_destinations()");
+	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
 	if (_known_destinations.size() > _known_destinations_maxsize) {
 		try {
 			// Build lightweight (timestamp, key) index to avoid copying full IdentityEntry
@@ -418,6 +425,7 @@ Recall last heard app_data for a destination hash.
 }
 
 /*static*/ bool Identity::validate_announce(const Packet& packet) {
+	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
 	try {
 		if (packet.packet_type() == Type::Packet::ANNOUNCE) {
 			Bytes destination_hash = packet.destination_hash();

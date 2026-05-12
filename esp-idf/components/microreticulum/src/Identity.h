@@ -26,6 +26,7 @@
 #include <map>
 #include <string>
 #include <memory>
+#include <mutex>
 #include <cassert>
 
 namespace RNS {
@@ -59,6 +60,12 @@ namespace RNS {
 		static bool _saving_known_destinations;
 		// CBA
 		static uint16_t _known_destinations_maxsize;
+		/* Diptych add: protect _known_destinations against concurrent
+		 * access from other tasks (lxmf calls Identity::recall while
+		 * rnsd's Transport::inbound mutates the map). Recursive
+		 * because remember() calls cull_known_destinations() which
+		 * also needs the lock. */
+		static std::recursive_mutex _known_destinations_mux;
 
 	public:
 		Identity(bool create_keys = true);

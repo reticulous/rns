@@ -439,7 +439,18 @@ bool Packet::unpack() {
 		return false;
 	}
 	catch (const std::exception& e) {
-		ERRORF("Received malformed packet, dropping it. The contained exception was: %s", e.what());
+		/* Diptych add: dump the first ≤8 bytes hex on parse failure so
+		 * we can see flags / header type / hops / context — helps tell
+		 * "HEADER_2 truncated by HDLC" from "HEADER_1 with bad flag
+		 * bit" from "noise byte through framer". */
+		const uint8_t* raw = _object->_raw.data();
+		size_t n = _object->_raw.size();
+		char hex[32] = {0};
+		size_t dump = n < 8 ? n : 8;
+		for (size_t i = 0; i < dump; ++i)
+			std::snprintf(hex + 3*i, 4, "%02x ", raw[i]);
+		ERRORF("Received malformed packet, dropping it (%zuB, first=%s): %s",
+		       n, hex, e.what());
 		return false;
 	}
 
