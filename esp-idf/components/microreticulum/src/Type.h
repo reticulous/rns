@@ -95,7 +95,13 @@ namespace RNS { namespace Type {
 		will become enabled by default in the near future. Please update your
 		RNS instances.
 		*/
-		static const bool LINK_MTU_DISCOVERY   = true;
+		// Phase F: false. Every reticulous transport (tcp HDLC, lora,
+		// udp) carries only the RNS base MTU — tcp drops HDLC frames
+		// >500 B. Negotiating a larger link MTU makes peers chunk
+		// Resources into parts our own transport then drops (link.md
+		// §12.1). Links stay at Reticulum::MTU; the responder also
+		// clamps in Link::validate_request as a belt-and-braces guard.
+		static const bool LINK_MTU_DISCOVERY   = false;
 
 		static const uint16_t MAX_QUEUED_ANNOUNCES = RNS_QUEUED_ANNOUNCES_MAX;
 		static const uint32_t QUEUED_ANNOUNCE_LIFE = 60*60*24;

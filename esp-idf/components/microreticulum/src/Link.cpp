@@ -199,7 +199,16 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 				DEBUG("Link request includes MTU signalling"); // TODO: Remove debug
 				try {
 					uint16_t mtu = mtu_from_lr_packet(packet);
-					link.mtu((mtu != 0) ? mtu : Type::Reticulum::MTU);
+					uint16_t use_mtu = (mtu != 0) ? mtu : Type::Reticulum::MTU;
+					// Clamp to base MTU unless this build's transports
+					// actually support discovery — they don't (tcp HDLC
+					// caps at 500 B); a larger link MTU makes the peer
+					// chunk Resources too big for our own wire (link.md
+					// §12.1).
+					if (!RNS::Reticulum::link_mtu_discovery() &&
+					    use_mtu > Type::Reticulum::MTU)
+						use_mtu = Type::Reticulum::MTU;
+					link.mtu(use_mtu);
 				}
 				catch (const std::exception& e) {
 					ERRORF("An error ocurred while validating link request %s", link.link_id().toHex().c_str());
@@ -365,6 +374,10 @@ void Link::validate_proof(const Packet& packet) {
 					_object->__remote_identity = _object->_destination.identity();
 					if (confirmed_mtu) _object->_mtu = confirmed_mtu;
 					else _object->_mtu = RNS::Type::Reticulum::MTU;
+					// Never exceed what our transports carry (link.md §12.1).
+					if (!RNS::Reticulum::link_mtu_discovery() &&
+					    _object->_mtu > RNS::Type::Reticulum::MTU)
+						_object->_mtu = RNS::Type::Reticulum::MTU;
 					update_mdu();
 					_object->_status = Type::Link::ACTIVE;
 					_object->_activated_at = OS::time();

@@ -249,22 +249,38 @@ Resource Resource::accept(const Packet& advertisement_packet,
 	d._parts.assign(d._total_parts, Bytes());
 	d._status = Type::Resource::TRANSFERRING;
 
+	d._requested = 0;
 	link.register_incoming_resource(resource);
 
-	// Emit the initial part request:
-	//   [HASHMAP_IS_NOT_EXHAUSTED][resource_hash(32)][wanted map hashes…]
+	INFOF("Resource::accept t=%u d=%u n=%u maphashes=%zu window=%zu",
+	      (unsigned)adv.t, (unsigned)adv.d, (unsigned)adv.n,
+	      d._map_hashes.size(), d._window);
+	resource._request_window();   // initial window
+
+	return resource;
+}
+
+// Send a RESOURCE_REQ for [_requested, _requested+_window) map hashes and
+// advance _requested. Wire: [NOT_EXHAUSTED][resource_hash(32)][hashes…].
+// (v1: sequential windowed pull, no per-hash retransmit — see link.md
+// §9 limitation note; tcp delivery is reliable.)
+void Resource::_request_window() {
+	assert(_object);
+	ResourceData& d = *_object;
+	if (d._requested >= d._map_hashes.size()) return;
+	const size_t end = std::min(d._requested + static_cast<size_t>(d._window),
+	                            d._map_hashes.size());
 	Bytes req;
 	req.append((uint8_t)Type::Resource::HASHMAP_IS_NOT_EXHAUSTED);
 	req.append(d._resource_hash, 32);
-	const size_t want = std::min(static_cast<size_t>(d._window),
-	                             d._map_hashes.size());
-	for (size_t i = 0; i < want; ++i) {
+	for (size_t i = d._requested; i < end; ++i)
 		req.append(d._map_hashes[i].data(), Type::Resource::MAPHASH_LEN);
-	}
-	Packet req_packet(link, req, Type::Packet::DATA, Type::Packet::RESOURCE_REQ);
+	Packet req_packet(d._link, req, Type::Packet::DATA,
+	                  Type::Packet::RESOURCE_REQ);
 	req_packet.send();
-
-	return resource;
+	INFOF("Resource::_request_window [%zu,%zu) of %zu reqlen=%zu",
+	      d._requested, end, d._map_hashes.size(), req.size());
+	d._requested = end;
 }
 
 bool Resource::receive_part(const Bytes& part_data) {
@@ -287,9 +303,17 @@ bool Resource::receive_part(const Bytes& part_data) {
 			break;
 		}
 	}
+	INFOF("Resource::receive_part %zuB matched=%d %zu/%zu",
+	      part_data.size(), (int)accepted, d._received, d._total_parts);
 	if (!accepted) return false;
 
 	if (d._callbacks._progress) d._callbacks._progress(*this);
+
+	// Windowed pull: once everything currently requested has arrived and
+	// parts remain, request the next window. The sender waits on these
+	// follow-up requests ("timed out waiting for part requests").
+	if (d._received < d._total_parts && d._received >= d._requested)
+		_request_window();
 
 	if (d._total_parts > 0 && d._received >= d._total_parts) {
 		Bytes assembled;

@@ -163,6 +163,11 @@ namespace RNS {
 		                     const Bytes& request_id, bool is_request,
 		                     bool is_response);
 
+		// Inbound: send a RESOURCE_REQ for the next window of map hashes
+		// ([_requested, _requested+_window)) and advance _requested.
+		// Drives the windowed pull until every part is received.
+		void _request_window();
+
 	protected:
 		std::shared_ptr<ResourceData> _object;
 

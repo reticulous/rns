@@ -56,6 +56,7 @@ namespace RNS {
 		size_t   _data_size = 0;
 		size_t   _total_parts = 0;
 		size_t   _received = 0;
+		size_t   _requested = 0;            // inbound: map-hash indices requested so far
 		size_t   _window = Type::Resource::WINDOW;
 		ResourceFlags _flags;
 		double   _started_at = 0.0;
