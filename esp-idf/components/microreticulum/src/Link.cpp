@@ -1294,24 +1294,30 @@ void Link::receive(const Packet& packet) {
 				}
 				case Type::Packet::RESOURCE_REQ:
 				{
-					const Bytes plaintext = decrypt(packet.data());
-					if (plaintext && plaintext.size() >= (size_t)(1 + Type::Identity::HASHLENGTH/8)) {
-						Bytes resource_hash;
-						if ((uint8_t)plaintext.data()[0] == Type::Resource::HASHMAP_IS_EXHAUSTED) {
-							resource_hash = plaintext.mid(1 + Type::Resource::MAPHASH_LEN, Type::Identity::HASHLENGTH/8);
-						}
-						else {
-							resource_hash = plaintext.mid(1, Type::Identity::HASHLENGTH/8);
-						}
-						for (auto& resource : _object->_outgoing_resources) {
-							if (resource_hash == resource.hash()) {
-								// v1: no req_hashlist dedup / retransmit window —
-								// send every requested part once (limitation).
-								Resource r = resource;
-								r.request(plaintext);
-								break;
+					try {
+						const Bytes plaintext = decrypt(packet.data());
+						if (plaintext && plaintext.size() >= (size_t)(1 + Type::Identity::HASHLENGTH/8)) {
+							Bytes resource_hash;
+							if ((uint8_t)plaintext.data()[0] == Type::Resource::HASHMAP_IS_EXHAUSTED) {
+								resource_hash = plaintext.mid(1 + Type::Resource::MAPHASH_LEN, Type::Identity::HASHLENGTH/8);
+							}
+							else {
+								resource_hash = plaintext.mid(1, Type::Identity::HASHLENGTH/8);
+							}
+							for (auto& resource : _object->_outgoing_resources) {
+								if (resource_hash == resource.hash()) {
+									// v1: no req_hashlist dedup / retransmit window —
+									// send every requested part once (limitation).
+									Resource r = resource;
+									r.request(plaintext);
+									break;
+								}
 							}
 						}
+					}
+					catch (const std::exception& e) {
+						ERRORF("Link: RESOURCE_REQ handling threw on %s: %s",
+						       toString().c_str(), e.what());
 					}
 					break;
 				}
@@ -1324,23 +1330,29 @@ void Link::receive(const Packet& packet) {
 				}
 				case Type::Packet::RESOURCE_ICL:
 				{
-					const Bytes plaintext = decrypt(packet.data());
-					if (plaintext && plaintext.size() >= (size_t)(Type::Identity::HASHLENGTH/8)) {
-						const Bytes resource_hash = plaintext.left(Type::Identity::HASHLENGTH/8);
-						Resource to_cancel{Type::NONE};
-						for (auto& resource : _object->_incoming_resources) {
-							if (resource_hash == resource.hash()) {
-								to_cancel = resource;
-								break;
+					try {
+						const Bytes plaintext = decrypt(packet.data());
+						if (plaintext && plaintext.size() >= (size_t)(Type::Identity::HASHLENGTH/8)) {
+							const Bytes resource_hash = plaintext.left(Type::Identity::HASHLENGTH/8);
+							Resource to_cancel{Type::NONE};
+							for (auto& resource : _object->_incoming_resources) {
+								if (resource_hash == resource.hash()) {
+									to_cancel = resource;
+									break;
+								}
+							}
+							if (to_cancel) {
+								Resource r = to_cancel;
+								r.cancel();
+								if (_object->_incoming_resources.count(to_cancel) > 0) {
+									_object->_incoming_resources.erase(to_cancel);
+								}
 							}
 						}
-						if (to_cancel) {
-							Resource r = to_cancel;
-							r.cancel();
-							if (_object->_incoming_resources.count(to_cancel) > 0) {
-								_object->_incoming_resources.erase(to_cancel);
-							}
-						}
+					}
+					catch (const std::exception& e) {
+						ERRORF("Link: RESOURCE_ICL handling threw on %s: %s",
+						       toString().c_str(), e.what());
 					}
 					break;
 				}
@@ -1360,29 +1372,35 @@ void Link::receive(const Packet& packet) {
 				// of hash -> sequence map
 				case Type::Packet::RESOURCE:
 				{
-					Resource completed{Type::NONE};
-					for (auto& resource : _object->_incoming_resources) {
-						Resource r = resource;
-						if (r.receive_part(packet.data())) {
-							const Type::Resource::status st = r.status();
-							if (st == Type::Resource::COMPLETE ||
-							    st == Type::Resource::CORRUPT  ||
-							    st == Type::Resource::FAILED) {
-								if (r.is_request()) {
-									request_resource_concluded(r);
+					try {
+						Resource completed{Type::NONE};
+						for (auto& resource : _object->_incoming_resources) {
+							Resource r = resource;
+							if (r.receive_part(packet.data())) {
+								const Type::Resource::status st = r.status();
+								if (st == Type::Resource::COMPLETE ||
+								    st == Type::Resource::CORRUPT  ||
+								    st == Type::Resource::FAILED) {
+									if (r.is_request()) {
+										request_resource_concluded(r);
+									}
+									else if (r.is_response()) {
+										response_resource_concluded(r);
+									}
+									// App resources: the engine already invoked
+									// the consumer's resource_concluded callback.
+									completed = resource;
 								}
-								else if (r.is_response()) {
-									response_resource_concluded(r);
-								}
-								// App resources: the engine already invoked
-								// the consumer's resource_concluded callback.
-								completed = resource;
+								break;   // a part maps to at most one resource
 							}
-							break;   // a part maps to at most one resource
+						}
+						if (completed && _object->_incoming_resources.count(completed) > 0) {
+							_object->_incoming_resources.erase(completed);
 						}
 					}
-					if (completed && _object->_incoming_resources.count(completed) > 0) {
-						_object->_incoming_resources.erase(completed);
+					catch (const std::exception& e) {
+						ERRORF("Link: RESOURCE part handling threw on %s: %s",
+						       toString().c_str(), e.what());
 					}
 					break;
 				}
@@ -1412,20 +1430,26 @@ void Link::receive(const Packet& packet) {
 			}
 			else if (packet.packet_type() == Type::Packet::PROOF) {
 				if (packet.context() == Type::Packet::RESOURCE_PRF) {
-					Bytes resource_hash = packet.data().left(Type::Identity::HASHLENGTH/8);
-					Resource proven{Type::NONE};
-					for (const auto& resource : _object->_outgoing_resources) {
-						if (resource_hash == resource.hash()) {
-							Resource r = resource;
-							r.validate_proof(packet.data());
-							if (r.status() == Type::Resource::COMPLETE) {
-								proven = resource;
+					try {
+						Bytes resource_hash = packet.data().left(Type::Identity::HASHLENGTH/8);
+						Resource proven{Type::NONE};
+						for (const auto& resource : _object->_outgoing_resources) {
+							if (resource_hash == resource.hash()) {
+								Resource r = resource;
+								r.validate_proof(packet.data());
+								if (r.status() == Type::Resource::COMPLETE) {
+									proven = resource;
+								}
+								break;
 							}
-							break;
+						}
+						if (proven && _object->_outgoing_resources.count(proven) > 0) {
+							_object->_outgoing_resources.erase(proven);
 						}
 					}
-					if (proven && _object->_outgoing_resources.count(proven) > 0) {
-						_object->_outgoing_resources.erase(proven);
+					catch (const std::exception& e) {
+						ERRORF("Link: RESOURCE_PRF handling threw on %s: %s",
+						       toString().c_str(), e.what());
 					}
 				}
 			}

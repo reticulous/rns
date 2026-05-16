@@ -2834,7 +2834,13 @@ static void onResConcluded(const RNS::Resource& r)
         info("link[%s]: outbound resource delivered (proof ok)", c->tag);
         resSendAux(*c, RNSD_LINK_RESOURCE_OUTBOUND_DONE, nullptr, 0, 0);
     } else {
-        linkKey(*c, "resource.state", k, sizeof(k)); storageSet(k, "failed");
+        /* Encode the engine status so diptych-cli reveals the precise
+         * outcome without device logs: 7=FAILED 8=CORRUPT 3=still
+         * TRANSFERRING-when-concluded (timeout/cancel mid-flight). */
+        char st[24];
+        snprintf(st, sizeof(st), "failed:%s:%d",
+                 c->res_outbound ? "out" : "in", (int)r.status());
+        linkKey(*c, "resource.state", k, sizeof(k)); storageSet(k, st);
         warn("link[%s]: resource %s failed (status=%d)",
              c->tag, c->res_outbound ? "outbound" : "inbound",
              (int)r.status());
