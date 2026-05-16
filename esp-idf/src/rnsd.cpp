@@ -2540,6 +2540,15 @@ struct link_conn_t {
     RNS::Bytes           res_hash;      /* in-flight resource_hash; empty = idle */
     bool                 res_outbound;  /* true = we are sending it */
     uint32_t             res_opaque;    /* outbound: caller correlation id */
+
+    /* Pre-active outbound-Resource deferral: rnsdLinkSendResource may
+     * arrive before the async link reaches ACTIVE (lxmf opens the link
+     * then immediately sends). Hold the buffer and start the Resource
+     * from onLinkEstablishedCb — mirrors the one-packet pend_* outbox. */
+    bool                 pend_res_used;
+    void*                pend_res_buf;
+    uint32_t             pend_res_len;
+    uint32_t             pend_res_opaque;
 };
 
 static link_conn_t* s_link_conns = nullptr;
@@ -2641,6 +2650,46 @@ static bool linkLoadIdentity(const std::string& identity_key, RNS::Identity& out
     return true;
 }
 
+/* Defined below; needed here by linkStartOutboundResource. */
+static void onResConcluded(const RNS::Resource& r);
+static void resSendAux(link_conn_t& c, uint8_t opcode,
+                       void* buf, uint32_t len, uint8_t flags);
+
+/* Construct + advertise an outbound Resource on an ACTIVE link from a
+ * caller-owned buffer. The engine encrypts/chunks (copies) at
+ * construction, registers on the link's outgoing set and advertises,
+ * so the buffer is freed immediately after. Used by onLinkAux (link
+ * already active) and onLinkEstablishedCb (deferred pre-active send). */
+static void linkStartOutboundResource(link_conn_t& c, void* buf,
+                                      uint32_t reqlen, uint32_t opaque)
+{
+    if (c.res_hash.size()) {
+        warn("link[%s]: resource already in flight, dropping send", c.tag);
+        if (buf) free(buf);
+        return;
+    }
+    try {
+        RNS::Resource res(RNS::Bytes((const uint8_t*)buf, reqlen),
+                          c.link, /*advertise=*/true,
+                          /*auto_compress=*/false,
+                          /*concluded=*/onResConcluded,
+                          /*progress=*/nullptr);
+        if (buf) free(buf);
+        c.res_hash     = res.hash();
+        c.res_outbound = true;
+        c.res_opaque   = opaque;
+        char k[96];
+        linkKey(c, "resource.state", k, sizeof(k)); storageSet(k, "sending");
+        linkKey(c, "resource.size",  k, sizeof(k)); storageSet(k, (int)reqlen);
+        info("link[%s]: sending %uB resource (opaque=%u)",
+             c.tag, (unsigned)reqlen, (unsigned)opaque);
+    } catch (const std::exception& e) {
+        warn("link[%s]: resource send threw: %s", c.tag, e.what());
+        if (buf) free(buf);
+        resSendAux(c, RNSD_LINK_RESOURCE_FAILED, nullptr, 0, 0);
+    }
+}
+
 static void onLinkEstablishedCb(RNS::Link& link)
 {
     link_conn_t* c = linkFindByLink(link);
@@ -2681,6 +2730,17 @@ static void onLinkEstablishedCb(RNS::Link& link)
         }
         c->pend_used = false;
         c->pend_bytes.clear();
+    }
+
+    /* Flush a deferred outbound Resource (rnsdLinkSendResource that
+     * arrived before the link was ACTIVE). */
+    if (c->pend_res_used) {
+        c->pend_res_used = false;
+        linkStartOutboundResource(*c, c->pend_res_buf,
+                                  c->pend_res_len, c->pend_res_opaque);
+        c->pend_res_buf = nullptr;
+        c->pend_res_len = 0;
+        c->pend_res_opaque = 0;
     }
 }
 
@@ -2922,6 +2982,11 @@ static void linkFreeSlot(link_conn_t& c)
     c.identity_key.clear();
     c.pend_used = false;
     c.pend_bytes.clear();
+    if (c.pend_res_used && c.pend_res_buf) free(c.pend_res_buf);
+    c.pend_res_used = false;
+    c.pend_res_buf = nullptr;
+    c.pend_res_len = 0;
+    c.pend_res_opaque = 0;
     c.consumer_task = nullptr;
     c.res_hash = RNS::Bytes();
     c.res_outbound = false;
@@ -3024,6 +3089,10 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     c->estab_deadline = 0;
     c->pend_used    = false;
     c->pend_bytes.clear();
+    c->pend_res_used = false;
+    c->pend_res_buf = nullptr;
+    c->pend_res_len = 0;
+    c->pend_res_opaque = 0;
     c->consumer_task = itsRemoteTask(handle);   /* Phase F resource aux target */
     c->res_hash      = RNS::Bytes();
     c->res_outbound  = false;
@@ -3147,42 +3216,30 @@ static void onLinkAux(TaskHandle_t /*sender*/, const void* data, size_t len)
         req.tag[sizeof(req.tag) - 1] = '\0';
         void* buf = req.buf;            /* rnsd owns this now */
         link_conn_t* c = linkFindByTag(req.tag);
-        if (!c || !c->link || c->state != LST_ACTIVE) {
-            warn("link[%s]: SEND_RESOURCE but link not active", req.tag);
+        if (!c) {
+            warn("link[%s]: SEND_RESOURCE for unknown link", req.tag);
             if (buf) free(buf);
             return;
         }
-        if (c->res_hash.size()) {
-            warn("link[%s]: resource already in flight, dropping send",
+        if (c->pend_res_used || c->res_hash.size()) {
+            warn("link[%s]: resource already pending/in-flight, dropping",
                  c->tag);
             if (buf) free(buf);
             return;
         }
-        try {
-            /* Engine encrypts+chunks (copies) at construction; the
-             * Resource registers itself on the link's outgoing set and
-             * advertises. We can free the caller's buffer immediately. */
-            RNS::Resource res(RNS::Bytes((const uint8_t*)buf, req.len),
-                              c->link, /*advertise=*/true,
-                              /*auto_compress=*/false,
-                              /*concluded=*/onResConcluded,
-                              /*progress=*/nullptr);
-            if (buf) free(buf);
-            c->res_hash     = res.hash();
-            c->res_outbound = true;
-            c->res_opaque   = req.opaque_id;
-            char k[96];
-            linkKey(*c, "resource.state", k, sizeof(k));
-            storageSet(k, "sending");
-            linkKey(*c, "resource.size", k, sizeof(k));
-            storageSet(k, (int)req.len);
-            info("link[%s]: sending %uB resource (opaque=%u)",
-                 c->tag, (unsigned)req.len, (unsigned)req.opaque_id);
-        } catch (const std::exception& e) {
-            warn("link[%s]: resource send threw: %s", c->tag, e.what());
-            if (buf) free(buf);
-            resSendAux(*c, RNSD_LINK_RESOURCE_FAILED, nullptr, 0, 0);
+        if (!c->link || c->state != LST_ACTIVE) {
+            /* lxmf opens the link then immediately sends; the async
+             * handshake (~200 ms) isn't done yet. Defer to
+             * onLinkEstablishedCb (mirrors the one-packet outbox). */
+            c->pend_res_used   = true;
+            c->pend_res_buf    = buf;
+            c->pend_res_len    = req.len;
+            c->pend_res_opaque = req.opaque_id;
+            info("link[%s]: SEND_RESOURCE deferred (link %s) %uB",
+                 c->tag, lstName(c->state), (unsigned)req.len);
+            return;
         }
+        linkStartOutboundResource(*c, buf, req.len, req.opaque_id);
         return;
     }
 }
@@ -3234,6 +3291,10 @@ static void onIncomingLinkEstablished(RNS::Link& link)
     c->estab_deadline = 0;
     c->pend_used    = false;
     c->pend_bytes.clear();
+    c->pend_res_used = false;
+    c->pend_res_buf = nullptr;
+    c->pend_res_len = 0;
+    c->pend_res_opaque = 0;
 
     link.set_packet_callback(onLinkPacketCb);
     link.set_link_closed_callback(onLinkClosedCb);
