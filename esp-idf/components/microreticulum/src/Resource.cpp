@@ -35,11 +35,24 @@ using namespace RNS::Type::Resource;
 using namespace RNS::Utilities;
 
 // ----------------------------------------------------------------------
-// Phase F transfer-engine helpers (ratspeak algorithm, Apache-2.0)
+// Phase F transfer-engine helpers — UPSTREAM Reticulum wire (RNS/Resource.py).
+//
+// ratspeak/microReticulum (the algorithm reference the spec named) hashes
+// the *whole ciphertext* with a single random hash. Upstream Reticulum —
+// the wire we must interop with (link.md §3.3; the §9.5 echo is real
+// Python LXMF) — instead uses TWO 4-byte random hashes:
+//
+//   • a "stream" random hash, prepended to the plaintext, encrypted into
+//     the stream, and stripped by the receiver after decrypt;
+//   • the advertised random_hash (`adv.r`), used to derive the resource
+//     hash, the per-part map hashes and the proof — over the PLAINTEXT
+//     and per-chunk ciphertext, never over the whole ciphertext.
+//
+// We follow upstream where it diverges from ratspeak.
 // ----------------------------------------------------------------------
 namespace {
 
-// SHA256(data || random_hash)[:MAPHASH_LEN]
+// SHA256(data || rh)[:MAPHASH_LEN] — map hash over an encrypted chunk.
 void rns_map_hash(const uint8_t* data, size_t data_len,
                   const uint8_t* rh, size_t rh_len, uint8_t out[4]) {
 	Bytes in(data, data_len);
@@ -48,17 +61,10 @@ void rns_map_hash(const uint8_t* data, size_t data_len,
 	std::memcpy(out, h.data(), Type::Resource::MAPHASH_LEN);
 }
 
-// SHA256(encrypted || random_hash) — full 32-byte resource hash
-Bytes rns_resource_hash(const Bytes& enc, const uint8_t rh[4]) {
-	Bytes in(enc.data(), enc.size());
-	in.append(rh, Type::Resource::RANDOM_HASH_SIZE);
-	return Identity::full_hash(in);
-}
-
-// SHA256(encrypted || resource_hash) — expected proof
-Bytes rns_expected_proof(const Bytes& enc, const uint8_t rhash[32]) {
-	Bytes in(enc.data(), enc.size());
-	in.append(rhash, 32);
+// SHA256(a || b) — full 32 bytes.
+Bytes rns_full_hash2(const Bytes& a, const uint8_t* b, size_t blen) {
+	Bytes in(a.data(), a.size());
+	in.append(b, blen);
 	return Identity::full_hash(in);
 }
 
@@ -78,10 +84,12 @@ void Resource::_init_outbound(const Bytes& plaintext, bool advertise,
 	d._flags.is_request = is_request;
 	d._flags.is_response = is_response;
 
-	const Bytes rh = Identity::get_random_hash();
-	std::memcpy(d._random_hash, rh.data(), Type::Resource::RANDOM_HASH_SIZE);
-
-	Bytes to_encrypt(d._random_hash, Type::Resource::RANDOM_HASH_SIZE);
+	// Stream randomiser: prepended to the plaintext and encrypted into the
+	// stream; the receiver strips it after decrypt. Distinct from the
+	// advertised random_hash (upstream Resource.py uses two independent
+	// 4-byte random hashes for these two unrelated jobs).
+	const Bytes srh = Identity::get_random_hash();
+	Bytes to_encrypt(srh.data(), Type::Resource::RANDOM_HASH_SIZE);
 	to_encrypt.append(plaintext.data(), plaintext.size());
 
 	const Bytes encrypted = d._link.encrypt(to_encrypt);
@@ -94,11 +102,18 @@ void Resource::_init_outbound(const Bytes& plaintext, bool advertise,
 	d._transfer_size = encrypted.size();
 	d._size = encrypted.size();
 
-	const Bytes rhf = rns_resource_hash(encrypted, d._random_hash);
+	// Advertised random_hash drives resource_hash / map hashes / proof.
+	const Bytes rh = Identity::get_random_hash();
+	std::memcpy(d._random_hash, rh.data(), Type::Resource::RANDOM_HASH_SIZE);
+
+	// resource_hash = full_hash(plaintext || random_hash)   (PLAINTEXT domain)
+	const Bytes rhf = rns_full_hash2(plaintext, d._random_hash,
+	                                 Type::Resource::RANDOM_HASH_SIZE);
 	std::memcpy(d._resource_hash, rhf.data(), 32);
 	std::memcpy(d._original_hash, d._resource_hash, 32);
 	d._hash = Bytes(d._resource_hash, 32);
-	d._expected_proof = rns_expected_proof(encrypted, d._resource_hash);
+	// expected_proof = full_hash(plaintext || resource_hash)
+	d._expected_proof = rns_full_hash2(plaintext, d._resource_hash, 32);
 
 	const size_t sdu = Type::Resource::SDU;
 	const size_t num = (encrypted.size() + sdu - 1) / sdu;
@@ -298,15 +313,30 @@ bool Resource::receive_part(const Bytes& part_data) {
 				d._status = Type::Resource::CORRUPT;
 			}
 			else {
-				d._data = Bytes(
+				// Strip the 4-byte stream randomiser prepended pre-encrypt.
+				const Bytes payload(
 					decrypted.data() + Type::Resource::RANDOM_HASH_SIZE,
 					decrypted.size() - Type::Resource::RANDOM_HASH_SIZE);
-				d._status = Type::Resource::COMPLETE;
-				// Prove receipt over the assembled ciphertext.
-				const Bytes proof = generate_proof();
-				Packet proof_packet(d._link, proof, Type::Packet::PROOF,
-				                    Type::Packet::RESOURCE_PRF);
-				proof_packet.send();
+				// Integrity: full_hash(payload || random_hash) == resource_hash.
+				const Bytes calc = rns_full_hash2(
+					payload, d._random_hash, Type::Resource::RANDOM_HASH_SIZE);
+				if (calc.size() < 32 ||
+				    std::memcmp(calc.data(), d._resource_hash, 32) != 0) {
+					WARNING("Resource: assembled-hash mismatch — corrupt");
+					d._status = Type::Resource::CORRUPT;
+				}
+				else {
+					d._data = payload;
+					d._status = Type::Resource::COMPLETE;
+					// Prove: proof_data = resource_hash || full_hash(payload || resource_hash)
+					const Bytes proof = generate_proof();
+					Bytes proof_data(d._resource_hash, 32);
+					proof_data.append(proof.data(), proof.size());
+					Packet proof_packet(d._link, proof_data,
+					                    Type::Packet::PROOF,
+					                    Type::Packet::RESOURCE_PRF);
+					proof_packet.send();
+				}
 			}
 		}
 		if (d._callbacks._concluded) d._callbacks._concluded(*this);
@@ -352,20 +382,18 @@ void Resource::request(const Bytes& request_data) {
 Bytes Resource::generate_proof() const {
 	assert(_object);
 	const ResourceData& d = *_object;
-	Bytes assembled;
-	for (size_t i = 0; i < d._parts.size(); ++i) {
-		assembled.append(d._parts[i].data(), d._parts[i].size());
-	}
-	Bytes in(assembled.data(), assembled.size());
-	in.append(d._resource_hash, 32);
-	return Identity::full_hash(in);
+	// proof = full_hash(payload || resource_hash)  (payload == assembled
+	// plaintext, == upstream Resource.prove's full_hash(self.data+self.hash)).
+	return rns_full_hash2(d._data, d._resource_hash, 32);
 }
 
 void Resource::validate_proof(const Bytes& proof_data) {
 	assert(_object);
 	ResourceData& d = *_object;
-	if (proof_data.size() >= 32 && d._expected_proof.size() >= 32 &&
-	    std::memcmp(proof_data.data(), d._expected_proof.data(), 32) == 0) {
+	// proof_data on the wire is resource_hash(32) || proof(32); the proof
+	// is the trailing 32 bytes (upstream Resource.validate_proof).
+	if (proof_data.size() >= 64 && d._expected_proof.size() >= 32 &&
+	    std::memcmp(proof_data.data() + 32, d._expected_proof.data(), 32) == 0) {
 		d._status = Type::Resource::COMPLETE;
 		if (d._callbacks._concluded) d._callbacks._concluded(*this);
 	}
