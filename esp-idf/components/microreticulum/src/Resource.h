@@ -128,6 +128,11 @@ namespace RNS {
 		// hashes to parts and send them as RESOURCE-context packets.
 		void request(const Bytes& request_data);
 
+		// Inbound: apply a RESOURCE_HMU hashmap-update packet
+		// (resource_hash(32) || msgpack[segment, hashmap_bytes]) for
+		// multi-segment resources, then resume the pull.
+		void hashmap_update_packet(const Bytes& plaintext);
+
 		// Inbound: SHA256(assembled_ciphertext || resource_hash).
 		Bytes generate_proof() const;
 

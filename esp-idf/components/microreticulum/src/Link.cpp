@@ -1336,9 +1336,20 @@ void Link::receive(const Packet& packet) {
 				}
 				case Type::Packet::RESOURCE_HMU:
 				{
-					// Hashmap-update only applies to multi-segment resources;
-					// our v1 transfers are single-segment. Log and ignore.
-					DEBUG("Link: RESOURCE_HMU ignored (single-segment v1)");
+					// Multi-segment hashmap update: resource_hash(32) ||
+					// msgpack[segment, hashmap]. Route to the matching
+					// incoming resource so it can pull the next segment.
+					const Bytes plaintext = decrypt(packet.data());
+					if (plaintext && plaintext.size() >= (size_t)(Type::Identity::HASHLENGTH/8)) {
+						const Bytes resource_hash = plaintext.left(Type::Identity::HASHLENGTH/8);
+						for (auto& resource : _object->_incoming_resources) {
+							if (resource_hash == resource.hash()) {
+								Resource r = resource;
+								r.hashmap_update_packet(plaintext);
+								break;
+							}
+						}
+					}
 					break;
 				}
 				case Type::Packet::RESOURCE_ICL:

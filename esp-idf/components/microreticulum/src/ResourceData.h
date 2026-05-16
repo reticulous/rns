@@ -51,12 +51,18 @@ namespace RNS {
 		uint8_t  _random_hash[4] = {};
 		uint8_t  _original_hash[32] = {};
 		Bytes    _expected_proof;          // outbound
-		std::vector<std::array<uint8_t, 4>> _map_hashes;  // inbound
+		// inbound: per-part map hashes, sized to _total_parts. Only the
+		// first HASHMAP_MAX_LEN arrive in the advertisement; the rest are
+		// pulled segment-by-segment via RESOURCE_HMU (multi-segment).
+		std::vector<std::array<uint8_t, 4>> _map_hashes;
+		std::vector<uint8_t> _hash_known;   // 1 where _map_hashes[i] is valid
 		size_t   _transfer_size = 0;
 		size_t   _data_size = 0;
 		size_t   _total_parts = 0;
 		size_t   _received = 0;
-		size_t   _requested = 0;            // inbound: map-hash indices requested so far
+		long     _consec = -1;              // consecutive_completed_height
+		size_t   _hashmap_height = 0;       // count of known map hashes
+		bool     _waiting_hmu = false;      // awaiting a hashmap-update segment
 		size_t   _window = Type::Resource::WINDOW;
 		ResourceFlags _flags;
 		double   _started_at = 0.0;

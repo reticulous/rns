@@ -238,49 +238,137 @@ Resource Resource::accept(const Packet& advertisement_packet,
 	d._callbacks._progress = progress_callback;
 	d._started_at = OS::time();
 
-	// Split the advertised hashmap into 4-byte map hashes.
-	d._map_hashes.clear();
-	for (size_t i = 0; i + Type::Resource::MAPHASH_LEN <= adv.m.size();
-	     i += Type::Resource::MAPHASH_LEN) {
-		std::array<uint8_t, Type::Resource::MAPHASH_LEN> mh{};
-		std::memcpy(mh.data(), adv.m.data() + i, Type::Resource::MAPHASH_LEN);
-		d._map_hashes.push_back(mh);
+	// Per-part map-hash table sized to the full part count. The
+	// advertisement carries only the first HASHMAP_MAX_LEN hashes;
+	// the rest arrive segment-by-segment via RESOURCE_HMU.
+	d._map_hashes.assign(d._total_parts,
+	                     std::array<uint8_t, Type::Resource::MAPHASH_LEN>{});
+	d._hash_known.assign(d._total_parts, 0);
+	size_t adv_hashes = adv.m.size() / Type::Resource::MAPHASH_LEN;
+	for (size_t i = 0; i < adv_hashes && i < d._total_parts; ++i) {
+		std::memcpy(d._map_hashes[i].data(),
+		            adv.m.data() + i * Type::Resource::MAPHASH_LEN,
+		            Type::Resource::MAPHASH_LEN);
+		d._hash_known[i] = 1;
 	}
+	d._hashmap_height = std::min(adv_hashes, d._total_parts);
+	d._consec       = -1;
+	d._waiting_hmu  = false;
 	d._parts.assign(d._total_parts, Bytes());
 	d._status = Type::Resource::TRANSFERRING;
 
-	d._requested = 0;
 	link.register_incoming_resource(resource);
 
-	INFOF("Resource::accept t=%u d=%u n=%u maphashes=%zu window=%zu",
+	INFOF("Resource::accept t=%u d=%u n=%u advhashes=%zu/%zu window=%zu",
 	      (unsigned)adv.t, (unsigned)adv.d, (unsigned)adv.n,
-	      d._map_hashes.size(), d._window);
-	resource._request_window();   // initial window
+	      d._hashmap_height, d._total_parts, d._window);
+	resource._request_window();   // initial request
 
 	return resource;
 }
 
-// Send a RESOURCE_REQ for [_requested, _requested+_window) map hashes and
-// advance _requested. Wire: [NOT_EXHAUSTED][resource_hash(32)][hashes…].
-// (v1: sequential windowed pull, no per-hash retransmit — see link.md
-// §9 limitation note; tcp delivery is reliable.)
+// Inbound request-next (upstream Resource.request_next). Scans up to
+// _window missing parts from _consec+1, collecting their map hashes. If
+// a needed hash is not yet known, sets the HASHMAP_IS_EXHAUSTED flag and
+// appends the last known map hash so the sender replies with the next
+// hashmap segment (RESOURCE_HMU). Wire:
+//   [flag(1)] [last_map_hash(4) iff exhausted] [resource_hash(32)]
+//   [requested map hashes (N*4)]
 void Resource::_request_window() {
 	assert(_object);
 	ResourceData& d = *_object;
-	if (d._requested >= d._map_hashes.size()) return;
-	const size_t end = std::min(d._requested + static_cast<size_t>(d._window),
-	                            d._map_hashes.size());
+	if (d._outbound || d._waiting_hmu) return;
+	if (d._status != Type::Resource::TRANSFERRING) return;
+
+	uint8_t flag = Type::Resource::HASHMAP_IS_NOT_EXHAUSTED;
+	Bytes requested;
+	size_t i = 0;
+	long pn = d._consec + 1;
+	for (size_t s = 0; s < (size_t)d._window; ++s) {
+		if (pn < 0 || (size_t)pn >= d._total_parts) break;
+		if (d._parts[(size_t)pn].size() == 0) {
+			if (d._hash_known[(size_t)pn]) {
+				requested.append(d._map_hashes[(size_t)pn].data(),
+				                 Type::Resource::MAPHASH_LEN);
+				++i;
+			} else {
+				flag = Type::Resource::HASHMAP_IS_EXHAUSTED;
+			}
+		}
+		++pn;
+		if (i >= (size_t)d._window ||
+		    flag == Type::Resource::HASHMAP_IS_EXHAUSTED) break;
+	}
+
+	if (requested.size() == 0 &&
+	    flag != Type::Resource::HASHMAP_IS_EXHAUSTED)
+		return;   // window already satisfied; nothing to ask for
+
 	Bytes req;
-	req.append((uint8_t)Type::Resource::HASHMAP_IS_NOT_EXHAUSTED);
+	req.append(flag);
+	if (flag == Type::Resource::HASHMAP_IS_EXHAUSTED) {
+		if (d._hashmap_height > 0)
+			req.append(d._map_hashes[d._hashmap_height - 1].data(),
+			           Type::Resource::MAPHASH_LEN);
+		else
+			req.append(d._resource_hash, Type::Resource::MAPHASH_LEN);
+		d._waiting_hmu = true;
+	}
 	req.append(d._resource_hash, 32);
-	for (size_t i = d._requested; i < end; ++i)
-		req.append(d._map_hashes[i].data(), Type::Resource::MAPHASH_LEN);
+	req.append(requested.data(), requested.size());
 	Packet req_packet(d._link, req, Type::Packet::DATA,
 	                  Type::Packet::RESOURCE_REQ);
 	req_packet.send();
-	INFOF("Resource::_request_window [%zu,%zu) of %zu reqlen=%zu",
-	      d._requested, end, d._map_hashes.size(), req.size());
-	d._requested = end;
+	INFOF("Resource::request_next consec=%ld want=%zu exhausted=%d "
+	      "known=%zu/%zu", d._consec, i,
+	      (int)(flag == Type::Resource::HASHMAP_IS_EXHAUSTED),
+	      d._hashmap_height, d._total_parts);
+}
+
+// Apply a RESOURCE_HMU packet: resource_hash(32) || msgpack[segment,
+// hashmap_bytes]. Fills _map_hashes at segment*HASHMAP_MAX_LEN and
+// resumes the pull (upstream hashmap_update_packet / hashmap_update).
+void Resource::hashmap_update_packet(const Bytes& plaintext) {
+	assert(_object);
+	ResourceData& d = *_object;
+	if (d._status == Type::Resource::FAILED) return;
+	if (plaintext.size() <= 32) return;
+
+	const uint8_t* p = plaintext.data() + 32;
+	size_t n = plaintext.size() - 32;
+	try {
+		size_t off = 0, count = 0;
+		off += MsgPack::detail::unpack_array_header(p + off, n - off, count);
+		if (count < 2) return;
+		uint64_t segment = 0;
+		off += MsgPack::detail::unpack_uint(p + off, n - off, segment);
+		MsgPack::bin_t<uint8_t> hm;
+		off += MsgPack::detail::unpack_bin(p + off, n - off, hm);
+
+		const size_t seg_len =
+			RNS::Type::Resource::ResourceAdvertisement::HASHMAP_MAX_LEN;
+		const size_t hashes = hm.size() / Type::Resource::MAPHASH_LEN;
+		for (size_t i = 0; i < hashes; ++i) {
+			size_t idx = i + (size_t)segment * seg_len;
+			if (idx >= d._total_parts) break;
+			if (!d._hash_known[idx]) {
+				std::memcpy(d._map_hashes[idx].data(),
+				            hm.data() + i * Type::Resource::MAPHASH_LEN,
+				            Type::Resource::MAPHASH_LEN);
+				d._hash_known[idx] = 1;
+				if (idx + 1 > d._hashmap_height) d._hashmap_height = idx + 1;
+			}
+		}
+		INFOF("Resource::hashmap_update seg=%llu +%zu known=%zu/%zu",
+		      (unsigned long long)segment, hashes,
+		      d._hashmap_height, d._total_parts);
+	}
+	catch (const std::exception& e) {
+		WARNINGF("Resource::hashmap_update parse failed: %s", e.what());
+		return;
+	}
+	d._waiting_hmu = false;
+	_request_window();
 }
 
 bool Resource::receive_part(const Bytes& part_data) {
@@ -293,8 +381,8 @@ bool Resource::receive_part(const Bytes& part_data) {
 	             Type::Resource::RANDOM_HASH_SIZE, mh);
 
 	bool accepted = false;
-	for (size_t i = 0; i < d._map_hashes.size() && i < d._parts.size(); ++i) {
-		if (d._parts[i].size() == 0 &&
+	for (size_t i = 0; i < d._total_parts; ++i) {
+		if (d._hash_known[i] && d._parts[i].size() == 0 &&
 		    std::memcmp(d._map_hashes[i].data(), mh,
 		                Type::Resource::MAPHASH_LEN) == 0) {
 			d._parts[i] = part_data;
@@ -303,16 +391,22 @@ bool Resource::receive_part(const Bytes& part_data) {
 			break;
 		}
 	}
-	INFOF("Resource::receive_part %zuB matched=%d %zu/%zu",
-	      part_data.size(), (int)accepted, d._received, d._total_parts);
 	if (!accepted) return false;
+
+	// Advance the consecutive-completed height.
+	while (d._consec + 1 < (long)d._total_parts &&
+	       d._parts[(size_t)(d._consec + 1)].size() != 0)
+		++d._consec;
+
+	if ((d._received % 16) == 0 || d._received == d._total_parts)
+		INFOF("Resource::receive_part %zu/%zu consec=%ld",
+		      d._received, d._total_parts, d._consec);
 
 	if (d._callbacks._progress) d._callbacks._progress(*this);
 
-	// Windowed pull: once everything currently requested has arrived and
-	// parts remain, request the next window. The sender waits on these
-	// follow-up requests ("timed out waiting for part requests").
-	if (d._received < d._total_parts && d._received >= d._requested)
+	// Pull the next batch (or trigger a hashmap-update when the known
+	// hashmap is exhausted) until every part is in.
+	if (d._received < d._total_parts && !d._waiting_hmu)
 		_request_window();
 
 	if (d._total_parts > 0 && d._received >= d._total_parts) {
