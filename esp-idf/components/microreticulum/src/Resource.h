@@ -19,6 +19,9 @@
 
 #include <memory>
 #include <cassert>
+#include <vector>
+#include <array>
+#include <cstdint>
 
 namespace RNS {
 
@@ -27,6 +30,33 @@ namespace RNS {
 	class Destination;
 	class Link;
 	class Resource;
+
+	// Resource flag byte. Bit layout matches upstream RNS / ratspeak and
+	// the `f` byte assembled by ResourceAdvertisement below:
+	//   bit0 encrypted, bit1 compressed, bit2 split,
+	//   bit3 is_request, bit4 is_response, bit5 has_metadata.
+	struct ResourceFlags {
+		bool encrypted    = true;
+		bool compressed   = false;
+		bool split        = false;
+		bool is_request   = false;
+		bool is_response  = false;
+		bool has_metadata = false;
+
+		uint8_t to_byte() const {
+			return (uint8_t)(
+				(encrypted    ? 0x01 : 0) |
+				(compressed   ? 0x02 : 0) |
+				(split        ? 0x04 : 0) |
+				(is_request   ? 0x08 : 0) |
+				(is_response  ? 0x10 : 0) |
+				(has_metadata ? 0x20 : 0));
+		}
+		static ResourceFlags from_byte(uint8_t b) {
+			return { (b & 0x01) != 0, (b & 0x02) != 0, (b & 0x04) != 0,
+			         (b & 0x08) != 0, (b & 0x10) != 0, (b & 0x20) != 0 };
+		}
+	};
 
 	class Resource {
 
@@ -70,32 +100,44 @@ namespace RNS {
 		}
 
 	public:
-	    //p static def accept(advertisement_packet, callback=None, progress_callback = None, request_id = None):
+		// --- Phase F resource transfer engine ---
+		// ratspeak (Apache-2.0) algorithm folded into ResourceData per the
+		// approach-A decision in docs/plans/phase-f-resource-port.md. The
+		// attermann-shaped Resource/ResourceData/ResourceAdvertisement API
+		// Link.cpp already calls is preserved; only the bodies are real now.
 
-	public:
-//p def hashmap_update_packet(self, plaintext):
-//p def hashmap_update(self, segment, hashmap):
-//p def get_map_hash(self, data):
-//p def advertise(self):
-//p def __advertise_job(self):
-//p def watchdog_job(self):
-//p def __watchdog_job(self):
-//p def assemble(self):
-//p def prove(self):
+		// Inbound: build a receiver Resource from a decrypted RESOURCE_ADV
+		// packet (link recovered from packet.link()), register it on the
+		// link, and emit the initial part request. Returns a NONE Resource
+		// if the advertisement is unusable.
+		static Resource accept(const Packet& advertisement_packet,
+		                       Callbacks::concluded concluded_callback = nullptr,
+		                       Callbacks::progress progress_callback = nullptr,
+		                       const Bytes& request_id = {Type::NONE});
+
+		// Outbound: (re)send this resource's RESOURCE_ADV on its link.
+		void advertise();
+
+		// Inbound: feed one raw RESOURCE-context part. Returns true if the
+		// part matched an outstanding map hash. On the final part this
+		// assembles, decrypts, fires the concluded callback and sends the
+		// RESOURCE_PRF proof.
+		bool receive_part(const Bytes& part_data);
+
+		// Outbound: handle a RESOURCE_REQ payload — resolve requested map
+		// hashes to parts and send them as RESOURCE-context packets.
+		void request(const Bytes& request_data);
+
+		// Inbound: SHA256(assembled_ciphertext || resource_hash).
+		Bytes generate_proof() const;
+
+		bool is_outbound() const;
+		size_t num_parts() const;
+
+		// Outbound: validate an inbound RESOURCE_PRF; conclude on match.
 		void validate_proof(const Bytes& proof_data);
-//p def receive_part(self, packet):
-//p def request_next(self):
-//p def request(self, request_data):
 		void cancel();
-//p def set_callback(self, callback):
-//p def progress_callback(self, callback):
 		float get_progress() const;
-//p def get_transfer_size(self):
-//p def get_data_size(self):
-//p def get_parts(self):
-//p def get_segments(self):
-//p def get_hash(self):
-//p def is_compressed(self):
 		void set_concluded_callback(Callbacks::concluded callback);
 		void set_progress_callback(Callbacks::progress callback);
 
@@ -110,6 +152,14 @@ namespace RNS {
 		size_t total_size() const;
 
 		// setters
+
+	private:
+		// Shared outbound construction: encrypt with the link session key,
+		// chunk into SDU parts, build the hashmap, compute resource hash +
+		// expected proof, register on the link, optionally advertise.
+		void _init_outbound(const Bytes& plaintext, bool advertise,
+		                     const Bytes& request_id, bool is_request,
+		                     bool is_response);
 
 	protected:
 		std::shared_ptr<ResourceData> _object;

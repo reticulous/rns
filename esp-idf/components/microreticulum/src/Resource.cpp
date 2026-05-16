@@ -17,11 +17,14 @@
 #include "ResourceData.h"
 #include "Reticulum.h"
 #include "Transport.h"
+#include "Link.h"
+#include "Identity.h"
 #include "Packet.h"
 #include "Log.h"
 #include "MsgPack.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <string>
 #include <type_traits>
@@ -31,18 +34,106 @@ using namespace RNS;
 using namespace RNS::Type::Resource;
 using namespace RNS::Utilities;
 
-//Resource::Resource(const Link& link /*= {Type::NONE}*/) :
-//	_object(new ResourceData(link))
-//{
-//	assert(_object);
-//	MEM("Resource object created");
-//}
+// ----------------------------------------------------------------------
+// Phase F transfer-engine helpers (ratspeak algorithm, Apache-2.0)
+// ----------------------------------------------------------------------
+namespace {
+
+// SHA256(data || random_hash)[:MAPHASH_LEN]
+void rns_map_hash(const uint8_t* data, size_t data_len,
+                  const uint8_t* rh, size_t rh_len, uint8_t out[4]) {
+	Bytes in(data, data_len);
+	in.append(rh, rh_len);
+	const Bytes h = Identity::full_hash(in);
+	std::memcpy(out, h.data(), Type::Resource::MAPHASH_LEN);
+}
+
+// SHA256(encrypted || random_hash) — full 32-byte resource hash
+Bytes rns_resource_hash(const Bytes& enc, const uint8_t rh[4]) {
+	Bytes in(enc.data(), enc.size());
+	in.append(rh, Type::Resource::RANDOM_HASH_SIZE);
+	return Identity::full_hash(in);
+}
+
+// SHA256(encrypted || resource_hash) — expected proof
+Bytes rns_expected_proof(const Bytes& enc, const uint8_t rhash[32]) {
+	Bytes in(enc.data(), enc.size());
+	in.append(rhash, 32);
+	return Identity::full_hash(in);
+}
+
+} // namespace
+
+void Resource::_init_outbound(const Bytes& plaintext, bool advertise,
+                              const Bytes& request_id, bool is_request,
+                              bool is_response) {
+	assert(_object);
+	ResourceData& d = *_object;
+	d._outbound = true;
+	d._request_id = request_id;
+	d._data_size = plaintext.size();
+	d._total_size = plaintext.size();
+	d._flags.encrypted = true;
+	d._flags.compressed = false;            // bz2 deliberately disabled on this build
+	d._flags.is_request = is_request;
+	d._flags.is_response = is_response;
+
+	const Bytes rh = Identity::get_random_hash();
+	std::memcpy(d._random_hash, rh.data(), Type::Resource::RANDOM_HASH_SIZE);
+
+	Bytes to_encrypt(d._random_hash, Type::Resource::RANDOM_HASH_SIZE);
+	to_encrypt.append(plaintext.data(), plaintext.size());
+
+	const Bytes encrypted = d._link.encrypt(to_encrypt);
+	if (!encrypted) {
+		d._status = Type::Resource::FAILED;
+		ERROR("Resource: link.encrypt failed for outbound resource");
+		return;
+	}
+
+	d._transfer_size = encrypted.size();
+	d._size = encrypted.size();
+
+	const Bytes rhf = rns_resource_hash(encrypted, d._random_hash);
+	std::memcpy(d._resource_hash, rhf.data(), 32);
+	std::memcpy(d._original_hash, d._resource_hash, 32);
+	d._hash = Bytes(d._resource_hash, 32);
+	d._expected_proof = rns_expected_proof(encrypted, d._resource_hash);
+
+	const size_t sdu = Type::Resource::SDU;
+	const size_t num = (encrypted.size() + sdu - 1) / sdu;
+	d._parts.clear();
+	d._parts.reserve(num);
+	Bytes hashmap;
+	for (size_t i = 0; i < num; ++i) {
+		const size_t off  = i * sdu;
+		const size_t clen = std::min(sdu, encrypted.size() - off);
+		Bytes chunk(encrypted.data() + off, clen);
+		uint8_t mh[Type::Resource::MAPHASH_LEN];
+		rns_map_hash(chunk.data(), chunk.size(), d._random_hash,
+		             Type::Resource::RANDOM_HASH_SIZE, mh);
+		hashmap.append(mh, Type::Resource::MAPHASH_LEN);
+		d._parts.push_back(chunk);
+	}
+	d._hashmap = hashmap;
+	d._total_parts = d._parts.size();
+	d._status = Type::Resource::ADVERTISED;
+
+	d._link.register_outgoing_resource(*this);
+	if (advertise) {
+		this->advertise();
+	}
+}
 
 Resource::Resource(const Bytes& data, const Link& link, const Bytes& request_id, bool is_response, double timeout) :
 	_object(new ResourceData(link))
 {
 	assert(_object);
 	MEM("Resource object created");
+	_object->_timeout = timeout;
+	// Request/response carried as a resource (Link::request / response path).
+	_init_outbound(data, /*advertise=*/true, request_id,
+	               /*is_request=*/!is_response, is_response);
 }
 
 Resource::Resource(const Bytes& data, const Link& link, bool advertise /*= true*/, bool auto_compress /*= true*/, Callbacks::concluded callback /*= nullptr*/, Callbacks::progress progress_callback /*= nullptr*/, double timeout /*= 0.0*/, int segment_index /*= 1*/, const Bytes& original_hash /*= {Type::NONE}*/, const Bytes& request_id /*= {Type::NONE}*/, bool is_response /*= false*/) :
@@ -50,40 +141,263 @@ Resource::Resource(const Bytes& data, const Link& link, bool advertise /*= true*
 {
 	assert(_object);
 	MEM("Resource object created");
+	(void)auto_compress;        // bz2 unsupported on this build — see _init_outbound
+	(void)segment_index;        // single-segment only (v1)
+	(void)original_hash;
+	_object->_timeout = timeout;
+	_object->_callbacks._concluded = callback;
+	_object->_callbacks._progress = progress_callback;
+	_init_outbound(data, advertise, request_id,
+	               /*is_request=*/((bool)request_id && !is_response), is_response);
 }
 
+void Resource::advertise() {
+	assert(_object);
+	ResourceData& d = *_object;
+	ResourceAdvertisement adv;
+	adv.t = static_cast<uint32_t>(d._transfer_size);
+	adv.d = static_cast<uint32_t>(d._data_size);
+	adv.n = static_cast<uint32_t>(d._total_parts);
+	adv.h = Bytes(d._resource_hash, 32);
+	adv.r = Bytes(d._random_hash, Type::Resource::RANDOM_HASH_SIZE);
+	adv.o = Bytes(d._original_hash, 32);
+	adv.i = 1;
+	adv.l = 1;
+	adv.q = d._request_id;
+	adv.m = d._hashmap;
+	adv.e = d._flags.encrypted;
+	adv.c = d._flags.compressed;
+	adv.s = d._flags.split;
+	adv.u = d._flags.is_request;
+	adv.p = d._flags.is_response;
+	adv.x = d._flags.has_metadata;
+	adv.f = d._flags.to_byte();
+	const Bytes packed = adv.pack();
+	Packet adv_packet(d._link, packed, Type::Packet::DATA, Type::Packet::RESOURCE_ADV);
+	adv_packet.send();
+}
+
+Resource Resource::accept(const Packet& advertisement_packet,
+                          Callbacks::concluded concluded_callback,
+                          Callbacks::progress progress_callback,
+                          const Bytes& request_id) {
+	const Link& src_link = advertisement_packet.link();
+	if (!src_link) {
+		ERROR("Resource::accept: advertisement packet has no link");
+		return {Type::NONE};
+	}
+	ResourceAdvertisement adv;
+	try {
+		adv = ResourceAdvertisement::unpack(
+			const_cast<Packet&>(advertisement_packet).plaintext());
+	}
+	catch (const std::exception& e) {
+		ERRORF("Resource::accept: malformed advertisement: %s", e.what());
+		return {Type::NONE};
+	}
+	if (adv.h.size() < 32 || adv.r.size() < Type::Resource::RANDOM_HASH_SIZE) {
+		ERROR("Resource::accept: advertisement missing hash/random_hash");
+		return {Type::NONE};
+	}
+
+	Link link(src_link);                       // mutable handle, shares LinkData
+	Resource resource{Type::NONE};
+	resource._object.reset(new ResourceData(link));
+	ResourceData& d = *resource._object;
+
+	d._outbound = false;
+	d._transfer_size = adv.t;
+	d._size = adv.t;
+	d._data_size = adv.d;
+	d._total_size = adv.d;
+	d._total_parts = adv.n;
+	d._request_id = (bool)request_id ? request_id : adv.q;
+	std::memcpy(d._resource_hash, adv.h.data(), 32);
+	std::memcpy(d._random_hash, adv.r.data(), Type::Resource::RANDOM_HASH_SIZE);
+	if (adv.o.size() >= 32) std::memcpy(d._original_hash, adv.o.data(), 32);
+	d._hash = Bytes(d._resource_hash, 32);
+	d._flags = ResourceFlags::from_byte(static_cast<uint8_t>(adv.f));
+	d._received = 0;
+	d._window = Type::Resource::WINDOW;
+	d._callbacks._concluded = concluded_callback;
+	d._callbacks._progress = progress_callback;
+	d._started_at = OS::time();
+
+	// Split the advertised hashmap into 4-byte map hashes.
+	d._map_hashes.clear();
+	for (size_t i = 0; i + Type::Resource::MAPHASH_LEN <= adv.m.size();
+	     i += Type::Resource::MAPHASH_LEN) {
+		std::array<uint8_t, Type::Resource::MAPHASH_LEN> mh{};
+		std::memcpy(mh.data(), adv.m.data() + i, Type::Resource::MAPHASH_LEN);
+		d._map_hashes.push_back(mh);
+	}
+	d._parts.assign(d._total_parts, Bytes());
+	d._status = Type::Resource::TRANSFERRING;
+
+	link.register_incoming_resource(resource);
+
+	// Emit the initial part request:
+	//   [HASHMAP_IS_NOT_EXHAUSTED][resource_hash(32)][wanted map hashes…]
+	Bytes req;
+	req.append((uint8_t)Type::Resource::HASHMAP_IS_NOT_EXHAUSTED);
+	req.append(d._resource_hash, 32);
+	const size_t want = std::min(static_cast<size_t>(d._window),
+	                             d._map_hashes.size());
+	for (size_t i = 0; i < want; ++i) {
+		req.append(d._map_hashes[i].data(), Type::Resource::MAPHASH_LEN);
+	}
+	Packet req_packet(link, req, Type::Packet::DATA, Type::Packet::RESOURCE_REQ);
+	req_packet.send();
+
+	return resource;
+}
+
+bool Resource::receive_part(const Bytes& part_data) {
+	assert(_object);
+	ResourceData& d = *_object;
+	if (d._outbound) return false;
+
+	uint8_t mh[Type::Resource::MAPHASH_LEN];
+	rns_map_hash(part_data.data(), part_data.size(), d._random_hash,
+	             Type::Resource::RANDOM_HASH_SIZE, mh);
+
+	bool accepted = false;
+	for (size_t i = 0; i < d._map_hashes.size() && i < d._parts.size(); ++i) {
+		if (d._parts[i].size() == 0 &&
+		    std::memcmp(d._map_hashes[i].data(), mh,
+		                Type::Resource::MAPHASH_LEN) == 0) {
+			d._parts[i] = part_data;
+			++d._received;
+			accepted = true;
+			break;
+		}
+	}
+	if (!accepted) return false;
+
+	if (d._callbacks._progress) d._callbacks._progress(*this);
+
+	if (d._total_parts > 0 && d._received >= d._total_parts) {
+		Bytes assembled;
+		bool ok = true;
+		for (size_t i = 0; i < d._total_parts; ++i) {
+			if (d._parts[i].size() == 0) { ok = false; break; }
+			assembled.append(d._parts[i].data(), d._parts[i].size());
+		}
+		if (!ok) {
+			d._status = Type::Resource::CORRUPT;
+		}
+		else {
+			const Bytes decrypted = d._link.decrypt(assembled);
+			if (!decrypted ||
+			    decrypted.size() <= Type::Resource::RANDOM_HASH_SIZE) {
+				d._status = Type::Resource::CORRUPT;
+			}
+			else if (d._flags.compressed) {
+				WARNING("Resource: dropping compressed inbound payload "
+				        "(bz2 not supported on this build)");
+				d._status = Type::Resource::CORRUPT;
+			}
+			else {
+				d._data = Bytes(
+					decrypted.data() + Type::Resource::RANDOM_HASH_SIZE,
+					decrypted.size() - Type::Resource::RANDOM_HASH_SIZE);
+				d._status = Type::Resource::COMPLETE;
+				// Prove receipt over the assembled ciphertext.
+				const Bytes proof = generate_proof();
+				Packet proof_packet(d._link, proof, Type::Packet::PROOF,
+				                    Type::Packet::RESOURCE_PRF);
+				proof_packet.send();
+			}
+		}
+		if (d._callbacks._concluded) d._callbacks._concluded(*this);
+	}
+	return true;
+}
+
+void Resource::request(const Bytes& request_data) {
+	assert(_object);
+	ResourceData& d = *_object;
+	if (!d._outbound) return;
+	if (request_data.size() < 1 + 32) return;
+
+	size_t pos = 0;
+	const uint8_t exhausted = request_data.data()[pos++];
+	if (exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED &&
+	    request_data.size() > pos + Type::Resource::MAPHASH_LEN) {
+		pos += Type::Resource::MAPHASH_LEN;        // skip last_map_hash
+	}
+	if (pos + 32 > request_data.size()) return;
+	pos += 32;                                      // skip resource_hash
+
+	while (pos + Type::Resource::MAPHASH_LEN <= request_data.size()) {
+		uint8_t wanted[Type::Resource::MAPHASH_LEN];
+		std::memcpy(wanted, request_data.data() + pos,
+		            Type::Resource::MAPHASH_LEN);
+		pos += Type::Resource::MAPHASH_LEN;
+		for (size_t i = 0; i < d._parts.size(); ++i) {
+			uint8_t mh[Type::Resource::MAPHASH_LEN];
+			rns_map_hash(d._parts[i].data(), d._parts[i].size(),
+			             d._random_hash, Type::Resource::RANDOM_HASH_SIZE, mh);
+			if (std::memcmp(mh, wanted, Type::Resource::MAPHASH_LEN) == 0) {
+				Packet part_packet(d._link, d._parts[i],
+				                   Type::Packet::DATA, Type::Packet::RESOURCE);
+				part_packet.send();
+				break;
+			}
+		}
+	}
+	d._status = Type::Resource::TRANSFERRING;
+}
+
+Bytes Resource::generate_proof() const {
+	assert(_object);
+	const ResourceData& d = *_object;
+	Bytes assembled;
+	for (size_t i = 0; i < d._parts.size(); ++i) {
+		assembled.append(d._parts[i].data(), d._parts[i].size());
+	}
+	Bytes in(assembled.data(), assembled.size());
+	in.append(d._resource_hash, 32);
+	return Identity::full_hash(in);
+}
 
 void Resource::validate_proof(const Bytes& proof_data) {
+	assert(_object);
+	ResourceData& d = *_object;
+	if (proof_data.size() >= 32 && d._expected_proof.size() >= 32 &&
+	    std::memcmp(proof_data.data(), d._expected_proof.data(), 32) == 0) {
+		d._status = Type::Resource::COMPLETE;
+		if (d._callbacks._concluded) d._callbacks._concluded(*this);
+	}
 }
 
 void Resource::cancel() {
+	if (!_object) return;
+	if (_object->_status != Type::Resource::COMPLETE) {
+		_object->_status = Type::Resource::FAILED;
+	}
+	if (_object->_callbacks._concluded) _object->_callbacks._concluded(*this);
+}
+
+bool Resource::is_outbound() const {
+	return _object && _object->_outbound;
+}
+
+size_t Resource::num_parts() const {
+	return _object ? _object->_total_parts : 0;
 }
 
 /*
 :returns: The current progress of the resource transfer as a *float* between 0.0 and 1.0.
 */
 float Resource::get_progress() const {
-/*
-	assert(_object);
-	if (_object->_initiator) {
-		_object->_processed_parts = (_object->_segment_index-1)*math.ceil(Type::Resource::MAX_EFFICIENT_SIZE/Type::Resource::SDU);
-		_object->_processed_parts += _object->sent_parts;
-		_object->_progress_total_parts = float(_object->grand_total_parts);
-	}
-	else {
-		_object->_processed_parts = (_object->_segment_index-1)*math.ceil(Type::Resource::MAX_EFFICIENT_SIZE/Type::Resource::SDU);
-		_object->_processed_parts += _object->_received_count;
-		if (_object->split) {
-			_object->progress_total_parts = float(math.ceil(_object->total_size/Type::Resource::SDU));
-		}
-		else {
-			_object->progress_total_parts = float(_object->total_parts);
-		}
-	}
-
-	return (float)_object->processed_parts / (float)_object->progress_total_parts;
-*/
-	return 0.0;
+	if (!_object) return 0.0f;
+	const ResourceData& d = *_object;
+	if (d._status == Type::Resource::COMPLETE) return 1.0f;
+	// v1 has no per-part TX accounting on the outbound side; report
+	// 0 until the proof flips us to COMPLETE.
+	if (d._outbound || d._total_parts == 0) return 0.0f;
+	return static_cast<float>(d._received) / static_cast<float>(d._total_parts);
 }
 
 void Resource::set_concluded_callback(Callbacks::concluded callback) {

@@ -23,6 +23,10 @@
 #include "Type.h"
 #include "Cryptography/Fernet.h"
 
+#include <vector>
+#include <array>
+#include <cstdint>
+
 namespace RNS {
 
 	class ResourceData {
@@ -31,15 +35,34 @@ namespace RNS {
 		virtual ~ResourceData() {}
 	private:
 		Link _link;
-		Bytes _hash;
+		Bytes _hash;                       // resource_hash (32 B) as Bytes
 		Bytes _request_id;
-		Bytes _data;
+		Bytes _data;                       // inbound: assembled plaintext
 		Type::Resource::status _status = Type::Resource::NONE;
-		size_t _size = 0;
-		size_t _total_size = 0;
+		size_t _size = 0;                  // on-wire (encrypted) size
+		size_t _total_size = 0;            // original (plaintext) size
 		Resource::Callbacks _callbacks;
 
+		// --- Phase F transfer-engine state (ratspeak algorithm) ---
+		bool     _outbound = false;
+		std::vector<Bytes> _parts;         // out: encrypted chunks; in: received slots
+		Bytes    _hashmap;                 // concatenated 4-byte map hashes
+		uint8_t  _resource_hash[32] = {};
+		uint8_t  _random_hash[4] = {};
+		uint8_t  _original_hash[32] = {};
+		Bytes    _expected_proof;          // outbound
+		std::vector<std::array<uint8_t, 4>> _map_hashes;  // inbound
+		size_t   _transfer_size = 0;
+		size_t   _data_size = 0;
+		size_t   _total_parts = 0;
+		size_t   _received = 0;
+		size_t   _window = Type::Resource::WINDOW;
+		ResourceFlags _flags;
+		double   _started_at = 0.0;
+		double   _timeout = 0.0;
+
 	friend class Resource;
+	friend class ResourceAdvertisement;
 	};
 
 }
