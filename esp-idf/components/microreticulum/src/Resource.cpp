@@ -179,7 +179,18 @@ void Resource::advertise() {
 	adv.i = 1;
 	adv.l = 1;
 	adv.q = d._request_id;
-	adv.m = d._hashmap;
+	// Window the advertised hashmap to the first segment (upstream
+	// ResourceAdvertisement.pack(segment=0)). For >HASHMAP_MAX_LEN parts
+	// the full hashmap won't fit one packet; the receiver pulls the rest
+	// segment-by-segment via RESOURCE_REQ(exhausted) → RESOURCE_HMU.
+	{
+		const size_t seg_len =
+			Type::Resource::ResourceAdvertisement::HASHMAP_MAX_LEN;
+		const size_t adv_parts =
+			std::min<size_t>(d._total_parts, seg_len);
+		adv.m = Bytes(d._hashmap.data(),
+		              adv_parts * Type::Resource::MAPHASH_LEN);
+	}
 	adv.e = d._flags.encrypted;
 	adv.c = d._flags.compressed;
 	adv.s = d._flags.split;
@@ -470,8 +481,14 @@ void Resource::request(const Bytes& request_data) {
 
 	size_t pos = 0;
 	const uint8_t exhausted = request_data.data()[pos++];
-	if (exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED &&
-	    request_data.size() > pos + Type::Resource::MAPHASH_LEN) {
+	const bool wants_more_hashmap =
+		(exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED);
+	uint8_t last_map_hash[Type::Resource::MAPHASH_LEN] = {0};
+	if (wants_more_hashmap) {
+		if (request_data.size() < pos + Type::Resource::MAPHASH_LEN + 32)
+			return;
+		std::memcpy(last_map_hash, request_data.data() + pos,
+		            Type::Resource::MAPHASH_LEN);
 		pos += Type::Resource::MAPHASH_LEN;        // skip last_map_hash
 	}
 	if (pos + 32 > request_data.size()) return;
@@ -494,6 +511,60 @@ void Resource::request(const Bytes& request_data) {
 			}
 		}
 	}
+
+	// Peer's known hashmap is exhausted: reply with the next segment as a
+	// RESOURCE_HMU (upstream Resource.request's wants_more_hashmap branch).
+	// last_map_hash is the last hash the receiver knows; the part it maps
+	// to is at index k, so part_index = k+1 must land on a segment
+	// boundary and the next segment to send is part_index/HASHMAP_MAX_LEN.
+	if (wants_more_hashmap) {
+		const size_t mhl    = Type::Resource::MAPHASH_LEN;
+		const size_t seglen =
+			Type::Resource::ResourceAdvertisement::HASHMAP_MAX_LEN;
+		size_t part_index = 0;
+		bool   found      = false;
+		for (size_t i = 0; i < d._total_parts &&
+		                    (i + 1) * mhl <= d._hashmap.size(); ++i) {
+			if (std::memcmp(d._hashmap.data() + i * mhl,
+			                last_map_hash, mhl) == 0) {
+				part_index = i + 1;
+				found = true;
+				break;
+			}
+		}
+		if (!found || seglen == 0 || (part_index % seglen) != 0) {
+			WARNINGF("Resource::request HMU sequencing error "
+			         "(found=%d part_index=%zu seglen=%zu) — cancelling",
+			         (int)found, part_index, seglen);
+			cancel();
+			return;
+		}
+		const size_t segment = part_index / seglen;
+		const size_t hm_start = segment * seglen;
+		const size_t hm_end   =
+			std::min((segment + 1) * seglen, (size_t)d._total_parts);
+
+		std::vector<uint8_t> mp;
+		MsgPack::detail::pack_array_header(mp, 2);
+		MsgPack::detail::pack_uint(mp, (uint64_t)segment);
+		if (hm_end > hm_start &&
+		    hm_end * mhl <= d._hashmap.size()) {
+			MsgPack::detail::pack_bin(mp,
+				d._hashmap.data() + hm_start * mhl,
+				(hm_end - hm_start) * mhl);
+		} else {
+			MsgPack::detail::pack_bin(mp, nullptr, 0);
+		}
+
+		Bytes hmu(d._resource_hash, 32);
+		hmu.append(mp.data(), mp.size());
+		Packet hmu_packet(d._link, hmu, Type::Packet::DATA,
+		                  Type::Packet::RESOURCE_HMU);
+		hmu_packet.send();
+		INFOF("Resource::request HMU seg=%zu parts[%zu..%zu) of %zu",
+		      segment, hm_start, hm_end, (size_t)d._total_parts);
+	}
+
 	d._status = Type::Resource::TRANSFERRING;
 }
 
