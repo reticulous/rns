@@ -208,3 +208,34 @@ bool rnsdLinkTeardown(const char* tag);
  *  Link support lands. */
 bool rnsdDestListenLinks(int      dest_handle,
                          uint16_t target_port);
+
+/* ──────────────── Resource transfer (Phase F, link.md §9) ────────────────
+ *
+ * Messages larger than a single Link packet (~440 B encrypted) ride a
+ * Reticulum Resource instead. The data path is NOT the packet-mode ITS
+ * handle (which is KB-capped) — it is a shared-memory hand-off:
+ *
+ *  • Inbound: rnsd accepts the advertised Resource (size-gated by
+ *    `s.lxmf.max_resource_size`, default 262144), reassembles it, then
+ *    opens a one-shot ITS connection to the consumer's
+ *    LXMF_LINK_RESOURCE_AUX_PORT with an `rnsd_link_resource_done_t`
+ *    (ports.h). On RNSD_LINK_RESOURCE_INBOUND_DONE the consumer owns
+ *    `buf` and must rnsdResourceRelease() it.
+ *
+ *  • Outbound: the consumer hands rnsd a heap buffer; rnsd wraps it in
+ *    a Resource on the named link. rnsd takes ownership of the buffer
+ *    and frees it once the engine has copied it. */
+
+/** Send `buf`/`len` as a Resource on the outbound Link identified by
+ *  `tag` (the rnsdLinkOpen tag). rnsd takes ownership of `buf` (a heap
+ *  pointer in the shared address space) and frees it after the Resource
+ *  engine has copied it into encrypted parts — the caller must not
+ *  touch `buf` after this returns. `opaque_id` is echoed back in the
+ *  RNSD_LINK_RESOURCE_OUTBOUND_DONE aux so the caller can correlate.
+ *  Returns true if the aux was queued to rnsd (not delivery success). */
+bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
+                          uint32_t opaque_id);
+
+/** Free a buffer received via RNSD_LINK_RESOURCE_INBOUND_DONE. Thin
+ *  wrapper over free() — a symmetry hook in case the allocator changes. */
+void rnsdResourceRelease(void* buf);

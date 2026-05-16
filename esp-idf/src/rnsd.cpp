@@ -39,6 +39,7 @@
 #include "Reticulum.h"
 #include "Destination.h"
 #include "Link.h"
+#include "Resource.h"
 #include "Persistence/DestinationEntry.h"
 #include "Utilities/OS.h"
 
@@ -53,6 +54,7 @@
 #include "freertos/task.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <memory>
 #include <vector>
@@ -2247,6 +2249,34 @@ bool rnsdLinkTeardown(const char* tag)
                       pdMS_TO_TICKS(500));
 }
 
+bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
+                          uint32_t opaque_id)
+{
+    if (!tag || !*tag || !buf || len == 0) {
+        warn("rnsdLinkSendResource: bad args");
+        if (buf) free(buf);
+        return false;
+    }
+    rnsd_link_send_resource_t p = {};
+    p.op = RNSD_LINK_AUX_SEND_RESOURCE;
+    safeStrncpy(p.tag, tag, sizeof(p.tag));
+    p.buf       = buf;          /* ownership transfers to rnsd */
+    p.len       = (uint32_t)len;
+    p.opaque_id = opaque_id;
+    bool ok = itsSendAux("rnsd", RNSD_PORT_LINK, &p, sizeof(p),
+                         pdMS_TO_TICKS(1000));
+    if (!ok) {
+        warn("rnsdLinkSendResource: aux send failed, freeing buf");
+        free(buf);
+    }
+    return ok;
+}
+
+void rnsdResourceRelease(void* buf)
+{
+    if (buf) free(buf);
+}
+
 bool rnsdDestListenLinks(int dest_handle, uint16_t target_port)
 {
     if (dest_handle < 0 || target_port == 0) {
@@ -2502,6 +2532,14 @@ struct link_conn_t {
     double               dead_at;       /* OS::time() entered CLOSED/FAILED; 0 = n/a */
     bool                 pend_used;     /* one-packet pre-active outbox */
     std::vector<uint8_t> pend_bytes;
+
+    /* Phase F resource transfer (link.md §9). One in-flight resource
+     * per link in v1 (the §9.5 soak is sequential). consumer_task is
+     * where the rnsd_link_resource_done_t aux is delivered. */
+    TaskHandle_t         consumer_task; /* lxmf task for the §9.1 aux */
+    RNS::Bytes           res_hash;      /* in-flight resource_hash; empty = idle */
+    bool                 res_outbound;  /* true = we are sending it */
+    uint32_t             res_opaque;    /* outbound: caller correlation id */
 };
 
 static link_conn_t* s_link_conns = nullptr;
@@ -2685,6 +2723,141 @@ static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packe
     linkSetInt(*c, "last_inbound_s", (int)RNS::Utilities::OS::time());
 }
 
+/* ─────────────── Phase F: Resource transfer (link.md §9) ───────────────
+ *
+ * The Link's resource callbacks are plain C function pointers with no
+ * userdata; we resolve the owning slot the same way the packet path
+ * does — onResAdvertised gets adv.link (stamped by Link.cpp), and
+ * onResConcluded matches r.hash() against the slot's in-flight
+ * res_hash recorded at advertisement (inbound) or send (outbound). */
+
+static link_conn_t* linkFindByResHash(const RNS::Bytes& h)
+{
+    if (h.size() == 0) return nullptr;
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++) {
+        link_conn_t& c = s_link_conns[j];
+        if (c.used && c.res_hash.size() && c.res_hash == h) return &c;
+    }
+    return nullptr;
+}
+
+/* One small ITS aux frame to the consumer's resource-aux port (§9.1). */
+static void resSendAux(link_conn_t& c, uint8_t opcode,
+                       void* buf, uint32_t len, uint8_t flags)
+{
+    if (!c.consumer_task) {
+        warn("link[%s]: resource aux but no consumer task", c.tag);
+        if (buf) free(buf);
+        return;
+    }
+    rnsd_link_resource_done_t d = {};
+    d.opcode = opcode;
+    if (c.link && c.link.link_id().size() >= 16)
+        memcpy(d.link_id, c.link.link_id().data(), 16);
+    if (c.res_hash.size() >= 32) memcpy(d.resource_hash, c.res_hash.data(), 32);
+    if (c.dest_hash.size() >= 16)
+        memcpy(d.local_dest_hash, c.dest_hash.data(), 16);
+    d.buf       = buf;
+    d.len       = len;
+    d.opaque_id = c.res_opaque;
+    d.flags     = flags;
+    if (!itsSendAuxByTaskHandle(c.consumer_task, LXMF_LINK_RESOURCE_AUX_PORT,
+                                &d, sizeof(d), pdMS_TO_TICKS(2000))) {
+        warn("link[%s]: resource aux send failed (op=%u)", c.tag, opcode);
+        if (buf) free(buf);   /* consumer never took ownership */
+    }
+}
+
+/* ACCEPT_APP gate. Returns true to accept the advertised resource. */
+static bool onResAdvertised(const RNS::ResourceAdvertisement& adv)
+{
+    if (!adv.link) { warn("resource adv: no link"); return false; }
+    link_conn_t* c = linkFindByLink(*adv.link);
+    if (!c) { warn("resource adv: no slot"); return false; }
+
+    if (c->res_hash.size()) {
+        warn("link[%s]: resource already in flight, rejecting", c->tag);
+        return false;
+    }
+    int total_inflight = 0;
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)
+        if (s_link_conns[j].used && s_link_conns[j].res_hash.size())
+            total_inflight++;
+    if (total_inflight >= storageGetInt("s.rnsd.link.max_inbound_resources_total", 4)) {
+        warn("link[%s]: inbound resource cap reached, rejecting", c->tag);
+        return false;
+    }
+    uint32_t maxsz = (uint32_t)storageGetInt("s.lxmf.max_resource_size", 262144);
+    if (adv.d > maxsz) {
+        warn("link[%s]: resource %uB > max %uB, rejecting",
+             c->tag, (unsigned)adv.d, (unsigned)maxsz);
+        return false;
+    }
+
+    c->res_hash     = adv.h;
+    c->res_outbound = false;
+    c->res_opaque   = 0;
+    char k[96];
+    linkKey(*c, "resource.state", k, sizeof(k)); storageSet(k, "receiving");
+    linkKey(*c, "resource.size",  k, sizeof(k)); storageSet(k, (int)adv.d);
+    linkKey(*c, "resource.parts", k, sizeof(k)); storageSet(k, (int)adv.n);
+    info("link[%s]: accepting resource %uB (%u parts)",
+         c->tag, (unsigned)adv.d, (unsigned)adv.n);
+    return true;
+}
+
+static void onResConcluded(const RNS::Resource& r)
+{
+    link_conn_t* c = linkFindByResHash(r.hash());
+    if (!c) { warn("resource concluded: no slot for hash"); return; }
+
+    bool ok = (r.status() == RNS::Type::Resource::COMPLETE);
+    char k[96];
+    if (ok && !c->res_outbound) {
+        const RNS::Bytes& d = r.data();
+        size_t len = d.size();
+        void* buf = (len > 0) ? malloc(len) : nullptr;
+        if (len > 0 && !buf) {
+            warn("link[%s]: resource malloc %zuB failed", c->tag, len);
+            resSendAux(*c, RNSD_LINK_RESOURCE_FAILED, nullptr, 0, 0);
+        } else {
+            if (len > 0) memcpy(buf, d.data(), len);
+            linkKey(*c, "resource.state", k, sizeof(k));
+            storageSet(k, "received");
+            info("link[%s]: inbound resource complete %zuB → consumer",
+                 c->tag, len);
+            resSendAux(*c, RNSD_LINK_RESOURCE_INBOUND_DONE,
+                       buf, (uint32_t)len, 0);
+        }
+    } else if (ok && c->res_outbound) {
+        linkKey(*c, "resource.state", k, sizeof(k)); storageSet(k, "sent");
+        info("link[%s]: outbound resource delivered (proof ok)", c->tag);
+        resSendAux(*c, RNSD_LINK_RESOURCE_OUTBOUND_DONE, nullptr, 0, 0);
+    } else {
+        linkKey(*c, "resource.state", k, sizeof(k)); storageSet(k, "failed");
+        warn("link[%s]: resource %s failed (status=%d)",
+             c->tag, c->res_outbound ? "outbound" : "inbound",
+             (int)r.status());
+        resSendAux(*c, RNSD_LINK_RESOURCE_FAILED, nullptr, 0, 0);
+    }
+    c->res_hash     = RNS::Bytes();
+    c->res_outbound = false;
+    c->res_opaque   = 0;
+}
+
+/* Wire the resource strategy + callbacks onto a freshly-built Link.
+ * ACCEPT_APP routes every advertisement through onResAdvertised's gate. */
+static void linkWireResource(RNS::Link& link)
+{
+    try {
+        link.set_resource_strategy(RNS::Type::Link::ACCEPT_APP);
+        link.set_resource_callback(onResAdvertised);
+        link.set_resource_concluded_callback(onResConcluded);
+    } catch (const std::exception& e) {
+        warn("link: resource wire threw: %s", e.what());
+    }
+}
+
 /* Construct the OUT destination + RNS::Link and wire callbacks. The
  * target identity must already be recallable. Runs on the rnsd task. */
 static bool linkKickoff(link_conn_t& c)
@@ -2714,6 +2887,7 @@ static bool linkKickoff(link_conn_t& c)
         c.link.set_link_established_callback(onLinkEstablishedCb);
         c.link.set_link_closed_callback(onLinkClosedCb);
         c.link.set_packet_callback(onLinkPacketCb);
+        linkWireResource(c.link);                 /* Phase F */
         c.state = LST_ESTABLISHING;
         c.estab_deadline = RNS::Utilities::OS::time() + 60.0;
         linkPublishState(c);
@@ -2742,6 +2916,10 @@ static void linkFreeSlot(link_conn_t& c)
     c.identity_key.clear();
     c.pend_used = false;
     c.pend_bytes.clear();
+    c.consumer_task = nullptr;
+    c.res_hash = RNS::Bytes();
+    c.res_outbound = false;
+    c.res_opaque = 0;
     c.state = LST_FREE;
 }
 
@@ -2840,6 +3018,10 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     c->estab_deadline = 0;
     c->pend_used    = false;
     c->pend_bytes.clear();
+    c->consumer_task = itsRemoteTask(handle);   /* Phase F resource aux target */
+    c->res_hash      = RNS::Bytes();
+    c->res_outbound  = false;
+    c->res_opaque    = 0;
 
     int path_to_s = storageGetInt("s.rnsd.link.path_timeout_s", 30);
     if (req.path_timeout_ms != 0) path_to_s = (int)(req.path_timeout_ms / 1000);
@@ -2931,18 +3113,72 @@ static void onLinkDisconnect(int ref)
  * Link and frees the slot + tag immediately. */
 static void onLinkAux(TaskHandle_t /*sender*/, const void* data, size_t len)
 {
-    if (len < 1 || ((const uint8_t*)data)[0] != RNSD_LINK_AUX_TEARDOWN) return;
-    char tag[24] = {};
-    size_t tl = len - 1; if (tl > sizeof(tag) - 1) tl = sizeof(tag) - 1;
-    memcpy(tag, (const uint8_t*)data + 1, tl);
-    link_conn_t* c = linkFindByTag(tag);
-    if (!c) { info("link[%s]: teardown — no such link", tag); return; }
-    info("link[%s]: explicit teardown", c->tag);
-    try { if (c->link) c->link.teardown(); } catch (...) {}
-    c->link  = RNS::Link{RNS::Type::NONE};
-    c->state = LST_CLOSED;
-    linkPublishState(*c);          /* subscribers observe the close … */
-    linkFreeSlot(*c);              /* … then slot + storage tree freed */
+    if (len < 1) return;
+    uint8_t op = ((const uint8_t*)data)[0];
+
+    if (op == RNSD_LINK_AUX_TEARDOWN) {
+        char tag[24] = {};
+        size_t tl = len - 1; if (tl > sizeof(tag) - 1) tl = sizeof(tag) - 1;
+        memcpy(tag, (const uint8_t*)data + 1, tl);
+        link_conn_t* c = linkFindByTag(tag);
+        if (!c) { info("link[%s]: teardown — no such link", tag); return; }
+        info("link[%s]: explicit teardown", c->tag);
+        try { if (c->link) c->link.teardown(); } catch (...) {}
+        c->link  = RNS::Link{RNS::Type::NONE};
+        c->state = LST_CLOSED;
+        linkPublishState(*c);          /* subscribers observe the close … */
+        linkFreeSlot(*c);              /* … then slot + storage tree freed */
+        return;
+    }
+
+    if (op == RNSD_LINK_AUX_SEND_RESOURCE) {
+        if (len < sizeof(rnsd_link_send_resource_t)) {
+            warn("link: short SEND_RESOURCE aux %zu", len);
+            return;
+        }
+        rnsd_link_send_resource_t req;
+        memcpy(&req, data, sizeof(req));
+        req.tag[sizeof(req.tag) - 1] = '\0';
+        void* buf = req.buf;            /* rnsd owns this now */
+        link_conn_t* c = linkFindByTag(req.tag);
+        if (!c || !c->link || c->state != LST_ACTIVE) {
+            warn("link[%s]: SEND_RESOURCE but link not active", req.tag);
+            if (buf) free(buf);
+            return;
+        }
+        if (c->res_hash.size()) {
+            warn("link[%s]: resource already in flight, dropping send",
+                 c->tag);
+            if (buf) free(buf);
+            return;
+        }
+        try {
+            /* Engine encrypts+chunks (copies) at construction; the
+             * Resource registers itself on the link's outgoing set and
+             * advertises. We can free the caller's buffer immediately. */
+            RNS::Resource res(RNS::Bytes((const uint8_t*)buf, req.len),
+                              c->link, /*advertise=*/true,
+                              /*auto_compress=*/false,
+                              /*concluded=*/onResConcluded,
+                              /*progress=*/nullptr);
+            if (buf) free(buf);
+            c->res_hash     = res.hash();
+            c->res_outbound = true;
+            c->res_opaque   = req.opaque_id;
+            char k[96];
+            linkKey(*c, "resource.state", k, sizeof(k));
+            storageSet(k, "sending");
+            linkKey(*c, "resource.size", k, sizeof(k));
+            storageSet(k, (int)req.len);
+            info("link[%s]: sending %uB resource (opaque=%u)",
+                 c->tag, (unsigned)req.len, (unsigned)req.opaque_id);
+        } catch (const std::exception& e) {
+            warn("link[%s]: resource send threw: %s", c->tag, e.what());
+            if (buf) free(buf);
+            resSendAux(*c, RNSD_LINK_RESOURCE_FAILED, nullptr, 0, 0);
+        }
+        return;
+    }
 }
 
 /* ─────────────── Phase D: inbound Link → consumer forwarding ───────────────
@@ -2995,6 +3231,11 @@ static void onIncomingLinkEstablished(RNS::Link& link)
 
     link.set_packet_callback(onLinkPacketCb);
     link.set_link_closed_callback(onLinkClosedCb);
+    linkWireResource(link);                       /* Phase F */
+    c->consumer_task = mc->link_listener_task;     /* resource aux target */
+    c->res_hash      = RNS::Bytes();
+    c->res_outbound  = false;
+    c->res_opaque    = 0;
 
     RNS::Bytes rid;
     {

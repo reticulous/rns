@@ -68,8 +68,54 @@ constexpr uint16_t RNSD_PORT_ANNOUNCES = 6;
 constexpr uint16_t RNSD_PORT_LINK = 10;
 
 enum : uint8_t {
-    RNSD_LINK_AUX_TEARDOWN = 0x01,   /* payload: tag string (≤23 chars) */
+    RNSD_LINK_AUX_TEARDOWN     = 0x01,  /* payload: tag string (≤23 chars) */
+    RNSD_LINK_AUX_SEND_RESOURCE = 0x02, /* payload: rnsd_link_send_resource_t —
+                                         * Phase F outbound big send (link.md
+                                         * §9.2). rnsd takes ownership of buf
+                                         * and frees it once the engine has
+                                         * copied it into encrypted parts. */
 };
+
+/** Outbound Resource send request (RNSD_PORT_LINK aux, Phase F).
+ *  Sent by rnsdLinkSendResource(). `buf` is a heap pointer in the shared
+ *  address space; rnsd reads it on its own task, constructs the Resource
+ *  (the engine copies the bytes), then free()s it. Caller must not touch
+ *  buf after the call returns. */
+typedef struct {
+    uint8_t  op;            /* RNSD_LINK_AUX_SEND_RESOURCE */
+    char     tag[24];       /* outbound link tag (rnsdLinkOpen) */
+    void*    buf;           /* heap ptr, rnsd-owned after the aux */
+    uint32_t len;
+    uint32_t opaque_id;     /* echoed back in OUTBOUND_DONE (lxmf mid) */
+} rnsd_link_send_resource_t;
+static_assert(sizeof(rnsd_link_send_resource_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_link_send_resource_t must fit ITS_MAX_MSG_DATA");
+
+/** Resource-aux opcodes (consumer's LXMF_LINK_RESOURCE_AUX_PORT). */
+enum : uint8_t {
+    RNSD_LINK_RESOURCE_INBOUND_DONE  = 0x01,  /* buf valid, consumer owns it */
+    RNSD_LINK_RESOURCE_OUTBOUND_DONE = 0x02,  /* buf null; opaque_id settles */
+    RNSD_LINK_RESOURCE_FAILED        = 0x03,  /* buf null; transfer aborted */
+};
+
+/** Resource handoff frame. rnsd opens a one-shot ITS connection to the
+ *  consumer's LXMF_LINK_RESOURCE_AUX_PORT carrying this as the connect
+ *  payload (mirrors the rnsd_link_incoming_t pattern). On INBOUND_DONE
+ *  the consumer takes ownership of `buf` and must rnsdResourceRelease()
+ *  it. ≤ ITS_MAX_MSG_DATA. */
+typedef struct {
+    uint8_t  opcode;                   /* RNSD_LINK_RESOURCE_* */
+    uint8_t  link_id[16];
+    uint8_t  resource_hash[32];
+    uint8_t  local_dest_hash[16];      /* which hosted dest (consumer→identity) */
+    void*    buf;                      /* PSRAM ptr; consumer owns on INBOUND_DONE */
+    uint32_t len;
+    uint32_t opaque_id;                /* OUTBOUND_DONE correlation */
+    uint8_t  flags;                    /* bit0 compressed, bit1 has_metadata */
+    uint8_t  reserved[5];
+} rnsd_link_resource_done_t;
+static_assert(sizeof(rnsd_link_resource_done_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_link_resource_done_t must fit ITS_MAX_MSG_DATA");
 
 /** RNS interface modes — mirrors Type::Interface::modes in microreticulum. */
 enum rns_iface_mode : uint8_t {
