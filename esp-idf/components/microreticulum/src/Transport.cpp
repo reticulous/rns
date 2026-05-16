@@ -188,7 +188,11 @@ DestinationEntry empty_destination_entry;
 	// Load transport identity
 	if (!_identity) {
 		char transport_identity_path[Type::Reticulum::FILEPATH_MAXSIZE];
-		snprintf(transport_identity_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/transport_identity", Reticulum::_storagepath);
+		int tip_n = snprintf(transport_identity_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/transport_identity", Reticulum::_storagepath);
+		if (tip_n < 0 || (size_t)tip_n >= (size_t)Type::Reticulum::FILEPATH_MAXSIZE) {
+			ERROR("Transport identity path truncated; skipping identity load");
+		}
+		else {
 		DEBUG("Checking for transport identity...");
 		try {
 			if (OS::file_exists(transport_identity_path)) {
@@ -206,6 +210,7 @@ DestinationEntry empty_destination_entry;
 		}
 		catch (const std::exception& e) {
 			ERRORF("Failed to check for transport identity, the contained exception was: %s", e.what());
+		}
 		}
 	}
 
@@ -1289,6 +1294,7 @@ DestinationEntry empty_destination_entry;
 		case Type::Packet::RESOURCE: return true;
 		case Type::Packet::CACHE_REQUEST: return true;
 		case Type::Packet::CHANNEL: return true;
+		default: break;
 	}
 
 	if (packet.destination_type() == Type::Destination::PLAIN) {
@@ -2170,7 +2176,6 @@ DestinationEntry empty_destination_entry;
 							//announce_destination.hash(packet.destination_hash());
 							Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, packet.destination_hash());
 							//announce_destination.hexhash(announce_destination.hash().toHex());
-							Type::Packet::context_types announce_context = Type::Packet::CONTEXT_NONE;
 							Bytes announce_data = packet.data();
 
 							Packet new_announce(
@@ -3302,6 +3307,7 @@ will announce it.
 	DBGF_DEMOTE("Path request for destination %s%s", destination_hash.toHex().c_str(), interface_str.c_str());
 
 	bool destination_exists_on_local_client = false;
+	(void)destination_exists_on_local_client;	// set for future use; not yet consumed
 	if (_local_client_interfaces.size() > 0) {
 		// CBA microStore
 		//auto& destination_entry = get_path(destination_hash);
@@ -3339,6 +3345,7 @@ TRACEF("announce_packet destination_hash: %s", announce_packet.destination_hash(
 TRACEF("announce_packet hops: %u", announce_packet.hops());
 TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 		const Bytes& next_hop = destination_entry._received_from;
+		(void)next_hop;	// referenced only by disabled-log diagnostics below
 		const Interface& receiving_interface = destination_entry.receiving_interface();
 
 		if (attached_interface.mode() == Type::Interface::MODE_ROAMING && attached_interface == receiving_interface) {

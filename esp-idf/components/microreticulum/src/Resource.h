@@ -132,6 +132,8 @@ namespace RNS {
 		Bytes generate_proof() const;
 
 		bool is_outbound() const;
+		bool is_request() const;
+		bool is_response() const;
 		size_t num_parts() const;
 
 		// Outbound: validate an inbound RESOURCE_PRF; conclude on match.

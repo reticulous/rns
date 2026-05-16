@@ -308,6 +308,7 @@ Recall last heard app_data for a destination hash.
 
 		_saving_known_destinations = true;
 		double save_start = OS::time();
+		(void)save_start;	// only consumed by a TODO/disabled block below
 
 		std::map<Bytes, IdentityEntry> storage_known_destinations;
 // TODO

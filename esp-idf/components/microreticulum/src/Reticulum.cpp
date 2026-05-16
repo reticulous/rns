@@ -351,6 +351,7 @@ void Reticulum::persist_data() {
 void Reticulum::clean_caches() {
 	TRACE("Cleaning resource and packet caches...");
 	double now = OS::time();
+	(void)now;	// only used by the RNS_USE_FS/RNS_PERSIST_PATHS block below
 
 #if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
 /*
@@ -404,9 +405,11 @@ void Reticulum::clear_caches() {
 	TRACE("Clearing resource and packet caches...");
 
 	try {
-		char destination_table_path[FILEPATH_MAXSIZE];
-		snprintf(destination_table_path, FILEPATH_MAXSIZE, "%s/destination_table", _storagepath);
-		OS::remove_file(destination_table_path);
+		// std::string build (no fixed buffer) — truncation impossible,
+		// silences -Wformat-truncation. OS::remove_file is a no-op stub
+		// in this fork (we own persistence) so this path is inert anyway.
+		const std::string destination_table_path = std::string(_storagepath) + "/destination_table";
+		OS::remove_file(destination_table_path.c_str());
 
 		OS::remove_directory(_cachepath);
 

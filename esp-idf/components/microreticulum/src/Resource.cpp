@@ -411,6 +411,14 @@ bool Resource::is_outbound() const {
 	return _object && _object->_outbound;
 }
 
+bool Resource::is_request() const {
+	return _object && _object->_flags.is_request;
+}
+
+bool Resource::is_response() const {
+	return _object && _object->_flags.is_response;
+}
+
 size_t Resource::num_parts() const {
 	return _object ? _object->_total_parts : 0;
 }

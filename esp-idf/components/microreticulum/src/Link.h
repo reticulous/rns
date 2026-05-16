@@ -130,7 +130,10 @@ namespace RNS {
 			using closed = void(*)(Link& link);
 			using packet = void(*)(const Bytes& plaintext, const Packet& packet);
 			using remote_identified = void(*)(const Link& link, const Identity& remote_identity);
-			using resource = void(*)(const ResourceAdvertisement& resource_advertisement);
+			// Returns true to accept the advertised resource (ACCEPT_APP).
+			// Upstream Reticulum gates ACCEPT_APP on the callback's return;
+			// rnsd uses it for the §9.1 size/concurrency policy.
+			using resource = bool(*)(const ResourceAdvertisement& resource_advertisement);
 			using resource_started = void(*)(const Resource& resource);
 			using resource_concluded = void(*)(const Resource& resource);
 		public:

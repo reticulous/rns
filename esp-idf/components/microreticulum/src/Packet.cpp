@@ -634,6 +634,7 @@ std::string Packet::dumpString() const {
 	//	unpack();
 	//}
 	bool encrypted = true;
+	(void)encrypted;	// dump diagnostic only; tracked but not emitted
 	std::string dump;
 	dump = "\n------------------------------------------------------------------------------\n";
 	dump += "hash:         " + _object->_packet_hash.toHex() + "\n";
@@ -649,7 +650,7 @@ std::string Packet::dumpString() const {
 		dump += "HEADER_2\n";
 		break;
 	default:
-		std::to_string(_object->_header_type) + "\n";
+		dump += std::to_string(_object->_header_type) + "\n";
 	}
 	//dump += "  transport_type:   " + std::to_string(_object->_transport_type) + "\n";
 	dump += "  transport_type:   ";
@@ -670,7 +671,7 @@ std::string Packet::dumpString() const {
 		dump += "NONE\n";
 		break;
 	default:
-		std::to_string(_object->_transport_type) + "\n";
+		dump += std::to_string(_object->_transport_type) + "\n";
 	}
 	//dump += "  destination_type: " + std::to_string(_object->_destination_type) + "\n";
 	dump += "  destination_type: ";
@@ -688,7 +689,7 @@ std::string Packet::dumpString() const {
 		dump += "LINK\n";
 		break;
 	default:
-		std::to_string(_object->_destination_type) + "\n";
+		dump += std::to_string(_object->_destination_type) + "\n";
 	}
 	//dump += "  packet_type:      " + std::to_string(_object->_packet_type) + "\n";
 	dump += "  packet_type:      ";
@@ -715,7 +716,7 @@ std::string Packet::dumpString() const {
 		}
 		break;
 	default:
-		std::to_string(_object->_packet_type) + "\n";
+		dump += std::to_string(_object->_packet_type) + "\n";
 	}
 	dump += "hops:         " + std::to_string(_object->_hops) + "\n";
 	dump += "transport:    " + _object->_transport_id.toHex() + "\n";
@@ -792,7 +793,7 @@ std::string Packet::dumpString() const {
 		dump += "LRPROOF\n";
 		break;
 	default:
-		std::to_string(_object->_context) + "\n";
+		dump += std::to_string(_object->_context) + "\n";
 	}
 	dump += "raw:          " + _object->_raw.toHex() + "\n";
 	dump += "  length:           " + std::to_string(_object->_raw.size()) + "\n";
