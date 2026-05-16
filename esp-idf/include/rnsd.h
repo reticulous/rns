@@ -153,16 +153,43 @@ int rnsdDestOpen(const char* aspect,
  *  itsSend is one Link packet, each itsRecv is one Link packet.
  *  No framing bytes — the bytes are the Link plaintext.
  *
- *  NOT YET IMPLEMENTED: mR's Link layer is stubbed in our fork.
- *  Returns -1 until Link support lands. The declaration is here so
- *  callers can compile against the eventual surface. */
+ *  The connect **accepts immediately** — the handle comes back before
+ *  the Reticulum handshake (path request → LR → LRPROOF → key
+ *  derivation) completes. The Link sits in "establishing" state; the
+ *  caller watches `rnsd.links.<tag>.state` (storage, browser-synced)
+ *  for the transition to "active" / "failed". Sends queued before the
+ *  Link is active are buffered (one-packet outbox) and flushed on
+ *  establishment, or dropped with `rnsd.links.<tag>.last_error` set.
+ *
+ *  `tag` is a caller-chosen short id (≤ 23 chars), unique per concurrent
+ *  in-flight link for that caller (e.g. "lxmf.id0.4"). It keys the
+ *  link's storage state tree `rnsd.links.<tag>.*` so the caller and the
+ *  browser can watch progress before the link_id is even derived.
+ *
+ *  `aspect` is the remote's dotted aspect ("lxmf.delivery"); rnsd splits
+ *  at the first dot for mR's Destination ctor. `identity_key` is the
+ *  storage path of our 128-hex identity private key, or "" for rnsd's
+ *  default ("secrets.rnsd.identity"). `path_timeout_ms` overrides the
+ *  path-wait budget; 0 = use `s.rnsd.link.path_timeout_s` (default 30).
+ *
+ *  Returns the ITS handle (≥ 0) on accept, or negative on immediate
+ *  failure (rnsd down, slot table full, duplicate tag, bad args). */
 int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                  const char*   aspect,
                  const char*   identity_key,
-                 uint32_t      timeout_ms,
+                 const char*   tag,
+                 uint32_t      path_timeout_ms,
                  int           ref,
                  void (*on_recv)(int handle, size_t bytes_avail),
                  void (*on_disconnect)(int handle));
+
+/** Explicitly tear down the outbound Link identified by `tag` and free
+ *  its slot + `rnsd.links.<tag>.*` state. Use this — not bare
+ *  itsDisconnect — when the consumer is truly done with the Link:
+ *  itsDisconnect only *parks* it for `s.rnsd.link.orphan_ttl_s` so a
+ *  returning consumer can re-attach (§10a.1). Returns true if the
+ *  teardown aux was queued to rnsd (not whether the Link existed). */
+bool rnsdLinkTeardown(const char* tag);
 
 /** Tell rnsd to forward incoming Reticulum Links for the destination
  *  behind `dest_handle` (obtained from rnsdDestOpen) to ITS port

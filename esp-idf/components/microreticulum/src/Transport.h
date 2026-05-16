@@ -384,6 +384,14 @@ namespace RNS {
 		inline static const RateTable& get_announce_rate_table() { return _announce_rate_table; }
 		inline static const LinkTable& get_link_table() { return _link_table; }
 
+		// Diptych: size getters for the Link-state tables, used by rnsd's
+		// `rnsd links` CLI / 1Hz stats publish to surface leaks during Phase B
+		// Link bringup. Read-only; std::set::size() is an atomic counter load
+		// on supported platforms, and a slightly-stale count is fine for the
+		// leak-detection use case.
+		inline static size_t pending_links_count() { return _pending_links.size(); }
+		inline static size_t active_links_count()  { return _active_links.size(); }
+
 	private:
 		static bool _demote_dbg;
 

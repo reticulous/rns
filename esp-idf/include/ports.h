@@ -53,11 +53,23 @@ constexpr uint16_t RNSD_PORT_DGRAM = 5;
  *  diptych-core's log `:1` consumers (see core `log.cpp`). */
 constexpr uint16_t RNSD_PORT_ANNOUNCES = 6;
 
-/** Generic Reticulum Link → ITS connection. Connect payload identifies the
- *  remote destination; rnsd establishes a Link and bridges in/out packets
- *  to/from the ITS connection. Deferred — needs mR Link support, which
- *  isn't there yet. */
+/** Generic Reticulum Link → ITS connection (Phase C — link.md §6).
+ *  Connect payload (rnsd-private rnsd_link_connect_t, built by
+ *  rnsdLinkOpen()) identifies the remote destination; rnsd establishes
+ *  the Link asynchronously and bridges plaintext packets to/from the
+ *  packet-mode ITS handle (no framing bytes on the data path).
+ *
+ *  Consumer-initiated **explicit teardown** is an out-of-band aux frame
+ *  on this same port (the data path stays type-byte-free): the payload
+ *  is the link's `tag` string. itsDisconnect alone only *parks* the
+ *  Link for `s.rnsd.link.orphan_ttl_s` (§10a.1 in-session reconnect);
+ *  the aux is how a consumer says "really close it now, free the tag".
+ *  Sent via rnsdLinkTeardown(tag) from rnsd.h. */
 constexpr uint16_t RNSD_PORT_LINK = 10;
+
+enum : uint8_t {
+    RNSD_LINK_AUX_TEARDOWN = 0x01,   /* payload: tag string (≤23 chars) */
+};
 
 /** RNS interface modes — mirrors Type::Interface::modes in microreticulum. */
 enum rns_iface_mode : uint8_t {
@@ -92,7 +104,23 @@ enum : uint8_t {
     RNSD_DEST_IN_PACKET  = 0x04,   /* rnsd → app: bytes (decrypted plaintext) */
     RNSD_DEST_OUT_STATUS = 0x05,   /* rnsd → app: send_id(2) | type(1) | tail */
     RNSD_DEST_ANNOUNCE   = 0x06,   /* app → rnsd: app_data bytes (may be empty) */
+    RNSD_DEST_LINK_LISTEN = 0x07,  /* app → rnsd: link_inbox_port(2 BE) — Phase D */
 };
+
+/** Connect payload rnsd sends to the consumer's registered
+ *  link_inbox_port on every accepted *inbound* Link (Phase D, §7.2).
+ *  ≤ ITS_MAX_MSG_DATA. The consumer learns the rnsd-generated tag here
+ *  so it can cross-reference rnsd.links.<tag>.* state. */
+typedef struct {
+    char     tag[24];                  /* rnsd-generated "in.<8hex>" */
+    uint8_t  link_id[16];
+    uint8_t  remote_identity_hash[16]; /* zeroed if peer not identified yet */
+    uint8_t  local_dest_hash[16];      /* which hosted dest it landed on */
+    uint16_t mtu;
+    uint8_t  reserved[6];
+} rnsd_link_incoming_t;
+static_assert(sizeof(rnsd_link_incoming_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_link_incoming_t must fit ITS_MAX_MSG_DATA");
 
 /** OUT_RESULT.status. */
 enum : uint8_t {
@@ -129,4 +157,11 @@ static_assert(sizeof(rnsd_announces_connect_t) <= ITS_MAX_MSG_DATA,
 /* lxmf has no client-facing ports. Storage is the API — every frontend
  * is a view over `s.lxmf.*` / `lxmf.*` / `secrets.lxmf.*` keys, and the
  * lxmf task subscribes to its own subtree to drive state changes. See
- * docs/plans/lxmf.md §3 for the rationale. */
+ * docs/plans/lxmf.md §3 for the rationale.
+ *
+ * The two ports below are *internal* (rnsd → lxmf only), not client-
+ * facing: rnsd back-connects accepted inbound Links here after lxmf
+ * registers via rnsdDestListenLinks() on its lxmf.delivery handle.
+ * Phase E uses LINK_INBOX; LINK_RESOURCE_AUX is reserved for Phase F. */
+constexpr uint16_t LXMF_LINK_INBOX_PORT        = 100;  /* inbound Link forwards */
+constexpr uint16_t LXMF_LINK_RESOURCE_AUX_PORT = 101;  /* Resource handoff (Phase F) */

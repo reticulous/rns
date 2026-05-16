@@ -38,6 +38,7 @@
 #include "Transport.h"
 #include "Reticulum.h"
 #include "Destination.h"
+#include "Link.h"
 #include "Persistence/DestinationEntry.h"
 #include "Utilities/OS.h"
 
@@ -169,7 +170,21 @@ typedef struct {
 static_assert(sizeof(rnsd_dest_connect_t) <= ITS_MAX_MSG_DATA,
               "rnsd_dest_connect_t must fit ITS_MAX_MSG_DATA");
 
+/* RNSD_PORT_LINK connect payload — rnsd-private (mirrors
+ * rnsd_dest_connect_t; consumers go through rnsdLinkOpen() in rnsd.h,
+ * which fills it from typed args). Phase C — docs/plans/link.md §6.1. */
+typedef struct {
+    uint8_t  dest_hash[RNSD_DEST_HASH_LEN];  /* target destination hash */
+    char     aspect[32];                     /* "lxmf.delivery" */
+    char     identity_key[40];               /* our id privkey path; "" → default */
+    char     tag[24];                        /* caller tag, keys rnsd.links.<tag>.* */
+    uint32_t path_timeout_ms;                /* 0 → s.rnsd.link.path_timeout_s */
+} rnsd_link_connect_t;
+static_assert(sizeof(rnsd_link_connect_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_link_connect_t must fit ITS_MAX_MSG_DATA");
+
 #define RNSD_MAX_MAILBOX_CONNS    4
+#define RNSD_MAX_LINK_CONNS       8
 
 /* Length-checked inbound buffer for the IN destination dispatcher. RNS
  * MTU is 500 — 600 covers framing slack. */
@@ -195,6 +210,12 @@ struct mailbox_conn_t {
     RNS::Identity              listener_identity{RNS::Type::NONE};
     RNS::Destination           listener_dest{RNS::Type::NONE};
     RNS::Bytes                 listener_hash;          /* for inbound dispatch lookup */
+
+    /* Phase D — RNSD_DEST_LINK_LISTEN. Zero = not listening for Links.
+     * link_listener_task is itsRemoteTask(handle) cached at register
+     * time so inbound Links back-connect without a name lookup. */
+    TaskHandle_t               link_listener_task = nullptr;
+    uint16_t                   link_inbox_port    = 0;
 
     mailbox_pending_t          pending;                /* one in-flight at a time */
 };
@@ -581,6 +602,10 @@ static int mailboxTrySend(mailbox_conn_t& c, uint16_t send_id,
 /* mR's packet callback for incoming LXM-style packets on any listener
  * destination. We don't get a user-data slot, so the dispatcher walks
  * the conn table comparing destination hashes. */
+/* Phase D: inbound-Link established callback, set on every listening IN
+ * destination. Defined in the Phase C block (needs s_link_conns etc.). */
+static void onIncomingLinkEstablished(RNS::Link& link);
+
 static void onMailboxInbound(const RNS::Bytes& plaintext, const RNS::Packet& packet)
 {
     mailbox_conn_t* c = mailboxFindByDestHash(packet.destination().hash());
@@ -678,6 +703,17 @@ static int onMailboxConnect(int handle, const void* data, size_t len)
         info("mailbox conn %d open: aspect=%s identity=%s dest=%s",
              (int)(slot - s_mailbox_conns), slot->req.aspect,
              id.hexhash().c_str(), d.hash().toHex().c_str());
+        /* Observability: surface hosted destinations to storage so the
+         * browser / CLI can see what we host (and so tests can resolve
+         * a dest hash without log access). */
+        {
+            int idx = (int)(slot - s_mailbox_conns);
+            char k[64];
+            snprintf(k, sizeof(k), "rnsd.mailbox.%d.aspect", idx);
+            storageSet(k, slot->req.aspect);
+            snprintf(k, sizeof(k), "rnsd.mailbox.%d.dest", idx);
+            storageSet(k, d.hash().toHex().c_str());
+        }
     } catch (const std::exception& e) {
         err("mailbox connect: Destination ctor threw: %s", e.what());
     }
@@ -696,8 +732,15 @@ static void onMailboxDisconnect(int ref)
         try { RNS::Transport::deregister_destination(c.listener_dest); }
         catch (const std::exception& e) { warn("deregister_destination threw: %s", e.what()); }
     }
+    {
+        char p[48];
+        snprintf(p, sizeof(p), "rnsd.mailbox.%d", ref);
+        storageDeleteTree(p);
+    }
     c.used   = false;
     c.handle = -1;
+    c.link_listener_task = nullptr;
+    c.link_inbox_port    = 0;
     c.listener_identity = RNS::Identity(RNS::Type::NONE);
     c.listener_dest     = RNS::Destination(RNS::Type::NONE);
     c.listener_hash     = RNS::Bytes();
@@ -769,6 +812,28 @@ static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
             } catch (const std::exception& e) {
                 err("mailbox: announce threw: %s", e.what());
             }
+            break;
+        }
+        case RNSD_DEST_LINK_LISTEN: {
+            if (!c->listener_dest) {
+                warn("mailbox: LINK_LISTEN on outbound-only conn");
+                break;
+            }
+            if (n < 3) { err("mailbox: LINK_LISTEN too short (%zu)", n); break; }
+            uint16_t port = ((uint16_t)buf[1] << 8) | (uint16_t)buf[2];
+            if (port == 0) { warn("mailbox: LINK_LISTEN port 0"); break; }
+            c->link_listener_task = itsRemoteTask(handle);
+            c->link_inbox_port    = port;
+            try {
+                c->listener_dest.set_link_established_callback(
+                    onIncomingLinkEstablished);
+                c->listener_dest.accepts_links(true);
+            } catch (const std::exception& e) {
+                err("mailbox: LINK_LISTEN wiring threw: %s", e.what());
+                break;
+            }
+            info("mailbox conn %d: listening for inbound Links → port %u",
+                 (int)(c - s_mailbox_conns), (unsigned)port);
             break;
         }
         default:
@@ -1378,11 +1443,16 @@ static void cliRnsd(const char* args)
 {
     if (args && strcmp(args, "help") == 0) {
         cliPrintf("  %-*s identity & control (see rnstatus for status)\n",
-                  CLI_HELP_COL, "rnsd [identity|persist|reload]");
+                  CLI_HELP_COL, "rnsd [identity|persist|reload|link …|links|clink …]");
         return;
     }
     if (!args || !*args) {
         cliPrintf("usage: rnsd [identity|persist [if-transport]|reload]\n");
+        cliPrintf("       rnsd link <dest_hash> [aspect]   — outbound Link probe (Phase B)\n");
+        cliPrintf("       rnsd link teardown               — drop the active probe link\n");
+        cliPrintf("       rnsd links                       — pending/active Link table sizes\n");
+        cliPrintf("       rnsd clink <dest_hash> [aspect]  — Phase C consumer-API link\n");
+        cliPrintf("       rnsd clink send <text> | close\n");
         cliPrintf("       rnstatus  — interfaces & traffic\n");
         cliPrintf("       rnpath    — routing paths\n");
         cliPrintf("       rnprobe   — RTT probe\n");
@@ -1405,7 +1475,43 @@ static void cliRnsd(const char* args)
         loadOrCreateIdentity();
         return;
     }
-    cliPrintf("usage: rnsd [identity|persist [if-transport]|reload]\n");
+    if (strncmp(args, "link", 4) == 0 && (args[4] == 0 || args[4] == ' ')) {
+        const char* rest = args + 4;
+        while (*rest == ' ') rest++;
+        if (!*rest) {
+            cliPrintf("usage: rnsd link <dest_hash> [aspect]\n");
+            cliPrintf("       rnsd link teardown\n");
+            cliPrintf("  default aspect: rnstransport.probe\n");
+            return;
+        }
+        /* Hand off to the rnsd task via storage subscriber. CLI prints
+         * the queue ack; subsequent state transitions land in the log. */
+        storageSet("rnsd.cmd.link.open", rest);
+        cliPrintf("rnsd link: queued (%s) — watch log for state transitions\n", rest);
+        return;
+    }
+    if (strcmp(args, "links") == 0) {
+        cliPrintf("pending_links: %zu\n", RNS::Transport::pending_links_count());
+        cliPrintf("active_links:  %zu\n", RNS::Transport::active_links_count());
+        return;
+    }
+    if (strncmp(args, "clink", 5) == 0 && (args[5] == 0 || args[5] == ' ')) {
+        const char* rest = args + 5;
+        while (*rest == ' ') rest++;
+        if (!*rest) {
+            cliPrintf("usage: rnsd clink <dest_hash> [aspect]   — Phase C outbound link\n");
+            cliPrintf("       rnsd clink send <text>\n");
+            cliPrintf("       rnsd clink close\n");
+            cliPrintf("       rnsd clink listen <aspect>        — Phase D: host dest, accept inbound Links\n");
+            cliPrintf("       rnsd clink listen off\n");
+            cliPrintf("  default aspect: lxmf.delivery; watch rnsd.links.* / log\n");
+            return;
+        }
+        storageSet("rnsd.cmd.clink", rest);
+        cliPrintf("rnsd clink: queued (%s) — watch rnsd.links.clink.* and log\n", rest);
+        return;
+    }
+    cliPrintf("usage: rnsd [identity|persist [if-transport]|reload|link …|links|clink …]\n");
 }
 
 /* ─────────────── rnpath ─────────────── */
@@ -2107,26 +2213,56 @@ int rnsdDestOpen(const char* aspect,
                       ref, on_recv, on_disconnect);
 }
 
-int rnsdLinkOpen(const uint8_t /*dest_hash*/[RNSD_DEST_HASH_LEN],
-                 const char* /*aspect*/,
-                 const char* /*identity_key*/,
-                 uint32_t    /*timeout_ms*/,
-                 int         /*ref*/,
-                 void (*/*on_recv*/)(int, size_t),
-                 void (*/*on_disconnect*/)(int))
+int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+                 const char*   aspect,
+                 const char*   identity_key,
+                 const char*   tag,
+                 uint32_t      path_timeout_ms,
+                 int           ref,
+                 void (*on_recv)(int, size_t),
+                 void (*on_disconnect)(int))
 {
-    /* mR's Link layer is stubbed in our fork — Link::validate_request
-     * et al. are no-ops. Defined here so callers compile cleanly today
-     * and can switch on availability later. See rnsd.h. */
-    err("rnsdLinkOpen: Link layer not yet implemented in this build");
-    return -1;
+    if (!aspect || !*aspect) { warn("rnsdLinkOpen: aspect required"); return -1; }
+    if (!tag || !*tag)       { warn("rnsdLinkOpen: tag required");    return -1; }
+    rnsd_link_connect_t req = {};
+    memcpy(req.dest_hash, dest_hash, RNSD_DEST_HASH_LEN);
+    safeStrncpy(req.aspect, aspect, sizeof(req.aspect));
+    safeStrncpy(req.tag, tag, sizeof(req.tag));
+    if (identity_key && *identity_key)
+        safeStrncpy(req.identity_key, identity_key, sizeof(req.identity_key));
+    req.path_timeout_ms = path_timeout_ms;
+    return itsConnect("rnsd", RNSD_PORT_LINK,
+                      &req, sizeof(req), pdMS_TO_TICKS(2000),
+                      ref, on_recv, on_disconnect);
 }
 
-bool rnsdDestListenLinks(int      /*dest_handle*/,
-                         uint16_t /*target_port*/)
+bool rnsdLinkTeardown(const char* tag)
 {
-    err("rnsdDestListenLinks: Link layer not yet implemented in this build");
-    return false;
+    if (!tag || !*tag) { warn("rnsdLinkTeardown: tag required"); return false; }
+    uint8_t buf[1 + 24];
+    buf[0] = RNSD_LINK_AUX_TEARDOWN;
+    size_t tl = strnlen(tag, 23);
+    memcpy(buf + 1, tag, tl);
+    return itsSendAux("rnsd", RNSD_PORT_LINK, buf, 1 + tl,
+                      pdMS_TO_TICKS(500));
+}
+
+bool rnsdDestListenLinks(int dest_handle, uint16_t target_port)
+{
+    if (dest_handle < 0 || target_port == 0) {
+        warn("rnsdDestListenLinks: bad args");
+        return false;
+    }
+    /* In-band frame on the existing RNSD_PORT_DEST handle (§7.1) — rnsd
+     * already knows the owning task via itsRemoteTask(handle), so the
+     * frame only carries the inbox port. The act of sending it on a
+     * handle you own proves you own the destination. */
+    uint8_t f[3] = {
+        RNSD_DEST_LINK_LISTEN,
+        (uint8_t)(target_port >> 8),
+        (uint8_t)(target_port & 0xFF),
+    };
+    return itsSend(dest_handle, f, sizeof(f), pdMS_TO_TICKS(500)) == sizeof(f);
 }
 
 /* Subscription handler for rnsdRequestPath. Runs on rnsd's task. */
@@ -2151,11 +2287,974 @@ static void onCmdRequestPath(const char* key, const char* val)
     storageUnset(key);
 }
 
+/* ─────────────── one-shot Link probe (Phase B §5.1.6) ───────────────
+ *
+ * `rnsd link <hash> [aspect]` triggers an outbound Link establishment to
+ * the named destination, with state transitions logged via info(). This
+ * is the device-side counterpart to scripts/link-probe (which exercises
+ * the inbound path). It deliberately skips the eventual rnsdLinkOpen()
+ * consumer API (Phase C) — Phase B is just about getting establishment
+ * to work end-to-end, so we hold one Link in a static slot and report.
+ *
+ * `rnsd link teardown` drops the active probe link (if any). Without
+ * that, a stuck-in-PENDING link stays until mR's stale-time cull. */
+
+static RNS::Link s_probe_link{RNS::Type::NONE};
+
+static void onProbeLinkEstablished(RNS::Link& link)
+{
+    /* link.link_id() and friends are valid only once ACTIVE, hence the
+     * full dump on this callback. RTT comes from the LRPROOF round-trip. */
+    info("rnsd link: ESTABLISHED link_id=%s mtu=%u rtt=%.3fs",
+         link.link_id().toHex().c_str(),
+         (unsigned)link.get_mtu(),
+         link.rtt());
+
+    /* Phase B §5.1.6: send one test packet on establish so we exercise the
+     * encrypted send path and (for an echo-style peer) get a reply on the
+     * packet callback. RNS::Packet(link, payload).send() per upstream's
+     * Link API — Link::send is not a member, that's the Packet ctor that
+     * branches on its destination's type (Link vs SINGLE). */
+    try {
+        static const RNS::Bytes probe_payload =
+            RNS::Bytes((const uint8_t*)"reticulous probe", 16);
+        RNS::Packet pkt(link, probe_payload);
+        pkt.send();
+        info("rnsd link: sent test packet (16B)");
+    } catch (const std::exception& e) {
+        warn("rnsd link: test send threw: %s", e.what());
+    }
+}
+
+static void onProbeLinkClosed(RNS::Link& link)
+{
+    info("rnsd link: CLOSED reason=%u",
+         (unsigned)link.teardown_reason());
+    /* Single-slot design — clear unconditionally so the next `rnsd link
+     * <hash>` doesn't trip the "previous probe link still exists" branch.
+     * Comparing &link == &s_probe_link wouldn't work: mR copies Link
+     * wrappers into its tables (shared_ptr backed), so the callback runs
+     * with a different wrapper address even when the underlying state is
+     * ours. */
+    s_probe_link = RNS::Link{RNS::Type::NONE};
+}
+
+static void onProbeLinkPacket(const RNS::Bytes& plaintext,
+                              const RNS::Packet& /*packet*/)
+{
+    size_t n = plaintext.size();
+    size_t show = n < 32 ? n : 32;
+    info("rnsd link: PKT %zuB head=%s%s",
+         n,
+         RNS::Bytes(plaintext.data(), show).toHex().c_str(),
+         n > show ? "…" : "");
+}
+
+/* Subscription handler for `rnsd link <hash> [aspect]`. Runs on rnsd's
+ * task — mR's Link constructor takes Transport state and the callbacks
+ * fire on the rnsd task too, so we must build the Link here, not on CLI. */
+static void onCmdLinkOpen(const char* key, const char* val)
+{
+    if (!val || !*val) { storageUnset(key); return; }
+
+    std::string cmd = val;
+    storageUnset(key);  /* consume — single-shot */
+
+    /* Special verb: teardown the active probe link. */
+    if (cmd == "teardown") {
+        if (!s_probe_link) {
+            info("rnsd link: no active probe link to tear down");
+            return;
+        }
+        try {
+            s_probe_link.teardown();
+            info("rnsd link: teardown requested");
+        } catch (const std::exception& e) {
+            warn("rnsd link: teardown threw: %s", e.what());
+        }
+        s_probe_link = RNS::Link{RNS::Type::NONE};
+        return;
+    }
+
+    /* Parse: "<32-hex> [<aspect>]" */
+    std::string hash_hex, aspect = "rnstransport.probe";
+    size_t sp = cmd.find(' ');
+    if (sp == std::string::npos) {
+        hash_hex = cmd;
+    } else {
+        hash_hex = cmd.substr(0, sp);
+        aspect   = cmd.substr(sp + 1);
+        while (!aspect.empty() && aspect[0] == ' ') aspect.erase(0, 1);
+    }
+
+    if (hash_hex.size() != RNSD_DEST_HASH_LEN * 2) {
+        warn("rnsd link: bad hash length (got %zu, need %u)",
+             hash_hex.size(), (unsigned)(RNSD_DEST_HASH_LEN * 2));
+        return;
+    }
+
+    RNS::Bytes dh;
+    try { dh.assignHex((const uint8_t*)hash_hex.c_str(), hash_hex.size()); }
+    catch (...) { warn("rnsd link: bad hash hex"); return; }
+    if (dh.size() != RNSD_DEST_HASH_LEN) {
+        warn("rnsd link: bad hash bytes");
+        return;
+    }
+
+    /* Aspect format mirrors what mailbox does (rnsd.cpp ~line 538): split
+     * at first dot → app_name + aspects. "rnstransport.probe" → app
+     * "rnstransport" aspect "probe"; "lxmf.delivery" → "lxmf"/"delivery". */
+    std::string app_name = aspect, aspects;
+    auto dot = aspect.find('.');
+    if (dot != std::string::npos) {
+        app_name = aspect.substr(0, dot);
+        aspects  = aspect.substr(dot + 1);
+    }
+
+    /* Recall identity; if absent, request a path and tell the user to retry
+     * once the announce lands. Asynchronous path waits don't belong in a
+     * storage subscriber — keep this side simple. */
+    RNS::Identity target = RNS::Identity::recall(dh);
+    if (!target) {
+        info("rnsd link: no identity cached for %s, requesting path — retry once announced",
+             hash_hex.c_str());
+        try { RNS::Transport::request_path(dh); }
+        catch (const std::exception& e) {
+            warn("rnsd link: request_path threw: %s", e.what());
+        }
+        return;
+    }
+
+    if (s_probe_link) {
+        warn("rnsd link: previous probe link still exists, replacing");
+        try { s_probe_link.teardown(); } catch (...) {}
+        s_probe_link = RNS::Link{RNS::Type::NONE};
+    }
+
+    try {
+        RNS::Destination out_dest(target,
+                                  RNS::Type::Destination::OUT,
+                                  RNS::Type::Destination::SINGLE,
+                                  app_name.c_str(), aspects.c_str());
+        info("rnsd link: opening Link → %s aspect=%s",
+             hash_hex.c_str(), aspect.c_str());
+        s_probe_link = RNS::Link(out_dest);
+        s_probe_link.set_link_established_callback(onProbeLinkEstablished);
+        s_probe_link.set_link_closed_callback(onProbeLinkClosed);
+        s_probe_link.set_packet_callback(onProbeLinkPacket);
+    } catch (const std::exception& e) {
+        warn("rnsd link threw: %s", e.what());
+        s_probe_link = RNS::Link{RNS::Type::NONE};
+    }
+}
+
+/* ─────────────── Phase C: RNSD_PORT_LINK outbound consumer API ───────────────
+ *
+ * docs/plans/link.md §6. Consumers (lxmf in Phase E, CLI tools) call
+ * rnsdLinkOpen() → itsConnect(RNSD_PORT_LINK) with an rnsd-private
+ * rnsd_link_connect_t. The connect accepts immediately; the Link
+ * establishes asynchronously on the rnsd task. Per-link progress is
+ * published to the ephemeral rnsd.links.<tag>.* tree (browser-synced
+ * for free via storage's empty-prefix subscriber). Slot↔Link is
+ * resolved by shared-LinkData pointer identity, not wrapper address —
+ * mR passes Link wrapper *copies* into callbacks; copies share the
+ * shared_ptr<LinkData> and the public operator< compares _object.get().
+ * See memory project_link_slot_mapping; refines §6.2 / decision #8.
+ *
+ * §10a.1 in-session consumer reconnect (re-attach a live Link to a
+ * returning consumer) is intentionally deferred: lxmf (Phase E) is the
+ * first reconnecting consumer and the plan treats 10a as cross-cutting
+ * C/D/E. Consumer disconnect here parks the Link for orphan_ttl then
+ * tears it down — it never silently dies with the handle. */
+
+enum link_state_t : uint8_t {
+    LST_FREE = 0, LST_AWAITING_PATH, LST_ESTABLISHING,
+    LST_ACTIVE, LST_CLOSING, LST_CLOSED, LST_FAILED
+};
+
+static const char* lstName(link_state_t s)
+{
+    switch (s) {
+        case LST_AWAITING_PATH: return "awaiting_path";
+        case LST_ESTABLISHING:  return "establishing";
+        case LST_ACTIVE:        return "active";
+        case LST_CLOSING:       return "closing";
+        case LST_CLOSED:        return "closed";
+        case LST_FAILED:        return "failed";
+        default:                return "free";
+    }
+}
+
+struct link_conn_t {
+    bool                 used;
+    int                  handle;        /* -1 once consumer disconnected */
+    int                  ref;           /* opaque, echoed to ITS callbacks */
+    char                 tag[24];
+    RNS::Bytes           dest_hash;
+    std::string          aspect;
+    std::string          identity_key;
+    link_state_t         state;
+    RNS::Link            link{RNS::Type::NONE};
+    double               opened_at;     /* OS::time() */
+    double               path_deadline; /* OS::time() a path must answer by */
+    double               estab_deadline;/* OS::time() ACTIVE must arrive by */
+    double               orphan_at;     /* OS::time() consumer left; 0 = attached */
+    double               dead_at;       /* OS::time() entered CLOSED/FAILED; 0 = n/a */
+    bool                 pend_used;     /* one-packet pre-active outbox */
+    std::vector<uint8_t> pend_bytes;
+};
+
+static link_conn_t* s_link_conns = nullptr;
+
+/* Two Link wrappers reference the same underlying LinkData iff neither
+ * orders before the other under mR's public operator< (which compares
+ * _object.get()). Works in every state — link_id is empty on a failed
+ * establishment, the shared_ptr identity is not. */
+static inline bool sameLink(const RNS::Link& a, const RNS::Link& b)
+{
+    return a && b && !(a < b) && !(b < a);
+}
+
+static link_conn_t* linkFindByHandle(int handle)
+{
+    if (handle < 0) return nullptr;
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)
+        if (s_link_conns[j].used && s_link_conns[j].handle == handle)
+            return &s_link_conns[j];
+    return nullptr;
+}
+
+static link_conn_t* linkFindByLink(const RNS::Link& l)
+{
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++) {
+        link_conn_t& c = s_link_conns[j];
+        if (c.used && c.link && sameLink(c.link, l)) return &c;
+    }
+    return nullptr;
+}
+
+static link_conn_t* linkFindByTag(const char* tag)
+{
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)
+        if (s_link_conns[j].used && strcmp(s_link_conns[j].tag, tag) == 0)
+            return &s_link_conns[j];
+    return nullptr;
+}
+
+static link_conn_t* linkAlloc(void)
+{
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)
+        if (!s_link_conns[j].used) return &s_link_conns[j];
+    return nullptr;
+}
+
+/* rnsd.links.<tag>.<field> — segments are well under the 95-char cap. */
+static void linkKey(const link_conn_t& c, const char* field,
+                    char* out, size_t n)
+{
+    snprintf(out, n, "rnsd.links.%s.%s", c.tag, field);
+}
+
+static void linkSetStr(const link_conn_t& c, const char* field, const char* v)
+{
+    char k[96];
+    linkKey(c, field, k, sizeof(k));
+    storageSet(k, v);
+}
+
+static void linkSetInt(const link_conn_t& c, const char* field, int v)
+{
+    char k[96];
+    linkKey(c, field, k, sizeof(k));
+    storageSet(k, v);
+}
+
+static void linkPublishState(link_conn_t& c)
+{
+    linkSetStr(c, "state", lstName(c.state));
+}
+
+static void linkSetError(link_conn_t& c, const char* err_msg)
+{
+    linkSetStr(c, "last_error", err_msg);
+}
+
+/* Resolve our local identity for the OUT destination. Mirrors the
+ * mailbox path: identity_key or the rnsd default. */
+static bool linkLoadIdentity(const std::string& identity_key, RNS::Identity& out)
+{
+    const char* key = !identity_key.empty()
+                     ? identity_key.c_str() : "secrets.rnsd.identity";
+    char hex[160] = {};
+    storageGetStr(key, hex, sizeof(hex), "");
+    if (strlen(hex) != 128) {
+        warn("link: no identity at %s", key);
+        return false;
+    }
+    RNS::Bytes prv;
+    prv.assignHex((const uint8_t*)hex, 128);
+    if (prv.size() != 64) { warn("link: bad identity hex at %s", key); return false; }
+    RNS::Identity id(false);
+    if (!id.load_private_key(prv)) {
+        warn("link: identity load failed for %s", key);
+        return false;
+    }
+    out = id;
+    return true;
+}
+
+static void onLinkEstablishedCb(RNS::Link& link)
+{
+    link_conn_t* c = linkFindByLink(link);
+    if (!c) { warn("link: established cb, no slot"); return; }
+
+    c->state         = LST_ACTIVE;
+    c->orphan_at     = 0;
+    c->estab_deadline = 0;
+    std::string lid  = link.link_id().toHex();
+    info("link[%s]: ACTIVE link_id=%s mtu=%u rtt=%.3fs",
+         c->tag, lid.c_str(), (unsigned)link.get_mtu(), link.rtt());
+
+    linkSetStr(*c, "link_id", lid.c_str());
+    linkSetInt(*c, "mtu", (int)link.get_mtu());
+    linkSetInt(*c, "rtt_ms", (int)(link.rtt() * 1000.0));
+    linkSetInt(*c, "activated_s", (int)RNS::Utilities::OS::time());
+    linkPublishState(*c);
+    /* Reverse index for inbound/link_id-only lookups (Phase D uses it). */
+    {
+        char k[96];
+        snprintf(k, sizeof(k), "rnsd.links.byid.%s", lid.c_str());
+        storageSet(k, c->tag);
+    }
+
+    /* Flush the one-packet pre-active outbox. */
+    if (c->pend_used) {
+        try {
+            RNS::Packet pkt(c->link,
+                            RNS::Bytes(c->pend_bytes.data(), c->pend_bytes.size()));
+            pkt.send();
+            linkSetInt(*c, "tx_packets", 1);
+            linkSetInt(*c, "last_outbound_s", (int)RNS::Utilities::OS::time());
+            info("link[%s]: flushed queued %zuB on establish",
+                 c->tag, c->pend_bytes.size());
+        } catch (const std::exception& e) {
+            warn("link[%s]: flush send threw: %s", c->tag, e.what());
+            linkSetError(*c, "flush_failed");
+        }
+        c->pend_used = false;
+        c->pend_bytes.clear();
+    }
+}
+
+static void onLinkClosedCb(RNS::Link& link)
+{
+    link_conn_t* c = linkFindByLink(link);
+    if (!c) return;   /* already culled */
+    unsigned reason = (unsigned)link.teardown_reason();
+    info("link[%s]: CLOSED reason=%u", c->tag, reason);
+    c->state   = LST_CLOSED;
+    c->dead_at = RNS::Utilities::OS::time();
+    if (reason == (unsigned)RNS::Type::Link::TIMEOUT)
+        linkSetError(*c, "timeout");
+    else if (reason == (unsigned)RNS::Type::Link::DESTINATION_CLOSED)
+        linkSetError(*c, "remote_closed");
+    linkPublishState(*c);
+    /* Release the mR wrapper now; slot + storage tree are reclaimed
+     * after a short grace window by linkTick so subscribers observe
+     * the "closed" transition first. */
+    c->link = RNS::Link{RNS::Type::NONE};
+}
+
+static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packet)
+{
+    /* No Link arg on this callback; Transport stamped packet.link()
+     * with the matched active Link just before link.receive(). */
+    link_conn_t* c = linkFindByLink(packet.link());
+    if (!c) { warn("link: inbound pkt, no slot"); return; }
+    if (c->handle < 0) return;   /* consumer detached; drop (orphan window) */
+    /* Packet-mode handle: one Link plaintext = one ITS packet, no type
+     * byte. Drop on back-pressure (timeout 0) rather than stall rnsd. */
+    size_t w = itsSend(c->handle, plaintext.data(), plaintext.size(), 0);
+    if (w == 0) {
+        linkSetError(*c, "rx_overflow");
+        return;
+    }
+    char k[96];
+    linkKey(*c, "rx_packets", k, sizeof(k));
+    storageSet(k, storageGetInt(k, 0) + 1);
+    linkSetInt(*c, "last_inbound_s", (int)RNS::Utilities::OS::time());
+}
+
+/* Construct the OUT destination + RNS::Link and wire callbacks. The
+ * target identity must already be recallable. Runs on the rnsd task. */
+static bool linkKickoff(link_conn_t& c)
+{
+    RNS::Identity target = RNS::Identity::recall(c.dest_hash);
+    if (!target) return false;
+
+    RNS::Identity local{RNS::Type::NONE};
+    if (!linkLoadIdentity(c.identity_key, local)) {
+        c.state = LST_FAILED;
+        linkSetError(c, "no_identity");
+        linkPublishState(c);
+        return true;   /* terminal — caller stops retrying */
+    }
+
+    std::string app_name = c.aspect, aspects;
+    auto dot = c.aspect.find('.');
+    if (dot != std::string::npos) {
+        app_name = c.aspect.substr(0, dot);
+        aspects  = c.aspect.substr(dot + 1);
+    }
+    try {
+        RNS::Destination out_dest(target, RNS::Type::Destination::OUT,
+                                  RNS::Type::Destination::SINGLE,
+                                  app_name.c_str(), aspects.c_str());
+        c.link = RNS::Link(out_dest);
+        c.link.set_link_established_callback(onLinkEstablishedCb);
+        c.link.set_link_closed_callback(onLinkClosedCb);
+        c.link.set_packet_callback(onLinkPacketCb);
+        c.state = LST_ESTABLISHING;
+        c.estab_deadline = RNS::Utilities::OS::time() + 60.0;
+        linkPublishState(c);
+        info("link[%s]: kickoff → %s aspect=%s", c.tag,
+             c.dest_hash.toHex().c_str(), c.aspect.c_str());
+    } catch (const std::exception& e) {
+        warn("link[%s]: kickoff threw: %s", c.tag, e.what());
+        c.state = LST_FAILED;
+        linkSetError(c, "ctor_threw");
+        linkPublishState(c);
+    }
+    return true;
+}
+
+static void linkFreeSlot(link_conn_t& c)
+{
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "rnsd.links.%s", c.tag);
+    storageDeleteTree(prefix);
+    if (c.handle >= 0) itsDisconnect(c.handle);
+    c.used = false;
+    c.handle = -1;
+    c.link = RNS::Link{RNS::Type::NONE};
+    c.dest_hash = RNS::Bytes();
+    c.aspect.clear();
+    c.identity_key.clear();
+    c.pend_used = false;
+    c.pend_bytes.clear();
+    c.state = LST_FREE;
+}
+
+/* 1 Hz from the rnsd loop (tickPhase 0), beside mailboxTickPending. */
+static void linkTick(void)
+{
+    if (!s_link_conns) return;
+    double now = RNS::Utilities::OS::time();
+    int orphan_ttl = storageGetInt("s.rnsd.link.orphan_ttl_s", 600);
+
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++) {
+        link_conn_t& c = s_link_conns[j];
+        if (!c.used) continue;
+
+        switch (c.state) {
+        case LST_AWAITING_PATH:
+            if (RNS::Identity::recall(c.dest_hash)) {
+                linkKickoff(c);
+            } else if (now >= c.path_deadline) {
+                warn("link[%s]: no path within budget", c.tag);
+                c.state = LST_FAILED;
+                linkSetError(c, "no_path");
+                linkPublishState(c);
+                c.dead_at = now;
+            }
+            break;
+
+        case LST_ESTABLISHING:
+            if (c.estab_deadline != 0 && now >= c.estab_deadline) {
+                warn("link[%s]: establishment timed out", c.tag);
+                try { if (c.link) c.link.teardown(); } catch (...) {}
+                c.link = RNS::Link{RNS::Type::NONE};
+                c.state = LST_FAILED;
+                linkSetError(c, "establish_timeout");
+                linkPublishState(c);
+                c.dead_at = now;
+            }
+            break;
+
+        case LST_ACTIVE:
+            /* Consumer gone past the orphan budget → tear the Link down
+             * (§10a.1: consumer-handle close ≠ Link teardown; the
+             * orphan TTL is the backstop, not an immediate close). */
+            if (c.orphan_at != 0 && now - c.orphan_at >= orphan_ttl) {
+                info("link[%s]: orphan ttl elapsed, tearing down", c.tag);
+                try { if (c.link) c.link.teardown(); } catch (...) {}
+                c.state = LST_CLOSING;
+                linkPublishState(c);
+            }
+            break;
+
+        case LST_CLOSED:
+        case LST_FAILED:
+            /* Grace so subscribers see the terminal state, then reclaim. */
+            if (c.dead_at == 0) c.dead_at = now;
+            if (now - c.dead_at >= 3.0) linkFreeSlot(c);
+            break;
+
+        default:
+            break;
+        }
+    }
+}
+
+static int onLinkConnect(int handle, const void* data, size_t len)
+{
+    if (len != sizeof(rnsd_link_connect_t)) {
+        err("link connect: bad payload len %zu (want %zu)",
+            len, sizeof(rnsd_link_connect_t));
+        return -1;
+    }
+    rnsd_link_connect_t req;
+    memcpy(&req, data, sizeof(req));
+    req.aspect[sizeof(req.aspect) - 1]             = '\0';
+    req.identity_key[sizeof(req.identity_key) - 1] = '\0';
+    req.tag[sizeof(req.tag) - 1]                   = '\0';
+
+    if (req.tag[0] == '\0') { err("link connect: empty tag"); return -1; }
+    if (linkFindByTag(req.tag)) {
+        err("link connect: duplicate tag '%s'", req.tag);
+        return -1;
+    }
+    link_conn_t* c = linkAlloc();
+    if (!c) { err("link connect: no slots"); return -1; }
+
+    c->used   = true;
+    c->handle = handle;
+    c->ref    = (int)(c - s_link_conns);
+    safeStrncpy(c->tag, req.tag, sizeof(c->tag));
+    c->dest_hash    = RNS::Bytes(req.dest_hash, RNSD_DEST_HASH_LEN);
+    c->aspect       = req.aspect;
+    c->identity_key = req.identity_key;
+    c->opened_at    = RNS::Utilities::OS::time();
+    c->orphan_at    = 0;
+    c->dead_at      = 0;
+    c->estab_deadline = 0;
+    c->pend_used    = false;
+    c->pend_bytes.clear();
+
+    int path_to_s = storageGetInt("s.rnsd.link.path_timeout_s", 30);
+    if (req.path_timeout_ms != 0) path_to_s = (int)(req.path_timeout_ms / 1000);
+    c->path_deadline = c->opened_at + (path_to_s > 0 ? path_to_s : 30);
+
+    /* Initial state tree. storageSet (not Default) so the browser /
+     * consumer subscribers fire on every field. */
+    linkSetStr(*c, "direction", "out");
+    linkSetStr(*c, "aspect", c->aspect.c_str());
+    linkSetStr(*c, "remote_hash", c->dest_hash.toHex().c_str());
+    linkSetInt(*c, "opened_s", (int)c->opened_at);
+    linkSetStr(*c, "last_error", "");
+
+    if (RNS::Identity::recall(c->dest_hash)) {
+        c->state = LST_ESTABLISHING;
+        linkPublishState(*c);
+        linkKickoff(*c);
+    } else {
+        c->state = LST_AWAITING_PATH;
+        linkPublishState(*c);
+        info("link[%s]: no identity for %s, requesting path",
+             c->tag, c->dest_hash.toHex().c_str());
+        try { RNS::Transport::request_path(c->dest_hash); }
+        catch (const std::exception& e) {
+            warn("link[%s]: request_path threw: %s", c->tag, e.what());
+        }
+    }
+    return c->ref;
+}
+
+static void onLinkRecv(int handle, size_t /*bytesAvail*/)
+{
+    link_conn_t* c = linkFindByHandle(handle);
+    if (!c) return;
+    static uint8_t buf[2048];
+    size_t n = itsRecv(handle, buf, sizeof(buf), 0);
+    if (n == 0) return;
+
+    if (c->state == LST_ACTIVE && c->link) {
+        if (n > RNS::Type::Link::MDU) {
+            warn("link[%s]: oversize send %zuB", c->tag, n);
+            linkSetError(*c, "oversize");
+            return;
+        }
+        try {
+            RNS::Packet pkt(c->link, RNS::Bytes(buf, n));
+            pkt.send();
+            char k[96];
+            linkKey(*c, "tx_packets", k, sizeof(k));
+            storageSet(k, storageGetInt(k, 0) + 1);
+            linkSetInt(*c, "last_outbound_s", (int)RNS::Utilities::OS::time());
+        } catch (const std::exception& e) {
+            warn("link[%s]: send threw: %s", c->tag, e.what());
+            linkSetError(*c, "send_threw");
+        }
+        return;
+    }
+
+    /* Pre-active: one-packet outbox, drop-newer. */
+    if (c->pend_used) {
+        warn("link[%s]: send queue full, dropping newer %zuB", c->tag, n);
+        linkSetError(*c, "send_queue_full");
+        return;
+    }
+    c->pend_used = true;
+    c->pend_bytes.assign(buf, buf + n);
+}
+
+static void onLinkDisconnect(int ref)
+{
+    if (ref < 0 || ref >= RNSD_MAX_LINK_CONNS) return;
+    link_conn_t& c = s_link_conns[ref];
+    if (!c.used) return;
+    /* §10a.1: consumer handle close does NOT tear the Link down. Park
+     * it; linkTick tears down after s.rnsd.link.orphan_ttl_s if the
+     * consumer never comes back. Terminal slots just get reclaimed. */
+    c.handle = -1;
+    if (c.state == LST_ACTIVE || c.state == LST_ESTABLISHING ||
+        c.state == LST_AWAITING_PATH) {
+        c.orphan_at = RNS::Utilities::OS::time();
+        info("link[%s]: consumer detached, parking (orphan ttl)", c.tag);
+    }
+}
+
+/* Explicit consumer-initiated teardown (rnsdLinkTeardown → aux on
+ * RNSD_PORT_LINK). Runs on the rnsd task (itsOnAux dispatches on the
+ * registering task), where mR Link state must be touched. Distinct
+ * from onLinkDisconnect's park-for-reconnect: this fully closes the
+ * Link and frees the slot + tag immediately. */
+static void onLinkAux(TaskHandle_t /*sender*/, const void* data, size_t len)
+{
+    if (len < 1 || ((const uint8_t*)data)[0] != RNSD_LINK_AUX_TEARDOWN) return;
+    char tag[24] = {};
+    size_t tl = len - 1; if (tl > sizeof(tag) - 1) tl = sizeof(tag) - 1;
+    memcpy(tag, (const uint8_t*)data + 1, tl);
+    link_conn_t* c = linkFindByTag(tag);
+    if (!c) { info("link[%s]: teardown — no such link", tag); return; }
+    info("link[%s]: explicit teardown", c->tag);
+    try { if (c->link) c->link.teardown(); } catch (...) {}
+    c->link  = RNS::Link{RNS::Type::NONE};
+    c->state = LST_CLOSED;
+    linkPublishState(*c);          /* subscribers observe the close … */
+    linkFreeSlot(*c);              /* … then slot + storage tree freed */
+}
+
+/* ─────────────── Phase D: inbound Link → consumer forwarding ───────────────
+ *
+ * docs/plans/link.md §7. A consumer that has an RNSD_PORT_DEST handle
+ * sends RNSD_DEST_LINK_LISTEN with an inbox port; rnsd flips
+ * accepts_links(true) on that IN destination and sets *this* as its
+ * Destination-level established callback. mR fires it (Link.cpp:539,
+ * `_owner.callbacks()._link_established`) once an inbound Link reaches
+ * ACTIVE. We slot it into the shared s_link_conns table (direction
+ * "in"), reuse the Phase-C packet/closed thunks (sameLink resolves the
+ * slot), and itsConnectByTaskHandle back to the registered consumer
+ * with an rnsd_link_incoming_t describing the remote. Consumer→link
+ * sends and consumer detach reuse onLinkRecv / onLinkDisconnect. */
+static void onIncomingLinkEstablished(RNS::Link& link)
+{
+    RNS::Bytes local = link.destination().hash();   /* our IN dest (set
+                                                       by validate_request) */
+    mailbox_conn_t* mc = mailboxFindByDestHash(local);
+    if (!mc || !mc->link_listener_task || mc->link_inbox_port == 0) {
+        warn("inlink: LR on %s with no listener — tearing down",
+             local.toHex().c_str());
+        try { link.teardown(); } catch (...) {}
+        return;
+    }
+    link_conn_t* c = linkAlloc();
+    if (!c) {
+        warn("inlink: no slots — tearing down");
+        try { link.teardown(); } catch (...) {}
+        return;
+    }
+    std::string lid = link.link_id().toHex();
+    std::string tag = "in." + lid.substr(0, 8);
+
+    c->used   = true;
+    c->handle = -1;
+    c->ref    = (int)(c - s_link_conns);
+    safeStrncpy(c->tag, tag.c_str(), sizeof(c->tag));
+    c->dest_hash    = local;
+    c->aspect       = mc->req.aspect;
+    c->identity_key.clear();
+    c->state        = LST_ACTIVE;
+    c->link         = link;          /* copy shares shared_ptr<LinkData> */
+    c->opened_at    = RNS::Utilities::OS::time();
+    c->orphan_at    = 0;
+    c->dead_at      = 0;
+    c->estab_deadline = 0;
+    c->pend_used    = false;
+    c->pend_bytes.clear();
+
+    link.set_packet_callback(onLinkPacketCb);
+    link.set_link_closed_callback(onLinkClosedCb);
+
+    RNS::Bytes rid;
+    {
+        const RNS::Identity& ri = link.get_remote_identity();
+        if (ri) rid = ri.hash();
+    }
+
+    linkSetStr(*c, "direction", "in");
+    linkSetStr(*c, "aspect", c->aspect.c_str());
+    linkSetStr(*c, "local_hash", local.toHex().c_str());
+    if (rid) linkSetStr(*c, "remote_identity", rid.toHex().c_str());
+    linkSetStr(*c, "link_id", lid.c_str());
+    linkSetInt(*c, "mtu", (int)link.get_mtu());
+    linkSetInt(*c, "opened_s", (int)c->opened_at);
+    linkSetInt(*c, "activated_s", (int)c->opened_at);
+    linkSetStr(*c, "last_error", "");
+    linkPublishState(*c);
+    {
+        char k[96];
+        snprintf(k, sizeof(k), "rnsd.links.byid.%s", lid.c_str());
+        storageSet(k, c->tag);
+    }
+
+    rnsd_link_incoming_t pl = {};
+    safeStrncpy(pl.tag, c->tag, sizeof(pl.tag));
+    if (link.link_id().size() >= 16)
+        memcpy(pl.link_id, link.link_id().data(), 16);
+    if (rid.size() >= 16) memcpy(pl.remote_identity_hash, rid.data(), 16);
+    if (local.size() >= 16) memcpy(pl.local_dest_hash, local.data(), 16);
+    pl.mtu = link.get_mtu();
+
+    int h = itsConnectByTaskHandle(mc->link_listener_task,
+                                   mc->link_inbox_port,
+                                   &pl, sizeof(pl), pdMS_TO_TICKS(2000),
+                                   c->ref, onLinkRecv, onLinkDisconnect);
+    if (h < 0) {
+        warn("inlink[%s]: consumer unreachable (%d), tearing down",
+             c->tag, h);
+        linkSetError(*c, "consumer_unreachable");
+        try { link.teardown(); } catch (...) {}
+        c->link  = RNS::Link{RNS::Type::NONE};
+        c->state = LST_FAILED;
+        c->dead_at = RNS::Utilities::OS::time();
+        return;   /* linkTick reclaims after grace */
+    }
+    c->handle = h;
+    info("inlink[%s]: ACTIVE link_id=%s mtu=%u → consumer port %u",
+         c->tag, lid.c_str(), (unsigned)link.get_mtu(),
+         (unsigned)mc->link_inbox_port);
+}
+
+/* ─────────────── Phase C smoke: `clink` test consumer task ───────────────
+ *
+ * docs/plans/link.md §6.3 — "a trivial test consumer task on the device
+ * can open a Link, send, receive, disconnect". This is a *real*
+ * RNSD_PORT_LINK consumer (its own ITS-client task), distinct from the
+ * Phase B `rnsd link` probe (which builds RNS::Link directly on the
+ * rnsd task). Driven by `rnsd clink …` → `rnsd.cmd.clink` storage key.
+ *
+ *   rnsd clink <hash> [aspect]   open via rnsdLinkOpen() + queue a probe
+ *                                packet (exercises the pre-active outbox)
+ *   rnsd clink send <text>       send one Link packet
+ *   rnsd clink close             itsDisconnect (Link parks per §10a.1)
+ *
+ * Inbound Link packets are logged. With an echo-style peer the probe
+ * round-trips, proving establish + outbox flush + inbound forwarding. */
+
+static const char* CLINK_TAG = "clink";
+static int s_clink_handle      = -1;   /* outbound RNSD_PORT_LINK handle */
+static int s_clink_dest_handle = -1;   /* hosted RNSD_PORT_DEST handle (listen) */
+#define CLINK_INBOX_PORT 120           /* consumer-side inbound-Link port */
+
+static void onClinkRecv(int handle, size_t /*bytesAvail*/)
+{
+    static uint8_t buf[1024];
+    size_t n = itsRecv(handle, buf, sizeof(buf), 0);
+    if (n == 0) return;
+    size_t show = n < 48 ? n : 48;
+    info("clink: RX %zuB head=%s%s", n,
+         RNS::Bytes(buf, show).toHex().c_str(), n > show ? "…" : "");
+}
+
+static void onClinkDisc(int /*handle*/)
+{
+    info("clink: ITS handle closed");
+    s_clink_handle = -1;
+}
+
+/* ---- Phase D test: host a destination + receive inbound Links ---- */
+
+static void onClinkDestRecv(int handle, size_t /*n*/)
+{
+    /* Drain whatever rnsd sends on the hosted-dest handle (IN_PACKET,
+     * OUT_RESULT, …). The test only cares about inbound Links, which
+     * arrive on CLINK_INBOX_PORT, not here. */
+    static uint8_t b[700];
+    itsRecv(handle, b, sizeof(b), 0);
+}
+static void onClinkDestDisc(int /*handle*/)
+{
+    info("clink: hosted dest closed");
+    s_clink_dest_handle = -1;
+}
+
+static int onClinkInboxConnect(int /*handle*/, const void* data, size_t len)
+{
+    if (len < sizeof(rnsd_link_incoming_t)) {
+        warn("clink inbox: short payload %zu", len);
+        return -1;
+    }
+    rnsd_link_incoming_t pl;
+    memcpy(&pl, data, sizeof(pl));
+    pl.tag[sizeof(pl.tag) - 1] = '\0';
+    info("clink inbox: INBOUND LINK tag=%s link_id=%s mtu=%u "
+         "remote_id=%s local=%s",
+         pl.tag,
+         RNS::Bytes(pl.link_id, 16).toHex().c_str(),
+         (unsigned)pl.mtu,
+         RNS::Bytes(pl.remote_identity_hash, 16).toHex().c_str(),
+         RNS::Bytes(pl.local_dest_hash, 16).toHex().c_str());
+    return 0;   /* accept */
+}
+static void onClinkInboxRecv(int handle, size_t /*n*/)
+{
+    static uint8_t b[1024];
+    size_t n = itsRecv(handle, b, sizeof(b), 0);
+    if (n == 0) return;
+    size_t show = n < 48 ? n : 48;
+    info("clink inbox: RX %zuB head=%s%s", n,
+         RNS::Bytes(b, show).toHex().c_str(), n > show ? "…" : "");
+    /* Echo it straight back over the same inbound Link. */
+    itsSend(handle, b, n, 0);
+}
+static void onClinkInboxDisc(int /*handle*/)
+{
+    info("clink inbox: link forward closed");
+}
+
+static void onCmdClink(const char* key, const char* val)
+{
+    if (!val || !*val) return;            /* self-unset re-fire */
+    std::string cmd = val;
+    storageUnset(key);                    /* single-shot */
+
+    if (cmd == "close") {
+        /* Full teardown (frees the "clink" tag for immediate reuse) —
+         * not bare itsDisconnect, which would only park per §10a.1. */
+        rnsdLinkTeardown(CLINK_TAG);
+        if (s_clink_handle >= 0) { itsDisconnect(s_clink_handle); s_clink_handle = -1; }
+        info("clink: teardown requested");
+        return;
+    }
+    if (cmd.rfind("send ", 0) == 0) {
+        std::string txt = cmd.substr(5);
+        if (s_clink_handle < 0) { warn("clink: no link open"); return; }
+        itsSend(s_clink_handle, txt.data(), txt.size(), 0);
+        info("clink: sent %zuB", txt.size());
+        return;
+    }
+    if (cmd.rfind("listen", 0) == 0) {
+        std::string arg = cmd.size() > 6 ? cmd.substr(7) : "";
+        while (!arg.empty() && arg[0] == ' ') arg.erase(0, 1);
+        if (arg == "off" || arg.empty()) {
+            if (s_clink_dest_handle >= 0) {
+                itsDisconnect(s_clink_dest_handle);
+                s_clink_dest_handle = -1;
+            }
+            info("clink: listen off");
+            return;
+        }
+        /* Host an IN destination on the rnsd default identity, register
+         * for inbound Links to CLINK_INBOX_PORT, then announce so a
+         * host-side peer can resolve + open a Link to it (Phase D). */
+        int dh = rnsdDestOpen(arg.c_str(), "", /*SINGLE*/0, /*ref=*/1,
+                              onClinkDestRecv, onClinkDestDisc);
+        if (dh < 0) { warn("clink: rnsdDestOpen failed (%d)", dh); return; }
+        s_clink_dest_handle = dh;
+        if (!rnsdDestListenLinks(dh, CLINK_INBOX_PORT))
+            warn("clink: rnsdDestListenLinks failed");
+        uint8_t ann = RNSD_DEST_ANNOUNCE;            /* empty app_data */
+        itsSend(dh, &ann, 1, pdMS_TO_TICKS(500));
+        info("clink: listening on aspect=%s (announced; inbox port %u)",
+             arg.c_str(), (unsigned)CLINK_INBOX_PORT);
+        return;
+    }
+
+    /* "<32-hex> [aspect]" */
+    std::string hash_hex = cmd, aspect = "lxmf.delivery";
+    size_t sp = cmd.find(' ');
+    if (sp != std::string::npos) {
+        hash_hex = cmd.substr(0, sp);
+        aspect   = cmd.substr(sp + 1);
+        while (!aspect.empty() && aspect[0] == ' ') aspect.erase(0, 1);
+    }
+    if (hash_hex.size() != RNSD_DEST_HASH_LEN * 2) {
+        warn("clink: bad hash length %zu", hash_hex.size());
+        return;
+    }
+    RNS::Bytes dh;
+    try { dh.assignHex((const uint8_t*)hash_hex.c_str(), hash_hex.size()); }
+    catch (...) { warn("clink: bad hash hex"); return; }
+    if (dh.size() != RNSD_DEST_HASH_LEN) { warn("clink: bad hash bytes"); return; }
+
+    if (s_clink_handle >= 0) { itsDisconnect(s_clink_handle); s_clink_handle = -1; }
+    rnsdLinkTeardown(CLINK_TAG);   /* clear any parked/lingering prior link */
+    int h = rnsdLinkOpen(dh.data(), aspect.c_str(), "", CLINK_TAG,
+                         /*path_timeout_ms=*/0, /*ref=*/0,
+                         onClinkRecv, onClinkDisc);
+    if (h < 0) { warn("clink: rnsdLinkOpen failed (%d)", h); return; }
+    s_clink_handle = h;
+    /* Queue a probe immediately — rnsd's one-packet pre-active outbox
+     * buffers it and flushes on establishment (§6.2). */
+    static const char probe[] = "reticulous clink probe";
+    itsSend(h, probe, sizeof(probe) - 1, 0);
+    info("clink: opened → %s aspect=%s (probe queued)",
+         hash_hex.c_str(), aspect.c_str());
+}
+
+static void clinkTaskMain(void*)
+{
+    info("[%s] task up", CLINK_TAG);
+    /* Both server (inbound-Link inbox port) and client (rnsdLinkOpen /
+     * rnsdDestOpen connect to rnsd). itsServerInit sets up the shared
+     * inbox; itsClientInit then reuses it. */
+    if (!itsServerInit()) { err("clink itsServerInit failed"); }
+    itsServerPortOpen(CLINK_INBOX_PORT, /*packetBased=*/true,
+                      /*maxHandles=*/4, /*toSize=*/4096, /*fromSize=*/4096);
+    itsServerOnConnect(CLINK_INBOX_PORT,    onClinkInboxConnect);
+    itsServerOnDisconnect(CLINK_INBOX_PORT, onClinkInboxDisc);
+    itsServerOnRecv(CLINK_INBOX_PORT,       onClinkInboxRecv);
+    itsClientInit(4);
+    storageSubscribeChanges("rnsd.cmd.clink", onCmdClink);
+    TickType_t lastAnnounce = 0;
+    for (;;) {
+        while (itsPoll(0)) {}
+        itsPoll(pdMS_TO_TICKS(1000));
+        /* While hosting a Phase-D test dest, re-announce every 20 s so a
+         * host-side peer's path to it stays fresh across test runs. */
+        if (s_clink_dest_handle >= 0) {
+            TickType_t now = xTaskGetTickCount();
+            if (now - lastAnnounce >= pdMS_TO_TICKS(20000)) {
+                uint8_t ann = RNSD_DEST_ANNOUNCE;
+                itsSend(s_clink_dest_handle, &ann, 1, 0);
+                lastAnnounce = now;
+            }
+        }
+    }
+}
+
 static void rnsdTaskMain(void*)
 {
     info("[%s] task up", TAG);
 
     if (!itsServerInit()) { err("itsServerInit failed"); vTaskDelete(nullptr); return; }
+    /* rnsd is also an ITS *client*: Phase D back-connects inbound Links
+     * to the registered consumer via itsConnectByTaskHandle. Without
+     * this the connect fails and onIncomingLinkEstablished tears the
+     * Link down (peer sees DESTINATION_CLOSED). Shares the itsServerInit
+     * inbox. RNSD_MAX_LINK_CONNS inbound forwards + headroom. */
+    itsClientInit(RNSD_MAX_LINK_CONNS + 4);
     /* 4 KB per direction per handle — bursty announce traffic on a busy
      * testnet can fill 2 KB before rnsd drains during the 1 Hz publish
      * block. 4 KB gives ~4× more headroom; PSRAM-allocated, ~64 KB total
@@ -2195,6 +3294,21 @@ static void rnsdTaskMain(void*)
     itsServerOnConnect(RNSD_PORT_ANNOUNCES,    onAnnouncesConnect);
     itsServerOnDisconnect(RNSD_PORT_ANNOUNCES, onAnnouncesDisconnect);
     itsServerOnRecv(RNSD_PORT_ANNOUNCES,       onAnnouncesRecv);
+
+    /* RNSD_PORT_LINK — outbound Link consumer API (Phase C, §6.2).
+     * Packet-mode: one Link plaintext per itsSend/itsRecv, no framing.
+     * 4 KB/dir ≈ 9 in-flight Link packets — matches Resource cadence. */
+    if (!itsServerPortOpen(RNSD_PORT_LINK, /*packetBased=*/true,
+                           /*maxHandles=*/RNSD_MAX_LINK_CONNS,
+                           /*toSize=*/4096, /*fromSize=*/4096)) {
+        err("RNSD_PORT_LINK open failed");
+        vTaskDelete(nullptr);
+        return;
+    }
+    itsServerOnConnect(RNSD_PORT_LINK,    onLinkConnect);
+    itsServerOnDisconnect(RNSD_PORT_LINK, onLinkDisconnect);
+    itsServerOnRecv(RNSD_PORT_LINK,       onLinkRecv);
+    itsOnAux(RNSD_PORT_LINK,              onLinkAux);   /* explicit teardown */
 
     loadOrCreateIdentity();
     storageSet("rnsd.up", 1);
@@ -2249,6 +3363,10 @@ static void rnsdTaskMain(void*)
          * called from any other task — see memory note). */
         storageSubscribeChanges("rnsd.cmd.request_path", onCmdRequestPath);
 
+        /* Phase B §5.1.6: `rnsd link <hash> [aspect]` one-shot probe.
+         * CLI writes to this key; we build the Link here on the rnsd task. */
+        storageSubscribeChanges("rnsd.cmd.link.open", onCmdLinkOpen);
+
         /* Live-mirror s.rnsd.debug.only_local into the cached bool so
          * toggling at runtime takes effect on the next announce. Also
          * push the same flag into mR's Transport so its high-volume
@@ -2281,6 +3399,7 @@ static void rnsdTaskMain(void*)
                 try { RNS::Transport::jobs(); }
                 catch (const std::exception& e) { warn("Transport::jobs threw: %s", e.what()); }
                 mailboxTickPending();
+                linkTick();
 
                 /* Rnsd-hosted announces — debounce fire + periodic check.
                  * Each sendX() is a no-op when its destination is down,
@@ -2333,6 +3452,11 @@ void rnsdInit(void)
     if (!s_mailbox_conns) { err("s_mailbox_conns PSRAM alloc failed"); return; }
     for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++) new (&s_mailbox_conns[j]) mailbox_conn_t{};
 
+    s_link_conns = (link_conn_t*)heap_caps_malloc(
+        RNSD_MAX_LINK_CONNS * sizeof(link_conn_t), MALLOC_CAP_SPIRAM);
+    if (!s_link_conns) { err("s_link_conns PSRAM alloc failed"); return; }
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++) new (&s_link_conns[j]) link_conn_t{};
+
     for (auto& s : s_announce_subs) { s.used = false; s.handle = -1; s.aspect[0] = '\0'; }
 
     /* One-time storage defaults gated on version. */
@@ -2344,6 +3468,8 @@ void rnsdInit(void)
         storageDefault("s.rnsd.remote_management", 1);      /* host rnstransport.remote.management */
         storageDefault("s.rnsd.respond_to_probes", 0);      /* host rnstransport.probe (PROVE_ALL) */
         storageDefault("s.rnsd.debug.only_local", 0);       /* demote announce-traffic dbg to verb */
+        storageDefault("s.rnsd.link.path_timeout_s", 30);   /* §6.2 — LR retry budget */
+        storageDefault("s.rnsd.link.orphan_ttl_s", 600);    /* §6.2 — keep orphaned Link 10 min */
         /* `s.rnsd.path.max` / `s.rnsd.path.ttl` removed: mR's path table is
          * unbounded (BasicHeapStore), pruned only by PATHFINDER_E (24 h).
          * Re-add when we implement post-process pruning or interface-mode
@@ -2363,4 +3489,8 @@ void rnsdInit(void)
 
     /* PSRAM stack, core 0 alongside tcpip_thread, prio 2. */
     s_task = spawnTask(rnsdTaskMain, TAG, 12288, nullptr, 2, 0, STACK_PSRAM);
+
+    /* Phase C smoke consumer — its own ITS-client task, idle until
+     * `rnsd clink …`. Core 1, prio 1, modest PSRAM stack. */
+    spawnTask(clinkTaskMain, CLINK_TAG, 6144, nullptr, 1, 1, STACK_PSRAM);
 }

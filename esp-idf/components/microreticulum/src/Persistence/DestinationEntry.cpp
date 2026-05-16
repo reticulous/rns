@@ -131,7 +131,15 @@ using namespace RNS::Persistence;
 //TRACEF("Read %lu byte interface_hash", interface_hash.size());
 	entry._receiving_interface = Transport::find_interface_from_hash(interface_hash);
 	if (!entry._receiving_interface) {
-		WARNINGF("Path Interface %s not found", interface_hash.toHex().c_str());
+		/* Diptych fork: was WARNINGF — but DestinationEntry::decode runs on
+		 * every `_new_path_table.get(...)` call, which can happen hundreds
+		 * of times per second when Transport iterates paths during Link
+		 * maintenance or announce propagation. With a stale iface hash
+		 * (common after a TCP iface reconnect cycle re-registers with a
+		 * new hash) every iteration logged W lines fast enough to starve
+		 * other tasks. Demoted to verbose; the call site is responsible
+		 * for handling a null _receiving_interface gracefully. */
+		VERBOSEF("Path Interface %s not found", interface_hash.toHex().c_str());
 	}
 
 	// announce_packet
