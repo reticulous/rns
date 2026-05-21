@@ -368,6 +368,19 @@ namespace RNS {
 		inline static void path_store_segment_size(uint32_t value) { _path_store_segment_size = value; }
 		inline static uint8_t path_store_segment_count() { return _path_store_segment_count; }
 		inline static void path_store_segment_count(uint8_t value) { _path_store_segment_count = value; }
+		// Diptych: runtime-tunable path-entry TTLs (seconds). Applied at the
+		// live _new_path_table.put() site; govern age-based path expiry.
+		inline static uint32_t destination_timeout() { return _destination_timeout; }
+		inline static void destination_timeout(uint32_t value) { _destination_timeout = value; }
+		inline static uint32_t ap_path_time() { return _ap_path_time; }
+		inline static void ap_path_time(uint32_t value) { _ap_path_time = value; }
+		inline static uint32_t roaming_path_time() { return _roaming_path_time; }
+		inline static void roaming_path_time(uint32_t value) { _roaming_path_time = value; }
+		// Diptych: runtime-tunable jobs() cadence (seconds).
+		inline static float job_interval() { return _job_interval; }
+		inline static void job_interval(float value) { _job_interval = value; }
+		inline static float tables_cull_interval() { return _tables_cull_interval; }
+		inline static void tables_cull_interval(float value) { _tables_cull_interval = value; }
 		// CBA TEST
 		static inline void identity(Identity& identity) { _identity = identity; }
 
@@ -391,6 +404,22 @@ namespace RNS {
 		// leak-detection use case.
 		inline static size_t pending_links_count() { return _pending_links.size(); }
 		inline static size_t active_links_count()  { return _active_links.size(); }
+
+		// Diptych: table-size + stat getters for the `rnsd memory` breakdown.
+		inline static size_t path_table_size()     { return _new_path_table.size(); }
+		inline static size_t announce_table_size() { return _announce_table.size(); }
+		inline static size_t held_announces_size() { return _held_announces.size(); }
+		inline static size_t hashlist_size()       { return _packet_hashlist.size(); }
+		inline static size_t reverse_table_size()  { return _reverse_table.size(); }
+		inline static size_t link_table_size()     { return _link_table.size(); }
+		inline static size_t tunnels_count()       { return _tunnels.size(); }
+		inline static size_t path_requests_count() { return _path_requests.size(); }
+		inline static size_t destinations_count()  { return _destinations.size(); }
+		inline static size_t interfaces_count()    { return _interfaces.size(); }
+		inline static size_t pr_tags_count()       { return _discovery_pr_tags.size(); }
+		inline static uint32_t destinations_added(){ return _destinations_added; }
+		inline static uint32_t packets_sent()      { return _packets_sent; }
+		inline static uint32_t packets_received()  { return _packets_received; }
 
 	private:
 		static bool _demote_dbg;
@@ -462,6 +491,10 @@ namespace RNS {
 		static float _save_interval;
 		static uint32_t _path_table_crc;
 		static uint16_t _announce_table_maxsize;
+		// Diptych: runtime-tunable path TTLs (seeded from Type::Transport)
+		static uint32_t _destination_timeout;
+		static uint32_t _ap_path_time;
+		static uint32_t _roaming_path_time;
 
 		static Reticulum _owner;
 		static Identity _identity;

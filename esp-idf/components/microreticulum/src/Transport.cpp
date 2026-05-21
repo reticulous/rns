@@ -137,6 +137,10 @@ using namespace RNS::Persistence;
 /*static*/ float Transport::_save_interval				= 3600.0;
 /*static*/ uint32_t Transport::_path_table_crc	= 0;
 /*static*/ uint16_t Transport::_announce_table_maxsize	= RNS_ANNOUNCE_TABLE_MAX;
+// Diptych: runtime-tunable path TTLs, seeded from the Type::Transport defaults.
+/*static*/ uint32_t Transport::_destination_timeout	= Type::Transport::DESTINATION_TIMEOUT;
+/*static*/ uint32_t Transport::_ap_path_time		= Type::Transport::AP_PATH_TIME;
+/*static*/ uint32_t Transport::_roaming_path_time	= Type::Transport::ROAMING_PATH_TIME;
 
 /*static*/ Reticulum Transport::_owner({Type::NONE});
 /*static*/ Identity Transport::_identity({Type::NONE});
@@ -2327,13 +2331,13 @@ DestinationEntry empty_destination_entry;
 							// CBA microStore
 							uint32_t ttl = 0;
 							if (packet.receiving_interface().mode() == Type::Interface::MODE_ACCESS_POINT) {
-								ttl = AP_PATH_TIME;
+								ttl = _ap_path_time;
 							}
 							else if (packet.receiving_interface().mode() == Type::Interface::MODE_ROAMING) {
-								ttl = ROAMING_PATH_TIME;
+								ttl = _roaming_path_time;
 							}
 							else {
-								ttl = DESTINATION_TIMEOUT;
+								ttl = _destination_timeout;
 							}
 							if (_new_path_table.put(packet.destination_hash().collection(), destination_table_entry, ttl)) {
 								TRACEF("Added destination %s to path table!", packet.destination_hash().toHex().c_str());
@@ -4387,7 +4391,7 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 					WARNINGF("Failed to remove destination %s from path table", destination_hash.toHex().c_str());
 				}
 				++count;
-				if (_announce_table.size() <= _path_table_maxsize) {
+				if (_announce_table.size() <= _announce_table_maxsize) {
 					break;
 				}
 			}
