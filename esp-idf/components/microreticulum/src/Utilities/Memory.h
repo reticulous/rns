@@ -17,6 +17,7 @@
 #include "../Log.h"
 
 #include "tlsf.h"
+#include "esp_heap_caps.h"
 
 #include <memory>
 
@@ -25,6 +26,15 @@
 #define RNS_PSRAM_ALLOCATOR 2		 // Use PSRAM for allocator
 #define RNS_PSRAM_POOL_ALLOCATOR 3	 // Use PSRAM pool for allocator
 #define RNS_ALTHEAP_POOL_ALLOCATOR 4 // Use alternate HEAP pool for allocator
+
+/* Diptych: the µR containers (identity cache, announce + path tables) allocate
+ * their nodes straight from PSRAM via heap_caps — no shared TLSF pool. The
+ * nodes are tiny and already bounded by the per-table count caps, so a pool
+ * adds no value; direct PSRAM keeps them out of scarce internal DRAM and lets
+ * per-task heap tracking attribute them cleanly. Override-able from the build. */
+#ifndef RNS_CONTAINER_ALLOCATOR
+#define RNS_CONTAINER_ALLOCATOR RNS_PSRAM_ALLOCATOR
+#endif
 
 namespace RNS { namespace Utilities {
 
@@ -115,12 +125,10 @@ namespace RNS { namespace Utilities {
 #if RNS_CONTAINER_ALLOCATOR == RNS_HEAP_POOL_ALLOCATOR
 				void* p = pool_malloc(heap_pool_info, size);
 #elif RNS_CONTAINER_ALLOCATOR == RNS_PSRAM_ALLOCATOR
-#if BOARD_HAS_PSRAM != 1
-	#error "BOARD_HAS_PSRAM must be defined to use RNS_PSRAM_POOL_ALLOCATOR allocator."
-#endif
-				// CBA PSRAM may not be accessible early in startup, but since we use the same free() for both
-				//  HEAP and PSRAM allocations, we canb simply fallback to HEAP allocation when PSRAM fails
-				void* p = ps_malloc(size);
+				// Diptych: allocate straight from PSRAM via heap_caps (no Arduino
+				// ps_malloc, no shared pool). Falls back to any heap if PSRAM is
+				// exhausted; both are freed with the same free()/heap_caps_free.
+				void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
 				if (p == nullptr) {
 					++container_allocator_info.alloc_fault;
 					p = malloc(size);
@@ -154,10 +162,7 @@ namespace RNS { namespace Utilities {
 #if RNS_CONTAINER_ALLOCATOR == RNS_HEAP_POOL_ALLOCATOR
 				pool_free(heap_pool_info, p, size);
 #elif RNS_CONTAINER_ALLOCATOR == RNS_PSRAM_ALLOCATOR
-#if BOARD_HAS_PSRAM != 1
-	#error "BOARD_HAS_PSRAM must be defined to use RNS_PSRAM_POOL_ALLOCATOR allocator."
-#endif
-				free(p);
+				heap_caps_free(p);
 #elif RNS_CONTAINER_ALLOCATOR == RNS_PSRAM_POOL_ALLOCATOR
 #if BOARD_HAS_PSRAM != 1
 	#error "BOARD_HAS_PSRAM must be defined to use RNS_PSRAM_POOL_ALLOCATOR allocator."
