@@ -42,6 +42,7 @@
 #include "Resource.h"
 #include "Persistence/DestinationEntry.h"
 #include "Utilities/OS.h"
+#include "Utilities/Memory.h"
 
 #undef msg
 #pragma pop_macro("info")
@@ -63,6 +64,9 @@
 #include <new>
 
 #include "esp_heap_caps.h"
+#ifdef CONFIG_HEAP_TASK_TRACKING
+#include "esp_heap_task_info.h"
+#endif
 
 #include "cJSON.h"
 
@@ -1506,6 +1510,139 @@ static void publishStats(void)
 
 /* ─────────────── CLI ─────────────── */
 
+/* Defined in the Phase C block below, where s_link_conns lives. */
+static int rnsdLinkConnsUsed();
+
+/* One `rnsd memory` breakdown row, aligned, with bytes + % of task PSRAM.
+ * count<0 → no count/cap column (ITS / misc / TOTAL rows). For tables,
+ * `bytes` is count*perEntry where perEntry is a rough total cost per entry —
+ * the std::map/std::set tree node PLUS the Bytes payload blocks it owns
+ * (Bytes = shared_ptr<vector>), Xtensa 32-bit, incl. ~12 B heap headers.
+ * Estimates: payload size varies, so treat table totals as relative (which
+ * table dominates), not exact — the task PSRAM line is authoritative. `approx`
+ * prints the "~" estimate marker (tables, misc); ITS/TOTAL are exact. Returns
+ * bytes so the caller can sum. */
+static unsigned long long memBar(const char* name, int count, unsigned cap,
+                                 unsigned long long bytes, unsigned long long total,
+                                 bool approx)
+{
+    unsigned pm = total ? (unsigned)(bytes * 1000ULL / total) : 0;
+    char mid[32];
+    if (count < 0)   mid[0] = '\0';
+    else if (cap)    snprintf(mid, sizeof(mid), "%d / %u", count, cap);
+    else             snprintf(mid, sizeof(mid), "%d", count);
+    cliPrintf("  %-14s %-11s %c%7llu B  %2u.%u%%\n",
+              name, mid, approx ? '~' : ' ', bytes, pm / 10, pm % 10);
+    return bytes;
+}
+
+/* `rnsd memory` — breaks down where rnsd's heap goes, as far as the
+ * instrumentation allows: (1) the task's attributed heap from ESP-IDF's
+ * per-task tracking, (2) µR's container-allocator live total (the std::map
+ * nodes behind the tables), (3) per-table entry counts vs caps, (4) rnsd's
+ * own fixed-slot arrays, and (5) system free for context. */
+static void cliRnsdMemory(void)
+{
+    unsigned psramTot = 0, dramTot = 0, pblk = 0, dblk = 0;
+#ifdef CONFIG_HEAP_TASK_TRACKING
+    {
+        constexpr size_t MAX_HT = 40;
+        static heap_task_totals_t htotals[MAX_HT];
+        memset(htotals, 0, sizeof(htotals));
+        size_t ntot = 0;
+        heap_task_info_params_t p = {};
+        p.caps[0] = MALLOC_CAP_INTERNAL; p.mask[0] = MALLOC_CAP_INTERNAL;
+        p.caps[1] = MALLOC_CAP_SPIRAM;   p.mask[1] = MALLOC_CAP_SPIRAM;
+        p.totals = htotals; p.num_totals = &ntot; p.max_totals = MAX_HT;
+        heap_caps_get_per_task_info(&p);
+        for (size_t i = 0; i < ntot; i++) {
+            if (htotals[i].task == s_task) {
+                dramTot  = (unsigned)htotals[i].size[0]; dblk = (unsigned)htotals[i].count[0];
+                psramTot = (unsigned)htotals[i].size[1]; pblk = (unsigned)htotals[i].count[1];
+                break;
+            }
+        }
+    }
+#endif
+    cliPrintf("task heap (attributed to rnsd):\n");
+    cliPrintf("  DRAM   %8u B  %5u blocks\n", dramTot, dblk);
+    cliPrintf("  PSRAM  %8u B  %5u blocks\n", psramTot, pblk);
+
+    /* ---- PSRAM breakdown: one row per consumer, % of the task total, summing
+     * to ~100%. ITS buffers are exact (with s.rnsd.its_no_pool on); table
+     * rows are count*est(node+payload); `misc` is the remainder — engine object
+     * graph (Reticulum/Transport/Identity/Interface/Destination), the identity
+     * keypair, and transient in-flight Bytes. */
+    its_mem_t its = itsTaskMem(s_task);
+    bool itsExact = storageGetInt("s.rnsd.its_no_pool", 0) != 0;
+    cliPrintf("PSRAM breakdown (%% of %u B task total):  [ITS %s]\n",
+              psramTot, itsExact ? "exact (no_pool)" : "approx — set s.rnsd.its_no_pool=1");
+    memBar("ITS stream buf", -1, 0, its.streamBytes, psramTot, false);
+    memBar("ITS inbox",      -1, 0, its.inboxBytes,  psramTot, false);
+
+    /* Per-entry byte costs, calibrated for the real allocation shape: tree
+     * node + each Bytes field as a separate shared_ptr<vector> (control block +
+     * vector + data buffer), rounded to heap alignment, plus per-block heap/
+     * task-tracking overhead. Still estimates (payload length varies), but
+     * tuned so the rows account for most of the table footprint and `misc`
+     * drains to ~the engine object graph + transient in-flight Bytes. */
+    unsigned id_n = (unsigned)RNS::Identity::known_destinations_size();
+    unsigned pa_n = (unsigned)RNS::Transport::path_table_size();
+    unsigned an_n = (unsigned)RNS::Transport::announce_table_size();
+    unsigned he_n = (unsigned)RNS::Transport::held_announces_size();
+    unsigned hl_n = (unsigned)RNS::Transport::hashlist_size();
+    unsigned pr_n = (unsigned)RNS::Transport::pr_tags_count();
+    unsigned rv_n = (unsigned)RNS::Transport::reverse_table_size();
+    unsigned lk_n = (unsigned)RNS::Transport::link_table_size();
+    unsigned tu_n = (unsigned)RNS::Transport::tunnels_count();
+    unsigned pq_n = (unsigned)RNS::Transport::path_requests_count();
+    unsigned de_n = (unsigned)RNS::Transport::destinations_count();
+    unsigned if_n = (unsigned)RNS::Transport::interfaces_count();
+
+    unsigned long long tot = 0;
+    tot += memBar("identity cache", (int)id_n, (unsigned)RNS::Identity::known_destinations_maxsize(),
+                  (unsigned long long)id_n * 520, psramTot, true);
+    tot += memBar("path table",     (int)pa_n, (unsigned)RNS::Transport::path_table_maxsize(),
+                  (unsigned long long)pa_n * 340, psramTot, true);
+    tot += memBar("announce table", (int)an_n, (unsigned)RNS::Transport::announce_table_maxsize(),
+                  (unsigned long long)an_n * 520, psramTot, true);
+    tot += memBar("held announces", (int)he_n, 0, (unsigned long long)he_n * 520, psramTot, true);
+    tot += memBar("hashlist",       (int)hl_n, (unsigned)RNS::Transport::hashlist_maxsize(),
+                  (unsigned long long)hl_n * 120, psramTot, true);
+    tot += memBar("pr tags",        (int)pr_n, (unsigned)RNS::Transport::max_pr_tags(),
+                  (unsigned long long)pr_n * 120, psramTot, true);
+    tot += memBar("reverse table",  (int)rv_n, 0, (unsigned long long)rv_n * 110, psramTot, true);
+    tot += memBar("link table",     (int)lk_n, 0, (unsigned long long)lk_n * 280, psramTot, true);
+    tot += memBar("tunnels",        (int)tu_n, 0, (unsigned long long)tu_n * 220, psramTot, true);
+    tot += memBar("path requests",  (int)pq_n, 0, (unsigned long long)pq_n * 120, psramTot, true);
+    tot += memBar("destinations",   (int)de_n, 0, (unsigned long long)de_n * 300, psramTot, true);
+    tot += memBar("interfaces",     (int)if_n, 0, (unsigned long long)if_n * 220, psramTot, true);
+
+    unsigned long long base = (unsigned long long)its.streamBytes + its.inboxBytes + tot;
+    unsigned long long misc = psramTot > base ? psramTot - base : 0;
+    memBar("misc",  -1, 0, misc,     psramTot, true);
+    memBar("TOTAL", -1, 0, psramTot, psramTot, false);
+    cliPrintf("  (links: pending %u active %u)\n",
+              (unsigned)RNS::Transport::pending_links_count(),
+              (unsigned)RNS::Transport::active_links_count());
+
+    {
+        int ifc = 0, mbc = 0, lkc = rnsdLinkConnsUsed();
+        for (int j = 0; j < RNSD_MAX_IFACES; j++)        if (s_ifaces[j].used)        ifc++;
+        for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++) if (s_mailbox_conns[j].used) mbc++;
+        cliPrintf("rnsd slots (used / max):  ifaces %d/%d  mailbox %d/%d  link %d/%d\n",
+                  ifc, RNSD_MAX_IFACES, mbc, RNSD_MAX_MAILBOX_CONNS, lkc, RNSD_MAX_LINK_CONNS);
+    }
+
+    cliPrintf("stats: pkts in %u out %u, dests added %u\n",
+              (unsigned)RNS::Transport::packets_received(),
+              (unsigned)RNS::Transport::packets_sent(),
+              (unsigned)RNS::Transport::destinations_added());
+    cliPrintf("system free:  PSRAM %u B  DRAM %u B\n",
+              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
+
 static void cliRnsd(const char* args)
 {
     if (args && strcmp(args, "help") == 0) {
@@ -1515,6 +1652,7 @@ static void cliRnsd(const char* args)
     }
     if (!args || !*args) {
         cliPrintf("usage: rnsd [identity|persist [if-transport]|reload]\n");
+        cliPrintf("       rnsd memory                      — heap usage breakdown\n");
         cliPrintf("       rnsd link <dest_hash> [aspect]   — outbound Link probe (Phase B)\n");
         cliPrintf("       rnsd link teardown               — drop the active probe link\n");
         cliPrintf("       rnsd links                       — pending/active Link table sizes\n");
@@ -1540,6 +1678,10 @@ static void cliRnsd(const char* args)
     }
     if (strcmp(args, "reload") == 0) {
         loadOrCreateIdentity();
+        return;
+    }
+    if (strcmp(args, "memory") == 0 || strcmp(args, "mem") == 0) {
+        cliRnsdMemory();
         return;
     }
     if (strncmp(args, "link", 4) == 0 && (args[4] == 0 || args[4] == ' ')) {
@@ -2618,6 +2760,16 @@ struct link_conn_t {
 
 static link_conn_t* s_link_conns = nullptr;
 
+/* Count active link-consumer slots — for the `rnsd memory` breakdown,
+ * which is defined earlier than s_link_conns. */
+static int rnsdLinkConnsUsed() {
+    int n = 0;
+    if (s_link_conns)
+        for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)
+            if (s_link_conns[j].used) n++;
+    return n;
+}
+
 /* Two Link wrappers reference the same underlying LinkData iff neither
  * orders before the other under mR's public operator< (which compares
  * _object.get()). Works in every state — link_id is empty on a failed
@@ -3621,7 +3773,13 @@ static void rnsdTaskMain(void*)
 {
     info("[%s] task up", TAG);
 
-    if (!itsServerInit()) { err("itsServerInit failed"); vTaskDelete(nullptr); return; }
+    /* s.rnsd.its_no_pool (default off): when on, rnsd's ITS connections bypass
+     * the shared buffer pool — buffers are created on connect and freed on
+     * disconnect. Returns transient buffers to the heap and makes `rnsd memory`'s
+     * ITS figure exact under per-task heap tracking (no cross-task borrowing).
+     * Read once here — takes effect on the next boot after toggling. */
+    bool itsNoPool = storageGetInt("s.rnsd.its_no_pool", 0) != 0;
+    if (!itsServerInit(0, 0, itsNoPool)) { err("itsServerInit failed"); vTaskDelete(nullptr); return; }
     /* rnsd is also an ITS *client*: Phase D back-connects inbound Links
      * to the registered consumer via itsConnectByTaskHandle. Without
      * this the connect fails and onIncomingLinkEstablished tears the
@@ -3687,11 +3845,49 @@ static void rnsdTaskMain(void*)
     storageSet("rnsd.up", 1);
     if (s_identity) storageSet("rnsd.identity_hash", s_identity->hexhash().c_str());
 
-    /* Bump mR's identity cache from 100 → 1000 entries (~200 KiB PSRAM).
-     * 100 is too small for busy testnet traffic — entries get evicted before
-     * we have a chance to probe them, even though the path table still has
-     * the route. Identity::recall then fails and rnprobe can't proceed. */
-    RNS::Identity::known_destinations_maxsize(1000);
+    /* Runtime-tunable mR caps/TTLs/cadence. Each fires once now (applying the
+     * current stored value, or the fallback default if unset) and re-applies
+     * on later `set`. Fallbacks are the working defaults; operators override
+     * via `set s.rnsd.*`. No storageDefault — silent defaults wouldn't fire a
+     * subscription, and the fallback in each read already covers "unset".
+     *
+     * Identity cache: 100 is too small for busy testnet traffic — entries get
+     * evicted before we can probe them even though the path table still has the
+     * route, so Identity::recall fails and rnprobe can't proceed. Default 1000. */
+    NOW_AND_ON_CHANGE("s.rnsd.identity.cache_max", {
+        RNS::Identity::known_destinations_maxsize(storageGetInt(key, 1000));
+    });
+    /* Path table: engages BasicHeapStore set_max_recs (uncapped until now —
+     * only the 24h TTL pruned it). */
+    NOW_AND_ON_CHANGE("s.rnsd.path.max", {
+        RNS::Transport::path_table_maxsize(storageGetInt(key, 100));
+    });
+    NOW_AND_ON_CHANGE("s.rnsd.announce.table_max", {
+        RNS::Transport::announce_table_maxsize(storageGetInt(key, 100));
+    });
+    NOW_AND_ON_CHANGE("s.rnsd.hashlist_max", {
+        RNS::Transport::hashlist_maxsize(storageGetInt(key, 100));
+    });
+    NOW_AND_ON_CHANGE("s.rnsd.path.request_tags_max", {
+        RNS::Transport::max_pr_tags(storageGetInt(key, 32));
+    });
+    /* Path-entry TTLs, seconds. */
+    NOW_AND_ON_CHANGE("s.rnsd.path.ttl", {
+        RNS::Transport::destination_timeout(storageGetInt(key, 86400));
+    });
+    NOW_AND_ON_CHANGE("s.rnsd.path.ttl_ap", {
+        RNS::Transport::ap_path_time(storageGetInt(key, 21600));
+    });
+    NOW_AND_ON_CHANGE("s.rnsd.path.ttl_roaming", {
+        RNS::Transport::roaming_path_time(storageGetInt(key, 3600));
+    });
+    /* jobs() cadence + table-cull cadence. */
+    NOW_AND_ON_CHANGE("s.rnsd.jobs_interval_ms", {
+        RNS::Transport::job_interval(storageGetInt(key, 250) / 1000.0f);
+    });
+    NOW_AND_ON_CHANGE("s.rnsd.cull_interval_s", {
+        RNS::Transport::tables_cull_interval((float)storageGetInt(key, 60));
+    });
 
     /* Bring up mR. Reticulum::transport_enabled() is a static global
      * consulted by Transport for forwarding decisions. We mirror our
