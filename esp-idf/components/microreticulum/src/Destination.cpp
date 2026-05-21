@@ -437,7 +437,22 @@ void Destination::receive(const Packet& packet) {
 						DEBUGF("Error while executing receive callback from %s. The contained exception was: %s", toString().c_str(), e.what());
 					}
 				}
+				else {
+					INFOF("Destination %s: inbound DATA decrypted but no packet callback registered — dropped", toString().c_str());
+				}
 			}
+		}
+		else {
+			// Diptych diagnostic: a packet Transport already matched to this
+			// local destination failed to decrypt. Upstream logs the reason
+			// at DEBUG (Identity::decrypt), invisible at info level — so a
+			// "destination is local" with no delivery looked like silence.
+			// Surface it: this is the signature of a key/identity mismatch
+			// (sender encrypted to a stale/wrong pubkey for this dest).
+			INFOF("Destination %s: inbound %s decrypt FAILED (%zuB ciphertext) — packet dropped (key/identity mismatch?)",
+			      toString().c_str(),
+			      packet.packet_type() == Type::Packet::DATA ? "DATA" : "non-DATA",
+			      packet.data().size());
 		}
 	}
 }

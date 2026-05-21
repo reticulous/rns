@@ -89,6 +89,22 @@ static bool s_dbg_only_local = false;
  * the ITS server-port recv callback; we wrap the bytes into Interface
  * and call `iface.handle_incoming(...)`, which routes through
  * InterfaceImpl::handle_incoming → Transport::inbound. */
+/* Map an rnsd-facing rns_iface_mode (ports.h) to mR's Type::Interface::modes.
+ * The two enums deliberately do NOT share a bit layout — ports.h must not
+ * include mR headers — so a raw static_cast is wrong (e.g. rnsd GATEWAY
+ * 0x02 is not any mR mode, and would silently disable DISCOVER_PATHS_FOR
+ * and misfire the roaming anti-loop check). */
+static RNS::Type::Interface::modes mapIfaceMode(uint8_t m) {
+    switch (m) {
+        case RNS_IFACE_MODE_FULL:         return RNS::Type::Interface::MODE_FULL;
+        case RNS_IFACE_MODE_GATEWAY:      return RNS::Type::Interface::MODE_GATEWAY;
+        case RNS_IFACE_MODE_ACCESS_POINT: return RNS::Type::Interface::MODE_ACCESS_POINT;
+        case RNS_IFACE_MODE_ROAMING:      return RNS::Type::Interface::MODE_ROAMING;
+        case RNS_IFACE_MODE_BOUNDARY:     return RNS::Type::Interface::MODE_BOUNDARY;
+        default:                          return RNS::Type::Interface::MODE_FULL;
+    }
+}
+
 class TaskInterface : public RNS::InterfaceImpl {
 public:
     TaskInterface(const rnsd_transport_t& info, int handle) : _handle(handle) {
@@ -102,7 +118,7 @@ public:
         _FIXED_MTU = true;
         _AUTOCONFIGURE_MTU = false;
         _bitrate = info.bitrate;
-        _mode = static_cast<RNS::Type::Interface::modes>(info.mode);
+        _mode = mapIfaceMode(info.mode);
     }
 protected:
     void send_outgoing(const RNS::Bytes& data) override;
@@ -224,9 +240,20 @@ struct mailbox_conn_t {
 
 static mailbox_conn_t* s_mailbox_conns = nullptr;
 
-/* Retry / path-request cadence. RNS PATH_REQUEST_WAIT is 7s; we pace our
- * own RETRY emissions a little behind that to avoid stepping on it. */
-#define RNSD_MAILBOX_PATH_RETRY_INTERVAL_S   8.0
+/* Path-request retry cadence: exponential backoff, not a fixed interval.
+ * A parked send fires its first request immediately; mailboxRetryDelay()
+ * gives the gap before each *subsequent* request, indexed by how many
+ * retries have already gone out (pending.attempts). Steady state caps at
+ * 30 min so a long-unreachable peer keeps a slow heartbeat without
+ * flooding the mesh. After RNSD_MAILBOX_PATH_GIVEUP_S with no path the
+ * send is failed (OUT_RESULT status=FAILED) and unparked. */
+static double mailboxRetryDelay(int attempts) {
+    static const double S[] = { 5, 30, 60, 120, 240, 480, 960 };
+    if (attempts < 0) attempts = 0;
+    if (attempts >= (int)(sizeof(S) / sizeof(S[0]))) return 1800.0;
+    return S[attempts];
+}
+#define RNSD_MAILBOX_PATH_GIVEUP_S   (6.0 * 3600.0)
 
 /* ─────────────── Identity ─────────────── */
 
@@ -518,6 +545,29 @@ static void mailboxClearPending(mailbox_conn_t& c)
     c.pending.bytes.clear();
 }
 
+/* Debug: when `rnsd.debug.log_msg_content` (ephemeral, toggle live via
+ * CLI/storage) is set, dump a stable FNV-1a/32 hash + printable preview
+ * of a message payload. The on-send and after-decryption payloads are
+ * the same byte span (sender strips the 16-byte dest, receiver gets it
+ * back as the RNS plaintext), so the fnv= values match for one message
+ * — lets us pair a send with its decrypted echo and tell it apart from
+ * unrelated traffic. rnsd stays content-agnostic: just bytes. */
+static void rnsdDbgMsgContent(const char* dir, const uint8_t* p, size_t n)
+{
+    if (storageGetInt("rnsd.debug.log_msg_content", 0) == 0) return;
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    std::string prev;
+    size_t lim = n < 96 ? n : 96;
+    prev.reserve(lim);
+    for (size_t i = 0; i < lim; i++) {
+        uint8_t b = p[i];
+        prev += (b >= 0x20 && b < 0x7F) ? (char)b : '.';
+    }
+    info("debug.msg %s len=%zu fnv=%08x \"%s\"%s",
+         dir, n, (unsigned)h, prev.c_str(), n > lim ? "..." : "");
+}
+
 /* Try to send `bytes` (LXM wire) on c's connection. The first 16 bytes are
  * the target dest_hash. Returns:
  *   1  — sent: OUT_STATUS EGRESS_QUEUED + OUT_RESULT status=sent emitted
@@ -591,8 +641,12 @@ static int mailboxTrySend(mailbox_conn_t& c, uint16_t send_id,
         /* Opportunistic: there is no native ack, so we promote "sent" the
          * moment Transport accepted the packet. See lxmf.md §15. */
         mailboxSendOutResult(c, send_id, RNSD_DEST_STATUS_SENT, 0, hops);
-        info("mailbox: send_id=%u sent to %s (hops=%u, %zuB payload)",
-             (unsigned)send_id, dh.toHex().c_str(), (unsigned)hops, n);
+        RNS::Interface oif = RNS::Transport::next_hop_interface(dh);
+        info("mailbox: send_id=%u sent to %s via %s (hops=%u, %zuB payload)",
+             (unsigned)send_id, dh.toHex().c_str(),
+             oif ? oif.toString().c_str() : "<none>",
+             (unsigned)hops, n);
+        rnsdDbgMsgContent("send", bytes + 16, n - 16);
         return 1;
     } catch (const std::exception& e) {
         err("mailbox: send threw: %s", e.what());
@@ -627,6 +681,7 @@ static void onMailboxInbound(const RNS::Bytes& plaintext, const RNS::Packet& pac
     }
     info("mailbox inbound: %zuB for dest %s → handle=%d",
          plaintext.size(), packet.destination().hash().toHex().c_str(), c->handle);
+    rnsdDbgMsgContent("recv", plaintext.data(), plaintext.size());
     uint8_t f[RNSD_MAILBOX_INBOUND_MAX];
     f[0] = RNSD_DEST_IN_PACKET;
     memcpy(f + 1,      packet.destination().hash().data(), 16);
@@ -863,7 +918,17 @@ static void mailboxTickPending(void)
             continue;
         }
 
-        if (now - c.pending.last_request_path_at >= RNSD_MAILBOX_PATH_RETRY_INTERVAL_S) {
+        if (now - c.pending.first_seen_at >= RNSD_MAILBOX_PATH_GIVEUP_S) {
+            uint16_t send_id = c.pending.send_id;
+            info("mailbox: send_id=%u giving up path search for %s after %.0fs",
+                 (unsigned)send_id, dh.toHex().c_str(),
+                 now - c.pending.first_seen_at);
+            mailboxClearPending(c);
+            mailboxSendOutResult(c, send_id, RNSD_DEST_STATUS_FAILED, 0, 0);
+            continue;
+        }
+
+        if (now - c.pending.last_request_path_at >= mailboxRetryDelay(c.pending.attempts)) {
             info("mailbox: send_id=%u retrying path request for %s (attempt %u)",
                  (unsigned)c.pending.send_id, dh.toHex().c_str(),
                  (unsigned)(c.pending.attempts + 1));

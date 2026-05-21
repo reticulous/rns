@@ -481,7 +481,10 @@ DestinationEntry empty_destination_entry;
 
 							new_packet.hops(announce_entry._hops);
 							if (announce_entry._block_rebroadcasts) {
-								DEBUGF("Rebroadcasting announce as path response for %s with hop count %d", announce_destination.hash().toHex().c_str(), new_packet.hops());
+								INFOF("Sent requested route for %s to transport %s (hop count %d)",
+									announce_destination.hash().toHex().c_str(),
+									announce_entry._attached_interface ? announce_entry._attached_interface.toString().c_str() : "<all>",
+									new_packet.hops());
 							}
 							else {
 								DEBUGF("Rebroadcasting announce for %s with hop count %d", announce_destination.hash().toHex().c_str(), new_packet.hops());
@@ -1452,7 +1455,36 @@ DestinationEntry empty_destination_entry;
 
 	Packet packet(RNS::Destination(RNS::Type::NONE), raw);
 	if (!packet.unpack()) {
-		WARNING("Transport::inbound: Packet unpack failed!");
+		/* Malformed inbound packets often arrive in floods (a peer
+		 * retransmitting the same bad frame every second). De-dup on
+		 * interface + size + first 8 bytes: warn once per distinct
+		 * signature, count silent repeats, and emit a one-line summary
+		 * when the signature changes. Interface is named here because
+		 * Packet::unpack() has no view of where the bytes came from. */
+		static std::string s_lastSig;
+		static uint32_t s_suppressed = 0;
+		static double s_firstTime = 0.0;
+
+		const std::string ifname = interface ? interface.name() : "<unknown>";
+		char hex[32] = {0};
+		size_t dump = raw.size() < 8 ? raw.size() : 8;
+		for (size_t i = 0; i < dump; ++i)
+			std::snprintf(hex + 3*i, 4, "%02x ", raw.data()[i]);
+		std::string sig = ifname + "|" + std::to_string(raw.size()) + "|" + hex;
+
+		if (sig == s_lastSig) {
+			++s_suppressed;
+		}
+		else {
+			if (s_suppressed > 0)
+				WARNINGF("Transport::inbound: dropped %lu more malformed packet(s) over %.0fs",
+				         (unsigned long)s_suppressed, OS::time() - s_firstTime);
+			WARNINGF("Transport::inbound: dropping malformed packet on [%s] (%zuB, first=%s)",
+			         ifname.c_str(), raw.size(), hex);
+			s_lastSig = sig;
+			s_suppressed = 0;
+			s_firstTime = OS::time();
+		}
 		return;
 	}
 #ifndef NDEBUG
@@ -1915,10 +1947,35 @@ DestinationEntry empty_destination_entry;
 						//p random_blobs = Transport.destination_table[packet.destination_hash][4]
 						random_blobs = destination_entry._random_blobs;
 
+						// An explicitly requested path response is answered
+						// by the relay from its *cached* announce, so the
+						// random_blob is necessarily one we've already heard.
+						// The loop-prevention replay guard below would then
+						// reject it forever, silently starving a path we
+						// asked for (works once, then nothing). Upstream RNS
+						// escapes this via path_is_unresponsive; this port
+						// lacks that, so key on the outstanding request: if
+						// we have a pending path request for this dest and
+						// this is the PATH_RESPONSE, accept it regardless of
+						// blob replay.
+						bool requested_path_response =
+							packet.context() == Type::Packet::PATH_RESPONSE &&
+							_path_requests.find(packet.destination_hash()) != _path_requests.end();
+
+						// Scope the bypass to paths no worse than what we hold.
+						// A relay answers from its cached announce, so a
+						// *looped* longer copy can arrive as a requested
+						// PATH_RESPONSE too — without this hop guard it would
+						// overwrite a good direct (e.g. 1-hop) path with the
+						// loop.
+						if (requested_path_response && packet.hops() <= destination_entry._hops) {
+							DBGF_DEMOTE("Accepting requested path response for %s (%u hops <= known %u) despite seen random_blob", packet.destination_hash().toHex().c_str(), (unsigned)packet.hops(), (unsigned)destination_entry._hops);
+							should_add = true;
+						}
 						// If we already have a path to the announced
 						// destination, but the hop count is equal or
 						// less, we'll update our tables.
-						if (packet.hops() <= destination_entry._hops) {
+						else if (packet.hops() <= destination_entry._hops) {
 							// Make sure we haven't heard the random
 							// blob before, so announces can't be
 							// replayed to forge paths.
@@ -2043,6 +2100,33 @@ DestinationEntry empty_destination_entry;
 						}
 
 						random_blobs.insert(random_blob);
+
+						// Diptych fork: upstream RNS caps random_blobs to the
+						// most recent MAX_RANDOM_BLOBS per destination
+						// (Transport.py: `random_blobs = random_blobs[-MAX:]`).
+						// That cap was lost in the std::set port, so a
+						// frequently-announcing destination accumulated blobs
+						// without bound until the serialised DestinationEntry
+						// exceeded microStore's 1024-byte value limit and
+						// _new_path_table.put() failed on every subsequent
+						// announce ("Failed to add destination ... to path
+						// table!"), permanently freezing that path. std::set
+						// orders by blob content, not arrival, so drop the
+						// entries with the lowest emission timebase (bytes
+						// 5..10) — keep the most recently emitted blobs,
+						// matching upstream intent.
+						while (random_blobs.size() > MAX_RANDOM_BLOBS) {
+							auto oldest = random_blobs.begin();
+							uint64_t oldest_emitted = OS::from_bytes_big_endian(oldest->data() + 5, 5);
+							for (auto it = std::next(random_blobs.begin()); it != random_blobs.end(); ++it) {
+								uint64_t emitted = OS::from_bytes_big_endian(it->data() + 5, 5);
+								if (emitted < oldest_emitted) {
+									oldest_emitted = emitted;
+									oldest = it;
+								}
+							}
+							random_blobs.erase(oldest);
+						}
 
 						if ((Reticulum::transport_enabled() || Transport::from_local_client(packet)) && packet.context() != Type::Packet::PATH_RESPONSE) {
 							// Insert announce into announce table for retransmission
@@ -2378,9 +2462,10 @@ DestinationEntry empty_destination_entry;
 					 * next-hop. Useful for diagnosing "echo never replies"
 					 * by distinguishing "packet never arrived" from "packet
 					 * arrived for a hash we don't own". */
-					INFOF("DATA arrived for dest %s (hops=%u, %zuB) — no local destination",
+					INFOF("DATA arrived for dest %s on %s (hops=%u, %zuB) — no local destination",
 					      packet.destination_hash().toHex().c_str(),
-					      packet.hops(), packet.data().size());
+					      packet.receiving_interface() ? packet.receiving_interface().toString().c_str() : "<none>",
+				      packet.hops(), packet.data().size());
 				}
 				if (iter != _destinations.end()) {
 					/* Diptych: INFOF for app destinations (LXMF, mailbox,
@@ -3361,6 +3446,20 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 				// convergence time. Maybe just drop it?
 				DEBUGF("Not answering path request for destination %s%s, since next hop is the requestor", destination_hash.toHex().c_str(), interface_str.c_str());
 			}
+			// Only re-emit a path back out the *same* interface the request
+			// arrived on when we are the destination's direct neighbor on
+			// that medium (1 hop, learned on that interface). Re-emitting a
+			// multi-hop path onto a shared/broadcast medium is what
+			// propagates looped/long paths (the gateway hops=5,
+			// next-hop-unknown pollution). On point-to-point links the only
+			// "1 hop on that interface" path is the requesting peer itself,
+			// already handled above — so this also suppresses the pointless
+			// p2p echo without needing to tag interface kinds.
+			// Cross-interface answering (learned on iface A, answer on B) is
+			// legitimate transport bridging and is unaffected.
+			else if (attached_interface == receiving_interface && destination_entry._hops > 1) {
+				DBGF_DEMOTE("Not answering path request for destination %s%s back out its own interface: path is %u hops, not a direct neighbor on that medium", destination_hash.toHex().c_str(), interface_str.c_str(), (unsigned)destination_entry._hops);
+			}
 			else {
 				INFOF("Answering path request for destination %s%s, path is known", destination_hash.toHex().c_str(), interface_str.c_str());
 
@@ -3486,10 +3585,14 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 			}});
 
 			for (auto& [hash, interface] : _interfaces) {
-				// CBA EXPERIMENTAL forwarding path requests even on requestor interface in order to support
-				//  path-finding over LoRa mesh
-				//if (interface != attached_interface) {
-				if (true) {
+				// No path known here, so by the same-interface rule we must
+				// NOT re-flood the request back out the interface it came in
+				// on — that is what built the LoRa↔TCP path loop (every
+				// transport re-flooding into the others, hop counts to 127).
+				// Discovery still forwards out *other* interfaces (stock
+				// Reticulum behaviour); genuine multi-hop LoRa paths still
+				// propagate via normal announce flooding through transports.
+				if (interface != attached_interface) {
 					TRACEF("Transport::path_request: requesting path on interface %s", interface.toString().c_str());
 					// Use the previously extracted tag from this path request
 					// on the new path requests as well, to avoid potential loops

@@ -117,7 +117,10 @@ typedef struct {
 static_assert(sizeof(rnsd_link_resource_done_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_resource_done_t must fit ITS_MAX_MSG_DATA");
 
-/** RNS interface modes — mirrors Type::Interface::modes in microreticulum. */
+/** RNS interface modes. These are the rnsd-facing wire values; they do
+ *  NOT share the bit layout of mR's Type::Interface::modes — rnsd maps
+ *  between the two (mapIfaceMode in rnsd.cpp). Keep this enum stable;
+ *  never raw-cast it to an mR mode. */
 enum rns_iface_mode : uint8_t {
     RNS_IFACE_MODE_FULL          = 0x01,
     RNS_IFACE_MODE_GATEWAY       = 0x02,
@@ -174,6 +177,7 @@ enum : uint8_t {
     RNSD_DEST_STATUS_DELIVERED = 1,   /* DIRECT link-proof received */
     RNSD_DEST_STATUS_CANCELLED = 2,   /* client wrote OUT_CANCEL */
     RNSD_DEST_STATUS_EVICTED   = 3,   /* rnsd buffer/memory limit */
+    RNSD_DEST_STATUS_FAILED    = 4,   /* gave up — no route found before deadline */
 };
 
 /** OUT_STATUS.type — aux progress narration. See lxmf.md §5.2. */

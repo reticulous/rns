@@ -449,7 +449,11 @@ bool Packet::unpack() {
 		size_t dump = n < 8 ? n : 8;
 		for (size_t i = 0; i < dump; ++i)
 			std::snprintf(hex + 3*i, 4, "%02x ", raw[i]);
-		ERRORF("Received malformed packet, dropping it (%zuB, first=%s): %s",
+		/* Detail only — the user-facing, de-duplicated, interface-named
+		 * warning is emitted by Transport::inbound (the caller has the
+		 * receiving interface; unpack() does not). Keep this at TRACE so
+		 * it doesn't double-log every dropped packet. */
+		TRACEF("Packet::unpack: malformed packet (%zuB, first=%s): %s",
 		       n, hex, e.what());
 		return false;
 	}

@@ -306,7 +306,16 @@ inline size_t unpack_array_header(const uint8_t* p, size_t n, size_t& count) {
 
 // Per-type unpack dispatchers used by the fold expression in from_array.
 inline size_t unpack_one(const uint8_t* p, size_t n, double& v)         { return unpack_double(p, n, v); }
-inline size_t unpack_one(const uint8_t* p, size_t n, bin_t<uint8_t>& v) { return unpack_bin(p, n, v); }
+inline size_t unpack_one(const uint8_t* p, size_t n, bin_t<uint8_t>& v) {
+    // Reference RNS packs optional payload slots (Link REQUEST/RESPONSE
+    // request_data / response_data) as `None` → msgpack nil when the
+    // caller passes no data. Treat nil as an empty bin so a data-less
+    // request decodes instead of throwing "expected bin" and dropping
+    // the request. Lower-level unpack_bin stays strict for the callers
+    // that demand bin (Resource.cpp), which never see nil here.
+    if (n >= 1 && p[0] == 0xc0) { v.clear(); return 1; }
+    return unpack_bin(p, n, v);
+}
 
 } // namespace detail
 
