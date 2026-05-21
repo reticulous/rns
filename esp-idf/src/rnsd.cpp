@@ -3773,13 +3773,29 @@ static void rnsdTaskMain(void*)
 {
     info("[%s] task up", TAG);
 
+    /* PSRAM-place the iface and packet-connection tables in task context, so
+     * heap tracking attributes them to rnsd rather than the main task. RNS::
+     * Interface / Destination / Identity have non-trivial ctors — placement-
+     * new each slot. */
+    s_ifaces = (iface_t*)heap_caps_malloc(RNSD_MAX_IFACES * sizeof(iface_t), MALLOC_CAP_SPIRAM);
+    s_mailbox_conns = (mailbox_conn_t*)heap_caps_malloc(
+        RNSD_MAX_MAILBOX_CONNS * sizeof(mailbox_conn_t), MALLOC_CAP_SPIRAM);
+    s_link_conns = (link_conn_t*)heap_caps_malloc(
+        RNSD_MAX_LINK_CONNS * sizeof(link_conn_t), MALLOC_CAP_SPIRAM);
+    if (!s_ifaces || !s_mailbox_conns || !s_link_conns) {
+        err("rnsd table PSRAM alloc failed"); killSelf();
+    }
+    for (int j = 0; j < RNSD_MAX_IFACES; j++)        new (&s_ifaces[j])        iface_t{};
+    for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++) new (&s_mailbox_conns[j]) mailbox_conn_t{};
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)    new (&s_link_conns[j])    link_conn_t{};
+
     /* s.rnsd.its_no_pool (default off): when on, rnsd's ITS connections bypass
      * the shared buffer pool — buffers are created on connect and freed on
      * disconnect. Returns transient buffers to the heap and makes `rnsd memory`'s
      * ITS figure exact under per-task heap tracking (no cross-task borrowing).
      * Read once here — takes effect on the next boot after toggling. */
     bool itsNoPool = storageGetInt("s.rnsd.its_no_pool", 0) != 0;
-    if (!itsServerInit(0, 0, itsNoPool)) { err("itsServerInit failed"); vTaskDelete(nullptr); return; }
+    if (!itsServerInit(0, 0, itsNoPool)) { err("itsServerInit failed"); killSelf(); return; }
     /* rnsd is also an ITS *client*: Phase D back-connects inbound Links
      * to the registered consumer via itsConnectByTaskHandle. Without
      * this the connect fails and onIncomingLinkEstablished tears the
@@ -3794,7 +3810,7 @@ static void rnsdTaskMain(void*)
                            /*maxHandles=*/RNSD_MAX_IFACES,
                            /*toSize=*/4096, /*fromSize=*/4096)) {
         err("RNSD_PORT_TRANSPORT open failed");
-        vTaskDelete(nullptr);
+        killSelf();
         return;
     }
     itsServerOnConnect(RNSD_PORT_TRANSPORT, onTransportConnect);
@@ -3805,7 +3821,7 @@ static void rnsdTaskMain(void*)
                            /*maxHandles=*/RNSD_MAX_MAILBOX_CONNS,
                            /*toSize=*/4096, /*fromSize=*/2048)) {
         err("RNSD_PORT_DEST open failed");
-        vTaskDelete(nullptr);
+        killSelf();
         return;
     }
     itsServerOnConnect(RNSD_PORT_DEST,    onMailboxConnect);
@@ -3819,7 +3835,7 @@ static void rnsdTaskMain(void*)
                            /*maxHandles=*/RNSD_MAX_ANNOUNCE_SUBS,
                            /*toSize=*/0, /*fromSize=*/4096)) {
         err("RNSD_PORT_ANNOUNCES open failed");
-        vTaskDelete(nullptr);
+        killSelf();
         return;
     }
     itsServerOnConnect(RNSD_PORT_ANNOUNCES,    onAnnouncesConnect);
@@ -3833,7 +3849,7 @@ static void rnsdTaskMain(void*)
                            /*maxHandles=*/RNSD_MAX_LINK_CONNS,
                            /*toSize=*/4096, /*fromSize=*/4096)) {
         err("RNSD_PORT_LINK open failed");
-        vTaskDelete(nullptr);
+        killSelf();
         return;
     }
     itsServerOnConnect(RNSD_PORT_LINK,    onLinkConnect);
@@ -4009,23 +4025,8 @@ static void rnsdTaskMain(void*)
 
 void rnsdInit(void)
 {
-    /* PSRAM-place the iface and packet-connection tables. RNS::Interface /
-     * RNS::Destination / RNS::Identity have non-trivial ctors — placement-
-     * new each slot. */
-    s_ifaces = (iface_t*)heap_caps_malloc(RNSD_MAX_IFACES * sizeof(iface_t), MALLOC_CAP_SPIRAM);
-    if (!s_ifaces) { err("s_ifaces PSRAM alloc failed"); return; }
-    for (int j = 0; j < RNSD_MAX_IFACES; j++) new (&s_ifaces[j]) iface_t{};
-
-    s_mailbox_conns = (mailbox_conn_t*)heap_caps_malloc(
-        RNSD_MAX_MAILBOX_CONNS * sizeof(mailbox_conn_t), MALLOC_CAP_SPIRAM);
-    if (!s_mailbox_conns) { err("s_mailbox_conns PSRAM alloc failed"); return; }
-    for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++) new (&s_mailbox_conns[j]) mailbox_conn_t{};
-
-    s_link_conns = (link_conn_t*)heap_caps_malloc(
-        RNSD_MAX_LINK_CONNS * sizeof(link_conn_t), MALLOC_CAP_SPIRAM);
-    if (!s_link_conns) { err("s_link_conns PSRAM alloc failed"); return; }
-    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++) new (&s_link_conns[j]) link_conn_t{};
-
+    /* The iface / packet-connection tables are allocated in rnsdTaskMain (task
+     * context) so heap tracking attributes them to rnsd, not the main task. */
     for (auto& s : s_announce_subs) { s.used = false; s.handle = -1; s.aspect[0] = '\0'; }
 
     /* One-time storage defaults gated on version. */
