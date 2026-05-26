@@ -163,6 +163,9 @@ namespace RNS {
 		inline InterfaceImpl* get() {
 			return _impl.get();
 		}
+		inline const InterfaceImpl* get() const {
+			return _impl.get();
+		}
 		inline void clear() {
 			_impl.reset();
 		}

@@ -81,6 +81,9 @@ idf_component_register(
         # diptych-core — for log macros (info/warn/err/...) once Log.cpp is
         # rerouted into the build.
         diptych-core
+        # bzip2 — Resource.cpp (de)compresses bz2 Resource payloads
+        # (NomadNet/Reticulum compress with bz2; every client speaks it).
+        bzip2
 )
 
 # Plan §2: explicitly do NOT define RNS_USE_FS or RNS_PERSIST_PATHS so that

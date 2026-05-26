@@ -466,16 +466,30 @@ Sends a request to the remote peer.
 :param timeout: An optional timeout in seconds for the request. If *None* is supplied it will be calculated based on link RTT.
 :returns: A :ref:`RNS.RequestReceipt<api-requestreceipt>` instance if the request was sent, or *False* if it was not.
 */
-const RNS::RequestReceipt Link::request(const Bytes& path, const Bytes& data /*= {Bytes::NONE}*/, RequestReceipt::Callbacks::response response_callback /*= nullptr*/, RequestReceipt::Callbacks::failed failed_callback /*= nullptr*/, RequestReceipt::Callbacks::progress progress_callback /*= nullptr*/, double timeout /*= 0.0*/) {
+const RNS::RequestReceipt Link::request(const Bytes& path, const Bytes& data /*= {Bytes::NONE}*/, RequestReceipt::Callbacks::response response_callback /*= nullptr*/, RequestReceipt::Callbacks::failed failed_callback /*= nullptr*/, RequestReceipt::Callbacks::progress progress_callback /*= nullptr*/, double timeout /*= 0.0*/, bool data_packed /*= false*/) {
 	assert(_object);
 	DEBUGF("Link %s sending request", link_id().toHex().c_str());
 	const Bytes request_path_hash(Identity::truncated_hash(path));
 
 	//p unpacked_request = [OS::time(), request_path_hash, data]
 	//p packed_request = umsgpack.packb(unpacked_request)
-    MsgPack::Packer packer;
-	packer.to_array(OS::time(), request_path_hash, data);
-	Bytes packed_request(packer.data(), packer.size());
+	Bytes packed_request;
+	if (data_packed) {
+		// data is already a complete msgpack object (a NomadNet
+		// {field_*,var_*} map). Build the envelope by hand and splice it as
+		// the 3rd array element verbatim, rather than bin-wrapping it.
+		std::vector<uint8_t> b;
+		MsgPack::detail::pack_array_header(b, 3);
+		MsgPack::detail::pack_double(b, OS::time());
+		MsgPack::detail::pack_bin(b, request_path_hash.data(), request_path_hash.size());
+		b.insert(b.end(), data.data(), data.data() + data.size());
+		packed_request = Bytes(b.data(), b.size());
+	}
+	else {
+		MsgPack::Packer packer;
+		packer.to_array(OS::time(), request_path_hash, data);
+		packed_request = Bytes(packer.data(), packer.size());
+	}
 
 	if (timeout == 0.0) {
 		timeout = _object->_rtt * _object->_traffic_timeout_factor + Type::Resource::RESPONSE_MAX_GRACE_TIME * 1.125;
@@ -995,11 +1009,18 @@ void Link::response_resource_concluded(const Resource& resource) {
 	}
 	else {
 		DEBUGF("Incoming response resource failed with status: %d", resource.status());
+		// request_timed_out() erases the receipt from _pending_requests, so we
+		// must NOT keep iterating the set afterwards (that invalidates the
+		// range-for's iterator → reads a freed/NONE receipt → assert). request_id
+		// is unique: find the match, then act + break.
+		RNS::RequestReceipt match = {Type::NONE};
 		for (RNS::RequestReceipt pending_request : _object->_pending_requests) {
-			if (pending_request.request_id() == resource.request_id()) {
-				pending_request.request_timed_out({Type::NONE});
+			if (pending_request && pending_request.request_id() == resource.request_id()) {
+				match = pending_request;
+				break;
 			}
 		}
+		if (match) match.request_timed_out({Type::NONE});
 	}
 }
 
@@ -1026,7 +1047,16 @@ void Link::receive(const Packet& packet) {
 	_object->_watchdog_lock = true;
 	if (_object->_status != Type::Link::CLOSED && !(_object->_initiator && packet.context() == Type::Packet::KEEPALIVE && packet.data() == "\xFF")) {
 		if (packet.receiving_interface() != _object->_attached_interface) {
-			ERROR("Link-associated packet received on unexpected interface! Someone might be trying to manipulate your communication!");
+			/* Diptych diagnostic: name AND object-identity (impl ptr) of both
+			 * interfaces, plus the packet type/context. Lets us tell apart a
+			 * second TCP iface object (same name, different ptr — a reconnect)
+			 * from a different iface (LoRa) from an unset interface (<none>). */
+			ERRORF("Link-associated packet received on unexpected interface %s [%p] instead of %s [%p] (type=%d ctx=%d)! Someone might be trying to manipulate your communication!",
+				packet.receiving_interface() ? packet.receiving_interface().toString().c_str() : "<none>",
+				(const void*)packet.receiving_interface().get(),
+				_object->_attached_interface ? _object->_attached_interface.toString().c_str() : "<none>",
+				(const void*)_object->_attached_interface.get(),
+				(int)packet.packet_type(), (int)packet.context());
 		}
 		else {
 			_object->_last_inbound = OS::time();

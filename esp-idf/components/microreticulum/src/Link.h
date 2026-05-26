@@ -194,7 +194,11 @@ namespace RNS {
 		void prove_packet(const Packet& packet);
 		void validate_proof(const Packet& packet);
 		void identify(const Identity& identity);
-		const RequestReceipt request(const Bytes& path, const Bytes& data = {Bytes::NONE}, RequestReceipt::Callbacks::response response_callback = nullptr, RequestReceipt::Callbacks::failed failed_callback = nullptr, RequestReceipt::Callbacks::progress progress_callback = nullptr, double timeout = 0.0);
+		// data_packed (diptych): when true, `data` is already a complete msgpack
+		// object and is spliced as the request envelope's 3rd element verbatim
+		// (e.g. a {field_*,var_*} map for NomadNet form submission) instead of
+		// being bin-wrapped. Default false keeps the byte-for-byte GET path.
+		const RequestReceipt request(const Bytes& path, const Bytes& data = {Bytes::NONE}, RequestReceipt::Callbacks::response response_callback = nullptr, RequestReceipt::Callbacks::failed failed_callback = nullptr, RequestReceipt::Callbacks::progress progress_callback = nullptr, double timeout = 0.0, bool data_packed = false);
 		void update_mdu();
 		void rtt_packet(const Packet& packet);
 		float get_establishment_rate();

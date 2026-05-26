@@ -127,7 +127,11 @@ namespace RNS {
 		Bytes _hash;
 		PacketReceipt _packet_receipt = {Type::NONE};
 		Resource _resource = {Type::NONE};
-		Link _link;
+		// Must be NONE-initialized like the siblings above: a bare `Link _link;`
+		// invokes the full Link(Destination={Type::NONE}, …) ctor (line ~162),
+		// which derives keys from an empty identity and crashes. Latent until
+		// nomad became the first caller of Link::request → RequestReceipt.
+		Link _link = {Type::NONE};
 		double _started_at = 0.0;
 		Bytes _request_id;
 		int _request_size = 0;

@@ -22,6 +22,7 @@
 #include "Packet.h"
 #include "Log.h"
 #include "MsgPack.h"
+#include "bzlib.h"
 
 #include <algorithm>
 #include <array>
@@ -68,29 +69,81 @@ Bytes rns_full_hash2(const Bytes& a, const uint8_t* b, size_t blen) {
 	return Identity::full_hash(in);
 }
 
+// bz2 (de)compression for Resource payloads — Reticulum/NomadNet compress
+// Resource data with Python bz2; every client speaks it. Buffer-to-buffer
+// only (BZ_NO_STDIO). bzip2's malloc lands in PSRAM on this platform.
+
+// Decompress `in` into exactly `out_size` bytes (we know the uncompressed
+// size from the advertisement's `d`). small=1 trades speed for ~1/3 the
+// working set so a level-9 stream stays well within PSRAM. false on error.
+bool rns_bz2_decompress(const Bytes& in, size_t out_size, Bytes& out) {
+	if (out_size == 0) { out = Bytes(); return true; }
+	std::vector<uint8_t> buf(out_size);
+	unsigned int dlen = static_cast<unsigned int>(out_size);
+	int r = BZ2_bzBuffToBuffDecompress(
+		reinterpret_cast<char*>(buf.data()), &dlen,
+		reinterpret_cast<char*>(const_cast<uint8_t*>(in.data())),
+		static_cast<unsigned int>(in.size()), /*small=*/1, /*verbosity=*/0);
+	if (r != BZ_OK || dlen != out_size) return false;
+	out = Bytes(buf.data(), dlen);
+	return true;
+}
+
+// Compress `in`; fills `out` and returns true only if compression succeeded
+// AND shrank the data (else the caller sends it uncompressed). blockSize100k=1
+// bounds our working set (~1 MB); any bz2 decompressor handles any block size.
+bool rns_bz2_compress(const Bytes& in, Bytes& out) {
+	if (in.size() == 0) return false;
+	unsigned int cap = static_cast<unsigned int>(in.size() + in.size() / 100 + 600);
+	std::vector<uint8_t> buf(cap);
+	unsigned int clen = cap;
+	int r = BZ2_bzBuffToBuffCompress(
+		reinterpret_cast<char*>(buf.data()), &clen,
+		reinterpret_cast<char*>(const_cast<uint8_t*>(in.data())),
+		static_cast<unsigned int>(in.size()),
+		/*blockSize100k=*/1, /*verbosity=*/0, /*workFactor=*/0);
+	if (r != BZ_OK || clen >= in.size()) return false;
+	out = Bytes(buf.data(), clen);
+	return true;
+}
+
 } // namespace
 
 void Resource::_init_outbound(const Bytes& plaintext, bool advertise,
                               const Bytes& request_id, bool is_request,
-                              bool is_response) {
+                              bool is_response, bool auto_compress) {
 	assert(_object);
 	ResourceData& d = *_object;
 	d._outbound = true;
 	d._request_id = request_id;
+	// adv.d / total size are always the *uncompressed* length.
 	d._data_size = plaintext.size();
 	d._total_size = plaintext.size();
 	d._flags.encrypted = true;
-	d._flags.compressed = false;            // bz2 deliberately disabled on this build
 	d._flags.is_request = is_request;
 	d._flags.is_response = is_response;
 
-	// Stream randomiser: prepended to the plaintext and encrypted into the
-	// stream; the receiver strips it after decrypt. Distinct from the
+	// bz2-compress when it helps (every Reticulum/NomadNet client decompresses).
+	// Compression only affects the *encrypted stream payload*; the resource
+	// hash + proof are over the ORIGINAL uncompressed `plaintext` (upstream
+	// Resource.py: self.hash = full_hash(data + random_hash) where `data` is
+	// the uncompressed arg — Resource.py:404-443). map hashes are over the
+	// encrypted chunks (below), independent of compression.
+	Bytes compressed;
+	d._flags.compressed = (auto_compress &&
+	                       plaintext.size() <= Type::Resource::AUTO_COMPRESS_MAX_SIZE &&
+	                       rns_bz2_compress(plaintext, compressed));
+	const Bytes& on_wire = d._flags.compressed ? compressed : plaintext;
+	if (d._flags.compressed)
+		INFOF("Resource: bz2 %zu -> %zu B", plaintext.size(), on_wire.size());
+
+	// Stream randomiser: prepended to the on-wire payload and encrypted into
+	// the stream; the receiver strips it after decrypt. Distinct from the
 	// advertised random_hash (upstream Resource.py uses two independent
 	// 4-byte random hashes for these two unrelated jobs).
 	const Bytes srh = Identity::get_random_hash();
 	Bytes to_encrypt(srh.data(), Type::Resource::RANDOM_HASH_SIZE);
-	to_encrypt.append(plaintext.data(), plaintext.size());
+	to_encrypt.append(on_wire.data(), on_wire.size());
 
 	const Bytes encrypted = d._link.encrypt(to_encrypt);
 	if (!encrypted) {
@@ -106,14 +159,14 @@ void Resource::_init_outbound(const Bytes& plaintext, bool advertise,
 	const Bytes rh = Identity::get_random_hash();
 	std::memcpy(d._random_hash, rh.data(), Type::Resource::RANDOM_HASH_SIZE);
 
-	// resource_hash = full_hash(plaintext || random_hash)   (PLAINTEXT domain)
+	// resource_hash = full_hash(plaintext || random_hash)  (UNCOMPRESSED domain)
 	const Bytes rhf = rns_full_hash2(plaintext, d._random_hash,
 	                                 Type::Resource::RANDOM_HASH_SIZE);
 	std::memcpy(d._resource_hash, rhf.data(), 32);
 	std::memcpy(d._original_hash, d._resource_hash, 32);
 	d._hash = Bytes(d._resource_hash, 32);
-	// expected_proof = full_hash(plaintext || resource_hash)
-	d._expected_proof = rns_full_hash2(plaintext, d._resource_hash, 32);
+	// expected_proof = full_hash(on_wire || resource_hash)
+	d._expected_proof = rns_full_hash2(on_wire, d._resource_hash, 32);
 
 	const size_t sdu = Type::Resource::SDU;
 	const size_t num = (encrypted.size() + sdu - 1) / sdu;
@@ -156,14 +209,14 @@ Resource::Resource(const Bytes& data, const Link& link, bool advertise /*= true*
 {
 	assert(_object);
 	MEM("Resource object created");
-	(void)auto_compress;        // bz2 unsupported on this build — see _init_outbound
 	(void)segment_index;        // single-segment only (v1)
 	(void)original_hash;
 	_object->_timeout = timeout;
 	_object->_callbacks._concluded = callback;
 	_object->_callbacks._progress = progress_callback;
 	_init_outbound(data, advertise, request_id,
-	               /*is_request=*/((bool)request_id && !is_response), is_response);
+	               /*is_request=*/((bool)request_id && !is_response), is_response,
+	               auto_compress);
 }
 
 void Resource::advertise() {
@@ -436,35 +489,52 @@ bool Resource::receive_part(const Bytes& part_data) {
 			    decrypted.size() <= Type::Resource::RANDOM_HASH_SIZE) {
 				d._status = Type::Resource::CORRUPT;
 			}
-			else if (d._flags.compressed) {
-				WARNING("Resource: dropping compressed inbound payload "
-				        "(bz2 not supported on this build)");
-				d._status = Type::Resource::CORRUPT;
-			}
 			else {
-				// Strip the 4-byte stream randomiser prepended pre-encrypt.
-				const Bytes payload(
+				// Strip the 4-byte stream randomiser prepended pre-encrypt to
+				// get the on-wire payload (bz2-compressed when adv.c was set).
+				const Bytes onwire(
 					decrypted.data() + Type::Resource::RANDOM_HASH_SIZE,
 					decrypted.size() - Type::Resource::RANDOM_HASH_SIZE);
-				// Integrity: full_hash(payload || random_hash) == resource_hash.
-				const Bytes calc = rns_full_hash2(
-					payload, d._random_hash, Type::Resource::RANDOM_HASH_SIZE);
-				if (calc.size() < 32 ||
-				    std::memcmp(calc.data(), d._resource_hash, 32) != 0) {
-					WARNING("Resource: assembled-hash mismatch — corrupt");
+				// Decompress FIRST: upstream computes resource_hash + proof over
+				// the *uncompressed* data (Resource.py:404-443), so the
+				// integrity check and proof must be over the decompressed bytes,
+				// not the on-wire (compressed) ones.
+				Bytes data;
+				bool data_ok = true;
+				if (d._flags.compressed) {
+					if (!rns_bz2_decompress(onwire, d._total_size, data)) {
+						WARNING("Resource: bz2 decompress failed — corrupt");
+						data_ok = false;
+					}
+				} else {
+					data = onwire;
+				}
+				if (!data_ok) {
 					d._status = Type::Resource::CORRUPT;
 				}
 				else {
-					d._data = payload;
-					d._status = Type::Resource::COMPLETE;
-					// Prove: proof_data = resource_hash || full_hash(payload || resource_hash)
-					const Bytes proof = generate_proof();
-					Bytes proof_data(d._resource_hash, 32);
-					proof_data.append(proof.data(), proof.size());
-					Packet proof_packet(d._link, proof_data,
-					                    Type::Packet::PROOF,
-					                    Type::Packet::RESOURCE_PRF);
-					proof_packet.send();
+					// Integrity: full_hash(data || random_hash) == resource_hash.
+					const Bytes calc = rns_full_hash2(
+						data, d._random_hash, Type::Resource::RANDOM_HASH_SIZE);
+					if (calc.size() < 32 ||
+					    std::memcmp(calc.data(), d._resource_hash, 32) != 0) {
+						WARNING("Resource: assembled-hash mismatch — corrupt");
+						d._status = Type::Resource::CORRUPT;
+					}
+					else {
+						d._data = data;
+						d._status = Type::Resource::COMPLETE;
+						// proof_data = resource_hash || full_hash(data || resource_hash),
+						// over the decompressed data — matches the sender's
+						// expected_proof (Resource.py: over uncompressed data).
+						const Bytes proof = generate_proof();
+						Bytes proof_data(d._resource_hash, 32);
+						proof_data.append(proof.data(), proof.size());
+						Packet proof_packet(d._link, proof_data,
+						                    Type::Packet::PROOF,
+						                    Type::Packet::RESOURCE_PRF);
+						proof_packet.send();
+					}
 				}
 			}
 		}

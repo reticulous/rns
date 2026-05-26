@@ -166,7 +166,7 @@ namespace RNS {
 		// expected proof, register on the link, optionally advertise.
 		void _init_outbound(const Bytes& plaintext, bool advertise,
 		                     const Bytes& request_id, bool is_request,
-		                     bool is_response);
+		                     bool is_response, bool auto_compress = true);
 
 		// Inbound: send a RESOURCE_REQ for the next window of map hashes
 		// ([_requested, _requested+_window)) and advance _requested.
