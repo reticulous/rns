@@ -239,3 +239,44 @@ bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
 /** Free a buffer received via RNSD_LINK_RESOURCE_INBOUND_DONE. Thin
  *  wrapper over free() — a symmetry hook in case the allocator changes. */
 void rnsdResourceRelease(void* buf);
+
+/* ──────────────── request / response (nomad page fetch, nomad.md §1) ────────────────
+ *
+ * Reticulum's request/response layer rides an established Link: the
+ * consumer issues `link.request(path, data)`, the remote's registered
+ * handler returns response bytes. This is the NomadNet page-fetch path
+ * (`/page/<rel>.mu`, `/file/<rel>`) and also `rnstatus -R` / `rnpath -R`.
+ * rnsd bridges it to the byte-array world so consumers never see mR
+ * types — same contract as the Resource transfer API above. */
+
+/** Issue a request on the outbound Link identified by `tag` (already
+ *  opened via rnsdLinkOpen). `path` is the request path string (e.g.
+ *  "/page/index.mu"). `data`/`data_len` is the request payload (packed
+ *  by the caller per the target protocol); pass nullptr/0 for a plain
+ *  GET (the request envelope's data element is empty).
+ *
+ *  The response is delivered as one aux frame (rnsd_link_resource_done_t,
+ *  opcode RNSD_LINK_REQUEST_RESPONSE) to `resp_port` on the *calling*
+ *  task — the consumer owns `buf` and must rnsdResourceRelease() it.
+ *  Failure or timeout → RNSD_LINK_REQUEST_FAILED (buf null). The aux's
+ *  `opaque_id` echoes the returned request id so the consumer correlates.
+ *
+ *  If the Link is not yet ACTIVE the request is held (one pending request
+ *  per link) and issued on establishment — mirrors the pre-active
+ *  packet / Resource outboxes, so a consumer can rnsdLinkOpen() then
+ *  rnsdLinkRequest() back-to-back.
+ *
+ *  v1 limit: path+data are sent inline in the aux, so they must fit
+ *  ITS_MAX_MSG_DATA (ample for a page GET; large form uploads as a
+ *  request-Resource are a later phase). One in-flight request per link.
+ *
+ *  `data_packed` (default false): when true, `data` is already a complete
+ *  msgpack object (e.g. a NomadNet `{field_*,var_*}` form map built by the
+ *  caller) and is spliced as the request envelope's 3rd element verbatim,
+ *  rather than bin-wrapped. False is the plain GET/bin path.
+ *
+ *  Returns a non-negative request id (echoed as the aux opaque_id), or
+ *  negative on bad args / oversize inline payload / aux-send failure. */
+int rnsdLinkRequest(const char* tag, const char* path,
+                    const void* data, size_t data_len,
+                    uint16_t resp_port, bool data_packed = false);

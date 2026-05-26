@@ -74,7 +74,38 @@ enum : uint8_t {
                                          * §9.2). rnsd takes ownership of buf
                                          * and frees it once the engine has
                                          * copied it into encrypted parts. */
+    RNSD_LINK_AUX_REQUEST      = 0x03,  /* payload: rnsd_link_request_t header
+                                         * followed inline by path[path_len]
+                                         * then data[data_len] — the nomad
+                                         * page-fetch / request-response
+                                         * primitive (nomad.md §1). Sent via
+                                         * rnsdLinkRequest(). */
 };
+
+/** Request/response issue (RNSD_PORT_LINK aux, nomad.md §1). Sent by
+ *  rnsdLinkRequest(): bridges a consumer byte-array request to µR's
+ *  Link::request(path, data, …) on the Link already opened as `tag`. The
+ *  path and request data are appended *inline* after this fixed header in
+ *  the same aux frame: path occupies the next `path_len` bytes, the request
+ *  data the following `data_len` bytes (`data_len == 0` → plain GET). The
+ *  whole frame must fit ITS_MAX_MSG_DATA, so this rides packets only;
+ *  request-as-Resource (large form uploads) is a later phase. */
+typedef struct {
+    uint8_t  op;            /* RNSD_LINK_AUX_REQUEST */
+    char     tag[24];       /* outbound link tag (rnsdLinkOpen) */
+    uint16_t req_id;        /* consumer correlation id, echoed in the response
+                             * aux's opaque_id field */
+    uint16_t resp_port;     /* consumer aux port the response/failed handoff
+                             * is delivered to (on the requesting task) */
+    uint16_t path_len;      /* path bytes following this header */
+    uint16_t data_len;      /* request-data bytes following the path; 0 = GET */
+    uint8_t  data_packed;   /* 1 = data is a complete msgpack object spliced
+                             * verbatim as the request's 3rd element (NomadNet
+                             * form {field_*,var_*} map); 0 = plain GET/bin */
+    /* path[path_len], then data[data_len] follow inline. */
+} rnsd_link_request_t;
+static_assert(sizeof(rnsd_link_request_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_link_request_t must fit ITS_MAX_MSG_DATA");
 
 /** Outbound Resource send request (RNSD_PORT_LINK aux, Phase F).
  *  Sent by rnsdLinkSendResource(). `buf` is a heap pointer in the shared
@@ -91,11 +122,19 @@ typedef struct {
 static_assert(sizeof(rnsd_link_send_resource_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_send_resource_t must fit ITS_MAX_MSG_DATA");
 
-/** Resource-aux opcodes (consumer's LXMF_LINK_RESOURCE_AUX_PORT). */
+/** Resource-aux opcodes (consumer's resource/response aux port). The
+ *  REQUEST_* opcodes reuse the same handoff struct + delivery path as the
+ *  RESOURCE_* ones (nomad.md §1): a request response can be a whole page,
+ *  so it comes back as a heap buffer the consumer owns, tagged by the
+ *  consumer's req_id (carried in opaque_id). */
 enum : uint8_t {
     RNSD_LINK_RESOURCE_INBOUND_DONE  = 0x01,  /* buf valid, consumer owns it */
     RNSD_LINK_RESOURCE_OUTBOUND_DONE = 0x02,  /* buf null; opaque_id settles */
     RNSD_LINK_RESOURCE_FAILED        = 0x03,  /* buf null; transfer aborted */
+    RNSD_LINK_REQUEST_RESPONSE       = 0x04,  /* buf = response bytes (may be
+                                               * null/0 for an empty response),
+                                               * consumer owns; opaque_id = req_id */
+    RNSD_LINK_REQUEST_FAILED         = 0x05,  /* buf null; opaque_id = req_id */
 };
 
 /** Resource handoff frame. rnsd opens a one-shot ITS connection to the
@@ -133,7 +172,7 @@ enum rns_iface_mode : uint8_t {
  *  registering with rnsd. Fixed-size struct to keep the connect path
  *  cheap (fits in ITS_MAX_MSG_DATA = 96). */
 typedef struct {
-    char     name[24];      /* "tcp/0", "udp", "lora", "tcp_in/<addr:port>" */
+    char     name[24];      /* "tcp/0", "auto", "lora", "tcp_in/<addr:port>" */
     uint16_t mtu;           /* bytes — RNS protocol MTU is 500 */
     uint32_t bitrate;       /* bits/sec on the wire */
     uint8_t  mode;          /* rns_iface_mode */

@@ -84,7 +84,7 @@ static bool s_dbg_only_local = false;
 #define RNSD_VERSION 1
 
 /* Up to N concurrent registered transport ifaces. Each TCP peer is its
- * own iface, so this caps total transports (lora + udp + N tcp). */
+ * own iface, so this caps total transports (lora + auto + espnow + N tcp). */
 #define RNSD_MAX_IFACES 16
 
 /* mR Interface impl wrapping the ITS handle to a transport task. mR's
@@ -206,7 +206,11 @@ static_assert(sizeof(rnsd_link_connect_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_connect_t must fit ITS_MAX_MSG_DATA");
 
 #define RNSD_MAX_MAILBOX_CONNS    4
-#define RNSD_MAX_LINK_CONNS       8
+/* Generous — costs only a slot struct + (lazily, PSRAM) ITS buffers each.
+ * When the table is full a new open evicts the longest-idle link rather than
+ * failing (linkAlloc), so this is a soft concurrency ceiling, never a hard
+ * refusal. */
+#define RNSD_MAX_LINK_CONNS       32
 
 /* Length-checked inbound buffer for the IN destination dispatcher. RNS
  * MTU is 500 — 600 covers framing slack. */
@@ -1658,6 +1662,7 @@ static void cliRnsd(const char* args)
         cliPrintf("       rnsd links                       — pending/active Link table sizes\n");
         cliPrintf("       rnsd clink <dest_hash> [aspect]  — Phase C consumer-API link\n");
         cliPrintf("       rnsd clink send <text> | close\n");
+        cliPrintf("       rnsd creq <dest_hash> <path>     — request/response smoke (nomad)\n");
         cliPrintf("       rnstatus  — interfaces & traffic\n");
         cliPrintf("       rnpath    — routing paths\n");
         cliPrintf("       rnprobe   — RTT probe\n");
@@ -1720,7 +1725,21 @@ static void cliRnsd(const char* args)
         cliPrintf("rnsd clink: queued (%s) — watch rnsd.links.clink.* and log\n", rest);
         return;
     }
-    cliPrintf("usage: rnsd [identity|persist [if-transport]|reload|link …|links|clink …]\n");
+    if (strncmp(args, "creq", 4) == 0 && (args[4] == 0 || args[4] == ' ')) {
+        const char* rest = args + 4;
+        while (*rest == ' ') rest++;
+        if (!*rest) {
+            cliPrintf("usage: rnsd creq <dest_hash> <path> [aspect]  — Phase 0 request smoke\n");
+            cliPrintf("  opens a Link + link.request(path), logs the response bytes\n");
+            cliPrintf("  default aspect: nomadnetwork.node\n");
+            cliPrintf("  e.g. rnsd creq <hash> /page/index.mu\n");
+            return;
+        }
+        storageSet("rnsd.cmd.creq", rest);
+        cliPrintf("rnsd creq: queued (%s) — watch log for response\n", rest);
+        return;
+    }
+    cliPrintf("usage: rnsd [identity|persist [if-transport]|reload|link …|links|clink …|creq …]\n");
 }
 
 /* ─────────────── rnpath ─────────────── */
@@ -2479,6 +2498,50 @@ bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
     return ok;
 }
 
+int rnsdLinkRequest(const char* tag, const char* path,
+                    const void* data, size_t data_len,
+                    uint16_t resp_port, bool data_packed)
+{
+    if (!tag || !*tag || !path) { warn("rnsdLinkRequest: bad args"); return -1; }
+    if (!data) data_len = 0;
+    size_t path_len = strlen(path);
+    if (path_len > 0xffff || data_len > 0xffff) {
+        warn("rnsdLinkRequest: path/data too long");
+        return -1;
+    }
+    size_t total = sizeof(rnsd_link_request_t) + path_len + data_len;
+    if (total > ITS_MAX_MSG_DATA) {
+        warn("rnsdLinkRequest: inline payload too large (%zu > %d)",
+             total, (int)ITS_MAX_MSG_DATA);
+        return -1;
+    }
+
+    /* Monotonic correlation id. Single-byte-wraps are fine: it only has to
+     * be unique among a consumer's in-flight requests (one per link in v1). */
+    static uint16_t s_req_seq = 0;
+    uint16_t req_id = ++s_req_seq;
+    if (req_id == 0) req_id = ++s_req_seq;   /* never hand out 0 */
+
+    uint8_t buf[ITS_MAX_MSG_DATA];
+    rnsd_link_request_t hdr = {};
+    hdr.op        = RNSD_LINK_AUX_REQUEST;
+    safeStrncpy(hdr.tag, tag, sizeof(hdr.tag));
+    hdr.req_id    = req_id;
+    hdr.resp_port = resp_port;
+    hdr.path_len  = (uint16_t)path_len;
+    hdr.data_len  = (uint16_t)data_len;
+    hdr.data_packed = data_packed ? 1 : 0;
+    memcpy(buf, &hdr, sizeof(hdr));
+    memcpy(buf + sizeof(hdr), path, path_len);
+    if (data_len) memcpy(buf + sizeof(hdr) + path_len, data, data_len);
+
+    if (!itsSendAux("rnsd", RNSD_PORT_LINK, buf, total, pdMS_TO_TICKS(1000))) {
+        warn("rnsdLinkRequest: aux send failed");
+        return -1;
+    }
+    return (int)req_id;
+}
+
 void rnsdResourceRelease(void* buf)
 {
     if (buf) free(buf);
@@ -2733,6 +2796,7 @@ struct link_conn_t {
     link_state_t         state;
     RNS::Link            link{RNS::Type::NONE};
     double               opened_at;     /* OS::time() */
+    double               last_activity; /* OS::time() of last open/establish/traffic — LRU eviction key */
     double               path_deadline; /* OS::time() a path must answer by */
     double               estab_deadline;/* OS::time() ACTIVE must arrive by */
     double               orphan_at;     /* OS::time() consumer left; 0 = attached */
@@ -2756,6 +2820,28 @@ struct link_conn_t {
     void*                pend_res_buf;
     uint32_t             pend_res_len;
     uint32_t             pend_res_opaque;
+
+    /* Request/response (nomad page fetch, nomad.md §1). One in-flight
+     * request per link (v1). req_mrid is µR's RequestReceipt request_id —
+     * the response/failed callbacks have no userdata, so the slot is
+     * resolved by matching it (linkFindByReqMrid), the same trick the
+     * Resource path uses with res_hash. req_cid/req_port/req_task are the
+     * consumer's correlation id + where to deliver the response aux. */
+    RNS::Bytes           req_mrid;       /* empty = idle */
+    uint16_t             req_cid;
+    uint16_t             req_port;
+    TaskHandle_t         req_task;
+    double               req_deadline;   /* OS::time() response must arrive by; 0 = n/a */
+
+    /* Pre-active request deferral — held request issued on establish
+     * (mirrors pend_res_*). One pending request. */
+    bool                 pend_req_used;
+    std::string          pend_req_path;
+    std::vector<uint8_t> pend_req_data;
+    uint16_t             pend_req_cid;
+    uint16_t             pend_req_port;
+    TaskHandle_t         pend_req_task;
+    bool                 pend_req_packed;
 };
 
 static link_conn_t* s_link_conns = nullptr;
@@ -2805,11 +2891,37 @@ static link_conn_t* linkFindByTag(const char* tag)
     return nullptr;
 }
 
+static void linkFreeSlot(link_conn_t& c);   /* defined below */
+
+static inline void linkTouch(link_conn_t& c)
+{
+    c.last_activity = RNS::Utilities::OS::time();
+}
+
 static link_conn_t* linkAlloc(void)
 {
     for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)
         if (!s_link_conns[j].used) return &s_link_conns[j];
-    return nullptr;
+    /* Table full — evict the longest-idle link rather than refuse a new one.
+     * linkFreeSlot tears the victim down cleanly: cascades a disconnect to
+     * its consumer and fails any outstanding request, so the consumer learns
+     * its link went away instead of hanging. */
+    int    victim = -1;
+    double oldest = 0;
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++) {
+        if (!s_link_conns[j].used) continue;
+        if (victim < 0 || s_link_conns[j].last_activity < oldest) {
+            oldest = s_link_conns[j].last_activity;
+            victim = j;
+        }
+    }
+    if (victim < 0) return nullptr;
+    link_conn_t& v = s_link_conns[victim];
+    info("link[%s]: evicting longest-idle (link slot table full)", v.tag);
+    try { if (v.link) v.link.teardown(); } catch (...) {}
+    v.link = RNS::Link{RNS::Type::NONE};
+    linkFreeSlot(v);
+    return &s_link_conns[victim];
 }
 
 /* rnsd.links.<tag>.<field> — segments are well under the 95-char cap. */
@@ -2872,6 +2984,13 @@ static void onResConcluded(const RNS::Resource& r);
 static void resSendAux(link_conn_t& c, uint8_t opcode,
                        void* buf, uint32_t len, uint8_t flags);
 
+/* Defined below (request/response block); needed here by
+ * onLinkEstablishedCb to flush a request deferred before ACTIVE. */
+static void linkStartRequest(link_conn_t& c, const std::string& path,
+                             const std::vector<uint8_t>& data,
+                             uint16_t cid, uint16_t port, TaskHandle_t task,
+                             bool data_packed);
+
 /* Construct + advertise an outbound Resource on an ACTIVE link from a
  * caller-owned buffer. The engine encrypts/chunks (copies) at
  * construction, registers on the link's outgoing set and advertises,
@@ -2915,6 +3034,7 @@ static void onLinkEstablishedCb(RNS::Link& link)
     c->state         = LST_ACTIVE;
     c->orphan_at     = 0;
     c->estab_deadline = 0;
+    linkTouch(*c);
     std::string lid  = link.link_id().toHex();
     info("link[%s]: ACTIVE link_id=%s mtu=%u rtt=%.3fs",
          c->tag, lid.c_str(), (unsigned)link.get_mtu(), link.rtt());
@@ -2959,6 +3079,18 @@ static void onLinkEstablishedCb(RNS::Link& link)
         c->pend_res_len = 0;
         c->pend_res_opaque = 0;
     }
+
+    /* Flush a deferred request (rnsdLinkRequest before ACTIVE). */
+    if (c->pend_req_used) {
+        c->pend_req_used = false;
+        linkStartRequest(*c, c->pend_req_path, c->pend_req_data,
+                         c->pend_req_cid, c->pend_req_port, c->pend_req_task,
+                         c->pend_req_packed);
+        c->pend_req_path.clear();
+        c->pend_req_data.clear();
+        c->pend_req_task = nullptr;
+        c->pend_req_packed = false;
+    }
 }
 
 static void onLinkClosedCb(RNS::Link& link)
@@ -2986,6 +3118,7 @@ static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packe
      * with the matched active Link just before link.receive(). */
     link_conn_t* c = linkFindByLink(packet.link());
     if (!c) { warn("link: inbound pkt, no slot"); return; }
+    linkTouch(*c);
     if (c->handle < 0) return;   /* consumer detached; drop (orphan window) */
     /* Packet-mode handle: one Link plaintext = one ITS packet, no type
      * byte. Drop on back-pressure (timeout 0) rather than stall rnsd. */
@@ -3141,6 +3274,154 @@ static void linkWireResource(RNS::Link& link)
     }
 }
 
+/* ─────────────── nomad: request / response (nomad.md §1) ───────────────
+ *
+ * Bridges µR's Link::request(path, data) to the byte-array consumer
+ * world. The consumer (nomad task; the `creq` smoke task here) calls
+ * rnsdLinkRequest(tag, path, …) → RNSD_LINK_AUX_REQUEST aux → onLinkAux →
+ * linkStartRequest, which issues the request with our static response /
+ * failed thunks. µR's callbacks carry no userdata, so the owning slot is
+ * resolved in the thunk by matching the RequestReceipt's request_id
+ * against the slot's req_mrid (the same shared-identity trick the packet
+ * and Resource paths use). Responses ride back to the consumer as a heap
+ * buffer over one aux frame (rnsd_link_resource_done_t), exactly like an
+ * inbound Resource — a page response can be large. */
+
+static link_conn_t* linkFindByReqMrid(const RNS::Bytes& mrid)
+{
+    if (mrid.size() == 0) return nullptr;
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++) {
+        link_conn_t& c = s_link_conns[j];
+        if (c.used && c.req_mrid.size() && c.req_mrid == mrid) return &c;
+    }
+    return nullptr;
+}
+
+/* Deliver a request response/failure to the consumer's aux port. Mirrors
+ * resSendAux but uses the per-request task+port captured at issue time
+ * (the requester, which may differ from the link opener). */
+static void reqSendAux(link_conn_t& c, uint8_t opcode, void* buf, uint32_t len)
+{
+    if (!c.req_task || c.req_port == 0) {
+        warn("link[%s]: request aux but no consumer port", c.tag);
+        if (buf) free(buf);
+        return;
+    }
+    rnsd_link_resource_done_t d = {};
+    d.opcode = opcode;
+    if (c.link && c.link.link_id().size() >= 16)
+        memcpy(d.link_id, c.link.link_id().data(), 16);
+    if (c.req_mrid.size() >= 16) memcpy(d.resource_hash, c.req_mrid.data(), 16);
+    if (c.dest_hash.size() >= 16) memcpy(d.local_dest_hash, c.dest_hash.data(), 16);
+    d.buf       = buf;
+    d.len       = len;
+    d.opaque_id = c.req_cid;
+    if (!itsSendAuxByTaskHandle(c.req_task, c.req_port, &d, sizeof(d),
+                                pdMS_TO_TICKS(2000))) {
+        warn("link[%s]: request aux send failed (op=%u)", c.tag, opcode);
+        if (buf) free(buf);   /* consumer never took ownership */
+    }
+}
+
+/* Fail a request before a slot is bound to it (unknown link, request
+ * already in flight, request() threw) — we still owe the requester a
+ * REQUEST_FAILED so it doesn't hang. */
+static void reqFailDirect(TaskHandle_t task, uint16_t port, uint16_t cid)
+{
+    if (!task || port == 0) return;
+    rnsd_link_resource_done_t d = {};
+    d.opcode    = RNSD_LINK_REQUEST_FAILED;
+    d.opaque_id = cid;
+    itsSendAuxByTaskHandle(task, port, &d, sizeof(d), pdMS_TO_TICKS(500));
+}
+
+static void onReqResponseCb(const RNS::RequestReceipt& rr)
+{
+    link_conn_t* c = linkFindByReqMrid(rr.get_request_id());
+    if (!c) { warn("link: request response, no slot"); return; }
+    linkTouch(*c);
+    RNS::Bytes resp = rr.get_response();
+    size_t len = resp.size();
+    void* buf = (len > 0) ? malloc(len) : nullptr;
+    if (len > 0 && !buf) {
+        warn("link[%s]: response malloc %zuB failed", c->tag, len);
+        reqSendAux(*c, RNSD_LINK_REQUEST_FAILED, nullptr, 0);
+    } else {
+        if (len > 0) memcpy(buf, resp.data(), len);
+        char k[96];
+        linkKey(*c, "request.state", k, sizeof(k)); storageSet(k, "done");
+        info("link[%s]: request response %zuB → consumer (cid=%u)",
+             c->tag, len, (unsigned)c->req_cid);
+        reqSendAux(*c, RNSD_LINK_REQUEST_RESPONSE, buf, (uint32_t)len);
+    }
+    c->req_mrid     = RNS::Bytes();
+    c->req_deadline = 0;
+}
+
+static void onReqFailedCb(const RNS::RequestReceipt& rr)
+{
+    link_conn_t* c = linkFindByReqMrid(rr.get_request_id());
+    if (!c) return;
+    char k[96];
+    linkKey(*c, "request.state", k, sizeof(k)); storageSet(k, "failed");
+    warn("link[%s]: request failed (cid=%u)", c->tag, (unsigned)c->req_cid);
+    reqSendAux(*c, RNSD_LINK_REQUEST_FAILED, nullptr, 0);
+    c->req_mrid     = RNS::Bytes();
+    c->req_deadline = 0;
+}
+
+/* Issue link.request on an ACTIVE link. Forward-declared above. */
+static void linkStartRequest(link_conn_t& c, const std::string& path,
+                             const std::vector<uint8_t>& data,
+                             uint16_t cid, uint16_t port, TaskHandle_t task,
+                             bool data_packed)
+{
+    if (c.req_mrid.size()) {
+        warn("link[%s]: request already in flight, dropping (cid=%u)",
+             c.tag, (unsigned)cid);
+        reqFailDirect(task, port, cid);
+        return;
+    }
+    try {
+        RNS::Bytes path_b((const uint8_t*)path.data(), path.size());
+        /* Empty data → a plain GET. NOTE: the MsgPack shim packs an empty
+         * Bytes as an empty bin (0xc4 0x00), not msgpack nil. Real
+         * NomadNet static-page handlers ignore the request-data element,
+         * so a GET interops; if a desktop node is found to require nil for
+         * the data-less case, pack nil in Link::request — a documented
+         * Phase-0 HW follow-up (nomad.md §"What µR already gives us").
+         * When data_packed, `data` is a complete msgpack object (form map)
+         * spliced verbatim as the request's 3rd element. */
+        RNS::Bytes data_b = data.empty()
+                          ? RNS::Bytes()
+                          : RNS::Bytes(data.data(), data.size());
+        double timeout = (double)storageGetInt("s.rnsd.link.request_timeout_s", 15);
+        if (timeout < 1.0) timeout = 15.0;
+        RNS::RequestReceipt rr = c.link.request(path_b, data_b,
+                                                onReqResponseCb, onReqFailedCb,
+                                                nullptr, timeout, data_packed);
+        if (!rr) {
+            warn("link[%s]: request returned none", c.tag);
+            reqFailDirect(task, port, cid);
+            return;
+        }
+        c.req_mrid     = rr.get_request_id();
+        c.req_cid      = cid;
+        c.req_port     = port;
+        c.req_task     = task;
+        c.req_deadline = RNS::Utilities::OS::time() + timeout + 5.0;
+        linkTouch(c);
+        char k[96];
+        linkKey(c, "request.path", k, sizeof(k));  storageSet(k, path.c_str());
+        linkKey(c, "request.state", k, sizeof(k)); storageSet(k, "sent");
+        info("link[%s]: request '%s' sent (cid=%u, req_id=%s)",
+             c.tag, path.c_str(), (unsigned)cid, c.req_mrid.toHex().c_str());
+    } catch (const std::exception& e) {
+        warn("link[%s]: request threw: %s", c.tag, e.what());
+        reqFailDirect(task, port, cid);
+    }
+}
+
 /* Construct the OUT destination + RNS::Link and wire callbacks. The
  * target identity must already be recallable. Runs on the rnsd task. */
 static bool linkKickoff(link_conn_t& c)
@@ -3187,12 +3468,23 @@ static bool linkKickoff(link_conn_t& c)
 
 static void linkFreeSlot(link_conn_t& c)
 {
+    /* A request still outstanding when the link is reclaimed (establish
+     * failure, no-path, remote close, orphan-ttl teardown) will never get
+     * a response — tell the consumer so it doesn't hang. Done before the
+     * field resets below so req_task/port are still valid. After a normal
+     * DONE the callbacks already cleared req_mrid, so this no-ops. */
+    if (c.req_mrid.size())
+        reqSendAux(c, RNSD_LINK_REQUEST_FAILED, nullptr, 0);
+    if (c.pend_req_used)
+        reqFailDirect(c.pend_req_task, c.pend_req_port, c.pend_req_cid);
+
     char prefix[64];
     snprintf(prefix, sizeof(prefix), "rnsd.links.%s", c.tag);
     storageDeleteTree(prefix);
     if (c.handle >= 0) itsDisconnect(c.handle);
     c.used = false;
     c.handle = -1;
+    c.last_activity = 0;
     c.link = RNS::Link{RNS::Type::NONE};
     c.dest_hash = RNS::Bytes();
     c.aspect.clear();
@@ -3208,6 +3500,18 @@ static void linkFreeSlot(link_conn_t& c)
     c.res_hash = RNS::Bytes();
     c.res_outbound = false;
     c.res_opaque = 0;
+    c.req_mrid = RNS::Bytes();
+    c.req_cid = 0;
+    c.req_port = 0;
+    c.req_task = nullptr;
+    c.req_deadline = 0;
+    c.pend_req_used = false;
+    c.pend_req_path.clear();
+    c.pend_req_data.clear();
+    c.pend_req_cid = 0;
+    c.pend_req_port = 0;
+    c.pend_req_task = nullptr;
+    c.pend_req_packed = false;
     c.state = LST_FREE;
 }
 
@@ -3221,6 +3525,18 @@ static void linkTick(void)
     for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++) {
         link_conn_t& c = s_link_conns[j];
         if (!c.used) continue;
+
+        /* Request timeout backstop. µR does not drive RequestReceipt
+         * timeouts (the upstream response-timeout thread isn't ported),
+         * so fail the consumer here if no response arrived in time. */
+        if (c.req_mrid.size() && c.req_deadline != 0 && now >= c.req_deadline) {
+            warn("link[%s]: request timed out (cid=%u)", c.tag, (unsigned)c.req_cid);
+            char k[96];
+            linkKey(c, "request.state", k, sizeof(k)); storageSet(k, "timeout");
+            reqSendAux(c, RNSD_LINK_REQUEST_FAILED, nullptr, 0);
+            c.req_mrid     = RNS::Bytes();
+            c.req_deadline = 0;
+        }
 
         switch (c.state) {
         case LST_AWAITING_PATH:
@@ -3301,6 +3617,7 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     c->aspect       = req.aspect;
     c->identity_key = req.identity_key;
     c->opened_at    = RNS::Utilities::OS::time();
+    c->last_activity = c->opened_at;
     c->orphan_at    = 0;
     c->dead_at      = 0;
     c->estab_deadline = 0;
@@ -3314,6 +3631,18 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     c->res_hash      = RNS::Bytes();
     c->res_outbound  = false;
     c->res_opaque    = 0;
+    c->req_mrid      = RNS::Bytes();
+    c->req_cid       = 0;
+    c->req_port      = 0;
+    c->req_task      = nullptr;
+    c->req_deadline  = 0;
+    c->pend_req_used = false;
+    c->pend_req_path.clear();
+    c->pend_req_data.clear();
+    c->pend_req_cid  = 0;
+    c->pend_req_port = 0;
+    c->pend_req_task = nullptr;
+    c->pend_req_packed = false;
 
     int path_to_s = storageGetInt("s.rnsd.link.path_timeout_s", 30);
     if (req.path_timeout_ms != 0) path_to_s = (int)(req.path_timeout_ms / 1000);
@@ -3361,6 +3690,7 @@ static void onLinkRecv(int handle, size_t /*bytesAvail*/)
         try {
             RNS::Packet pkt(c->link, RNS::Bytes(buf, n));
             pkt.send();
+            linkTouch(*c);
             char k[96];
             linkKey(*c, "tx_packets", k, sizeof(k));
             storageSet(k, storageGetInt(k, 0) + 1);
@@ -3403,7 +3733,7 @@ static void onLinkDisconnect(int ref)
  * registering task), where mR Link state must be touched. Distinct
  * from onLinkDisconnect's park-for-reconnect: this fully closes the
  * Link and frees the slot + tag immediately. */
-static void onLinkAux(TaskHandle_t /*sender*/, const void* data, size_t len)
+static void onLinkAux(TaskHandle_t sender, const void* data, size_t len)
 {
     if (len < 1) return;
     uint8_t op = ((const uint8_t*)data)[0];
@@ -3459,6 +3789,54 @@ static void onLinkAux(TaskHandle_t /*sender*/, const void* data, size_t len)
         linkStartOutboundResource(*c, buf, req.len, req.opaque_id);
         return;
     }
+
+    if (op == RNSD_LINK_AUX_REQUEST) {
+        if (len < sizeof(rnsd_link_request_t)) {
+            warn("link: short REQUEST aux %zu", len);
+            return;
+        }
+        rnsd_link_request_t hdr;
+        memcpy(&hdr, data, sizeof(hdr));
+        hdr.tag[sizeof(hdr.tag) - 1] = '\0';
+        if (len < sizeof(hdr) + (size_t)hdr.path_len + (size_t)hdr.data_len) {
+            warn("link[%s]: REQUEST aux truncated (have %zu, need %zu)", hdr.tag,
+                 len, sizeof(hdr) + (size_t)hdr.path_len + (size_t)hdr.data_len);
+            reqFailDirect(sender, hdr.resp_port, hdr.req_id);
+            return;
+        }
+        const uint8_t* p = (const uint8_t*)data + sizeof(hdr);
+        std::string          path((const char*)p, hdr.path_len);
+        std::vector<uint8_t> rdata(p + hdr.path_len,
+                                   p + hdr.path_len + hdr.data_len);
+        link_conn_t* c = linkFindByTag(hdr.tag);
+        if (!c) {
+            warn("link[%s]: REQUEST for unknown link", hdr.tag);
+            reqFailDirect(sender, hdr.resp_port, hdr.req_id);
+            return;
+        }
+        if (c->state != LST_ACTIVE || !c->link) {
+            /* Defer until ACTIVE (one pending request, mirrors pend_res). */
+            if (c->pend_req_used || c->req_mrid.size()) {
+                warn("link[%s]: request already pending/in-flight, dropping",
+                     c->tag);
+                reqFailDirect(sender, hdr.resp_port, hdr.req_id);
+                return;
+            }
+            c->pend_req_used = true;
+            c->pend_req_path = path;
+            c->pend_req_data = rdata;
+            c->pend_req_cid  = hdr.req_id;
+            c->pend_req_port = hdr.resp_port;
+            c->pend_req_task = sender;
+            c->pend_req_packed = (hdr.data_packed != 0);
+            info("link[%s]: REQUEST deferred (link %s) path='%s'",
+                 c->tag, lstName(c->state), path.c_str());
+            return;
+        }
+        linkStartRequest(*c, path, rdata, hdr.req_id, hdr.resp_port, sender,
+                         hdr.data_packed != 0);
+        return;
+    }
 }
 
 /* ─────────────── Phase D: inbound Link → consumer forwarding ───────────────
@@ -3503,6 +3881,7 @@ static void onIncomingLinkEstablished(RNS::Link& link)
     c->state        = LST_ACTIVE;
     c->link         = link;          /* copy shares shared_ptr<LinkData> */
     c->opened_at    = RNS::Utilities::OS::time();
+    c->last_activity = c->opened_at;
     c->orphan_at    = 0;
     c->dead_at      = 0;
     c->estab_deadline = 0;
@@ -3591,6 +3970,7 @@ static const char* CLINK_TAG = "clink";
 static int s_clink_handle      = -1;   /* outbound RNSD_PORT_LINK handle */
 static int s_clink_dest_handle = -1;   /* hosted RNSD_PORT_DEST handle (listen) */
 #define CLINK_INBOX_PORT 120           /* consumer-side inbound-Link port */
+#define CREQ_RESP_PORT   121           /* consumer-side request-response aux port */
 
 static void onClinkRecv(int handle, size_t /*bytesAvail*/)
 {
@@ -3656,6 +4036,93 @@ static void onClinkInboxRecv(int handle, size_t /*n*/)
 static void onClinkInboxDisc(int /*handle*/)
 {
     info("clink inbox: link forward closed");
+}
+
+/* ---- Phase 0 smoke: request/response (nomad page fetch, nomad.md) ---- */
+
+/* Request response/failure handoff from rnsd (rnsd_link_resource_done_t
+ * on CREQ_RESP_PORT). Logs the response bytes hex + ASCII so a page GET
+ * is human-readable at the serial console. */
+static void onCreqResponse(TaskHandle_t /*sender*/, const void* data, size_t len)
+{
+    if (len < sizeof(rnsd_link_resource_done_t)) {
+        warn("creq: short response aux %zu", len);
+        return;
+    }
+    rnsd_link_resource_done_t d;
+    memcpy(&d, data, sizeof(d));
+
+    if (d.opcode == RNSD_LINK_REQUEST_FAILED) {
+        warn("creq: request FAILED (cid=%u)", (unsigned)d.opaque_id);
+        return;
+    }
+    if (d.opcode != RNSD_LINK_REQUEST_RESPONSE) return;
+
+    if (d.buf && d.len) {
+        /* One-line preview: hex head + a sanitized text fragment (CR/LF/
+         * controls folded to '.') + ellipsis. No full-page dump in the log. */
+        const uint8_t* b = (const uint8_t*)d.buf;
+        size_t hx = d.len < 12 ? d.len : 12;
+        std::string frag;
+        size_t fn = d.len < 56 ? d.len : 56;
+        for (size_t i = 0; i < fn; ++i)
+            frag += (b[i] < 0x20 || b[i] == 0x7f) ? '.' : (char)b[i];
+        info("creq: RESPONSE %uB (cid=%u) hex=%s%s text=\"%s%s\"",
+             (unsigned)d.len, (unsigned)d.opaque_id,
+             RNS::Bytes(b, hx).toHex().c_str(), d.len > hx ? "…" : "",
+             frag.c_str(), d.len > fn ? "…" : "");
+    } else {
+        info("creq: RESPONSE %uB (cid=%u)", (unsigned)d.len, (unsigned)d.opaque_id);
+    }
+    rnsdResourceRelease(d.buf);   /* we own it on REQUEST_RESPONSE */
+}
+
+/* `rnsd creq <hash> <path> [aspect]` → rnsd.cmd.creq. Opens an outbound
+ * Link (reusing the clink slot/tag) and issues one request; rnsd holds it
+ * until the Link is ACTIVE, then fires it. The response lands in
+ * onCreqResponse above. */
+static void onCmdCreq(const char* key, const char* val)
+{
+    if (!val || !*val) return;            /* self-unset re-fire */
+    std::string cmd = val;
+    storageUnset(key);                    /* single-shot */
+
+    /* "<hash> <path> [aspect]" */
+    size_t sp1 = cmd.find(' ');
+    if (sp1 == std::string::npos) {
+        warn("creq: usage <dest_hash> <path> [aspect]");
+        return;
+    }
+    std::string hash_hex = cmd.substr(0, sp1);
+    std::string tail     = cmd.substr(sp1 + 1);
+    while (!tail.empty() && tail[0] == ' ') tail.erase(0, 1);
+    std::string path = tail, aspect = "nomadnetwork.node";
+    size_t sp2 = tail.find(' ');
+    if (sp2 != std::string::npos) {
+        path   = tail.substr(0, sp2);
+        aspect = tail.substr(sp2 + 1);
+        while (!aspect.empty() && aspect[0] == ' ') aspect.erase(0, 1);
+    }
+    if (path.empty()) path = "/page/index.mu";
+    if (hash_hex.size() != RNSD_DEST_HASH_LEN * 2) {
+        warn("creq: bad hash length %zu", hash_hex.size());
+        return;
+    }
+    RNS::Bytes dh;
+    try { dh.assignHex((const uint8_t*)hash_hex.c_str(), hash_hex.size()); }
+    catch (...) { warn("creq: bad hash hex"); return; }
+    if (dh.size() != RNSD_DEST_HASH_LEN) { warn("creq: bad hash bytes"); return; }
+
+    if (s_clink_handle >= 0) { itsDisconnect(s_clink_handle); s_clink_handle = -1; }
+    rnsdLinkTeardown(CLINK_TAG);   /* clear any parked/lingering prior link */
+    int h = rnsdLinkOpen(dh.data(), aspect.c_str(), "", CLINK_TAG,
+                         /*path_timeout_ms=*/0, /*ref=*/0,
+                         onClinkRecv, onClinkDisc);
+    if (h < 0) { warn("creq: rnsdLinkOpen failed (%d)", h); return; }
+    s_clink_handle = h;
+    int rid = rnsdLinkRequest(CLINK_TAG, path.c_str(), nullptr, 0, CREQ_RESP_PORT);
+    info("creq: opened → %s aspect=%s path=%s (req_id=%d)",
+         hash_hex.c_str(), aspect.c_str(), path.c_str(), rid);
 }
 
 static void onCmdClink(const char* key, const char* val)
@@ -3750,8 +4217,10 @@ static void clinkTaskMain(void*)
     itsServerOnConnect(CLINK_INBOX_PORT,    onClinkInboxConnect);
     itsServerOnDisconnect(CLINK_INBOX_PORT, onClinkInboxDisc);
     itsServerOnRecv(CLINK_INBOX_PORT,       onClinkInboxRecv);
+    itsOnAux(CREQ_RESP_PORT,                onCreqResponse);   /* Phase 0 smoke */
     itsClientInit(4);
     storageSubscribeChanges("rnsd.cmd.clink", onCmdClink);
+    storageSubscribeChanges("rnsd.cmd.creq",  onCmdCreq);
     TickType_t lastAnnounce = 0;
     for (;;) {
         while (itsPoll(0)) {}
