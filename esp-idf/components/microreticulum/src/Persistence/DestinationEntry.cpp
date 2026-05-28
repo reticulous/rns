@@ -131,7 +131,7 @@ using namespace RNS::Persistence;
 //TRACEF("Read %lu byte interface_hash", interface_hash.size());
 	entry._receiving_interface = Transport::find_interface_from_hash(interface_hash);
 	if (!entry._receiving_interface) {
-		/* Diptych fork: was WARNINGF — but DestinationEntry::decode runs on
+		/* Spangap fork: was WARNINGF — but DestinationEntry::decode runs on
 		 * every `_new_path_table.get(...)` call, which can happen hundreds
 		 * of times per second when Transport iterates paths during Link
 		 * maintenance or announce propagation. With a stale iface hash

@@ -207,7 +207,7 @@ namespace RNS {
 		*/
 		bool deregister_request_handler(const Bytes& path);
 
-		// CBA Diptych patch: thread-safe lookup helper used by Link::handle_request.
+		// CBA Spangap patch: thread-safe lookup helper used by Link::handle_request.
 		// Returns true and copies the entry into `out` under the registration mutex,
 		// false if no handler is registered for `path_hash`.
 		bool find_request_handler(const Bytes& path_hash, RequestHandler& out) const;
@@ -259,7 +259,7 @@ namespace RNS {
 			bool _accept_link_requests = true;
 			Callbacks _callbacks;
 			std::map<Bytes, RequestHandler> _request_handlers;
-			// CBA Diptych patch: guards _request_handlers for safe (de)register vs
+			// CBA Spangap patch: guards _request_handlers for safe (de)register vs
 			// dispatch. Recursive so a response_generator may itself touch the table.
 			mutable std::recursive_mutex _request_handlers_mux;
 			Type::Destination::types _type;

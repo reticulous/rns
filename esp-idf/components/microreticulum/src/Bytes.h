@@ -17,7 +17,7 @@
 #include "Log.h"
 #include "Utilities/Memory.h"
 
-// Diptych fork: ArduinoJson dropped. The cJSON-based serialization adapter
+// Spangap fork: ArduinoJson dropped. The cJSON-based serialization adapter
 // for RNS::Bytes lives in Utilities/Persistence.{h,cpp} once that file is
 // rewritten — tracked in components/microreticulum/README.md. The
 // `convertToJson`/`convertFromJson` block at the bottom of this header was
@@ -370,7 +370,7 @@ MEM("Creating from data-move...");
 		inline void reserve(size_t capacity) const { if (!_data) return; _data->reserve(capacity); }
 		inline const uint8_t* data() const { if (!_data) return nullptr; return _data->data(); }
 		inline const Data& collection() const {
-			// Diptych fork: upstream returned a temporary `Data()` by const&
+			// Spangap fork: upstream returned a temporary `Data()` by const&
 			// in the null branch — undefined behavior. Return a static empty
 			// instance instead. (Caller never mutates through the ref.)
 			static const Data empty;
@@ -460,7 +460,7 @@ inline RNS::Bytes& operator << (RNS::Bytes& lhbytes, const char* rhstr) {
 	return lhbytes;
 }
 
-// Diptych fork: ArduinoJson convertToJson/convertFromJson/canConvertFromJson
+// Spangap fork: ArduinoJson convertToJson/convertFromJson/canConvertFromJson
 // adapters removed. cJSON equivalent will live in Utilities/Persistence
 // when that file is ported (plan §3, ArduinoJson → cJSON).
 

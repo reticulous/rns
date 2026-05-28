@@ -23,7 +23,7 @@ itself would not build correctly for our configuration.
 
 ```
 components/microreticulum/
-├── idf_component.yml           # deps: idf, diptych-core
+├── idf_component.yml           # deps: idf, spangap-core
 ├── CMakeLists.txt              # SRCS list grows as µR files are ported
 ├── LICENSE.upstream            # Apache-2.0, attermann/microReticulum
 ├── LICENSE.microstore          # Apache-2.0, attermann/microStore
@@ -36,7 +36,7 @@ components/microreticulum/
     │   ├── ed25519-hash-custom.h        — SHA-512 via mbedTLS
     │   ├── ed25519-randombytes-custom.h — RNG via esp_fill_random
     │   ├── x25519.{c,h}        # MIT, Mike Hamburg / Cryptography Research,
-    │   │                       # re-vendored from diptych-core's
+    │   │                       # re-vendored from spangap-core's
     │   │                       # esp_wireguard tree — X25519 ECDH.
     │   └── x25519-license.txt  # MIT attribution for x25519.c
     ├── Cryptography/           # AES, CBC, HKDF, HMAC, Hashes, Ed25519, X25519,
@@ -66,10 +66,10 @@ fails to track through the inlining).
 - ☑ Source vendored at the pinned commit, with `.git` stripped.
 - ☑ microStore headers vendored under `include/microStore/`.
 - ☑ `idf_component.yml` declares the dep tree (`mbedtls` + `esp_hw_support`
-  + `json` + `diptych-core` pulled via `REQUIRES` in `CMakeLists.txt`).
+  + `json` + `spangap-core` pulled via `REQUIRES` in `CMakeLists.txt`).
 - ☑ `src/Log.cpp` rerouted: `Serial.print*` / `printf` removed; all µR log
-  calls now go through diptych's `info()`/`warn()`/`err()`/`dbg()`/`verb()`
-  macros (mapping in the file). `getTimeString()` is stubbed — diptych
+  calls now go through spangap's `info()`/`warn()`/`err()`/`dbg()`/`verb()`
+  macros (mapping in the file). `getTimeString()` is stubbed — spangap
   prepends its own timestamp.
 - ☑ `src/Utilities/OS.h` file-I/O methods no-op'd per plan §10.5
   (`read_file`/`write_file`/`open_file`/etc. all return empty / `false` /
@@ -81,8 +81,8 @@ fails to track through the inlining).
     (esp_fill_random). Compiled with `ED25519_CUSTOMHASH`,
     `ED25519_CUSTOMRANDOM`, `ED25519_FORCE_32BIT`, `ED25519_NO_INLINE_ASM`.
   - **x25519.c** (Mike Hamburg / strobe, MIT) for X25519 ECDH —
-    re-vendored rather than depending on diptych-core's `PRIV_INCLUDE`'d
-    copy, so we don't need diptych-core to export internal symbols.
+    re-vendored rather than depending on spangap-core's `PRIV_INCLUDE`'d
+    copy, so we don't need spangap-core to export internal symbols.
   - Both compile clean with no warnings; objects pack into
     `libmicroreticulum.a`. The wrapper rewrite in `src/Cryptography/X25519.cpp`
     + `Ed25519.cpp` will call into these directly.
@@ -128,7 +128,7 @@ of Phase 0:
    reduces surprise during ports.
 
 5. **Wire up `microreticulum` to `main/`.** Currently `main/CMakeLists.txt`
-   only requires `diptych-core`; once at least one µR header is consumed
+   only requires `spangap-core`; once at least one µR header is consumed
    by `rnsd.cpp`, add `microreticulum` to the REQUIRES list there.
 
 ## Resolved design issues
@@ -151,18 +151,18 @@ both under `src/donna/`."
 
 ### B. esp_wireguard symbol export — RESOLVED (2026-05-10)
 
-`esp_wireguard` lives under `PRIV_INCLUDE_DIRS` in diptych-core, so its
+`esp_wireguard` lives under `PRIV_INCLUDE_DIRS` in spangap-core, so its
 X25519 symbols aren't reachable from this component. **Decision: re-vendor
 `x25519.c` + `x25519.h`** under `src/donna/` directly. Pragmatic choice
-that decouples us from diptych-core's internal layout — a single ~500 LOC
+that decouples us from spangap-core's internal layout — a single ~500 LOC
 MIT-licensed file with attribution preserved in `src/donna/x25519-license.txt`.
 
 ## Open design issues
 
-### D. µR's `Log.h` collides with diptych's `log.h` on case-insensitive filesystems
+### D. µR's `Log.h` collides with spangap's `log.h` on case-insensitive filesystems
 
 `src/Log.cpp` works around this by inlining `ESP_LOGx(pcTaskGetName(NULL), ...)`
-calls instead of `#include`ing diptych's `log.h` for the err/warn/info/dbg/
+calls instead of `#include`ing spangap's `log.h` for the err/warn/info/dbg/
 verb macros — the component's INCLUDE_DIRS puts `src/` on the compiler's
 `-I` list, and on macOS APFS the search resolves `log.h` to the sibling
 `Log.h` (µR's own header) regardless of `""` vs `<>` quoting.

@@ -403,7 +403,7 @@ Recall last heard app_data for a destination hash.
 					break;
 				}
 			}
-			/* Diptych: announce-driven cleanup → demote under only_local. */
+			/* Spangap: announce-driven cleanup → demote under only_local. */
 			if (Transport::demote_dbg()) VERBOSEF("Removed %d path(s) from known destinations", count);
 			else                         DEBUGF   ("Removed %d path(s) from known destinations", count);
 		}

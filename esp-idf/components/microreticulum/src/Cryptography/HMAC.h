@@ -2,7 +2,7 @@
  * Copyright (c) 2023 Chad Attermann
  * Apache-2.0. Full license in LICENSE.upstream at component root.
  *
- * Diptych fork: HMAC backed by mbedtls_md_hmac_* instead of rweather/Crypto.
+ * Spangap fork: HMAC backed by mbedtls_md_hmac_* instead of rweather/Crypto.
  * Public API (RNS::Cryptography::HMAC + the free `digest()` helper) is
  * preserved bit-for-bit so callers (Fernet, Token) don't need to change.
  */

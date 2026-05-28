@@ -50,7 +50,7 @@ constexpr uint16_t RNSD_PORT_DGRAM = 5;
  *
  *  Per-slot drop-on-full (timeout=0) — slow consumers lose announces,
  *  not announces stall the rnsd task. Same fan-out shape as
- *  diptych-core's log `:1` consumers (see core `log.cpp`). */
+ *  spangap-core's log `:1` consumers (see core `log.cpp`). */
 constexpr uint16_t RNSD_PORT_ANNOUNCES = 6;
 
 /** Generic Reticulum Link → ITS connection (Phase C — link.md §6).

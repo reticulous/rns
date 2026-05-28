@@ -60,7 +60,7 @@ namespace RNS {
 		static bool _saving_known_destinations;
 		// CBA
 		static uint16_t _known_destinations_maxsize;
-		/* Diptych add: protect _known_destinations against concurrent
+		/* Spangap add: protect _known_destinations against concurrent
 		 * access from other tasks (lxmf calls Identity::recall while
 		 * rnsd's Transport::inbound mutates the map). Recursive
 		 * because remember() calls cull_known_destinations() which
@@ -190,7 +190,7 @@ namespace RNS {
 		inline const Cryptography::Ed25519PublicKey::Ptr sig_pub() const { assert(_object); return _object->_sig_pub; }
 		inline static uint16_t known_destinations_maxsize() { return _known_destinations_maxsize; }
 		inline static void known_destinations_maxsize(uint16_t known_destinations_maxsize) { _known_destinations_maxsize = known_destinations_maxsize; }
-		// Diptych: live entry count for the `rnsd memory` breakdown.
+		// Spangap: live entry count for the `rnsd memory` breakdown.
 		inline static size_t known_destinations_size() { return _known_destinations.size(); }
 
 		inline std::string toString() const { if (!_object) return ""; return "{Identity:" + _object->_hash.toHex() + "}"; }

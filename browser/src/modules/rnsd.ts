@@ -1,10 +1,10 @@
 import { ref } from 'vue'
-import { useMenuStore } from 'diptych-browser/stores/menu'
+import { useMenuStore } from 'spangap-browser/stores/menu'
 import RnsdPanel from '../panels/RnsdPanel.vue'
 
 /* Visibility ref for the Status → Map floating window. Toggled by the menu
  * action below; MainLayout binds the MapWindow component to it. Mirrors
- * how diptych-browser/modules/advanced exposes cliVisible/logVisible. */
+ * how spangap-browser/modules/advanced exposes cliVisible/logVisible. */
 export const mapVisible = ref(false)
 export const nodesVisible = ref(false)
 

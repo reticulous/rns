@@ -34,7 +34,7 @@ using namespace RNS::Type::Transport;
 using namespace RNS::Utilities;
 using namespace RNS::Persistence;
 
-/* Diptych: announce/path-request DEBUGFs route through this — when
+/* Spangap: announce/path-request DEBUGFs route through this — when
  * Transport::_demote_dbg is set (mirrors `s.rnsd.debug.only_local`),
  * they fire at VERBOSE instead of DEBUG. Used at:
  *   - "Destination X is now N hops away ..."         (every announce)
@@ -137,7 +137,7 @@ using namespace RNS::Persistence;
 /*static*/ float Transport::_save_interval				= 3600.0;
 /*static*/ uint32_t Transport::_path_table_crc	= 0;
 /*static*/ uint16_t Transport::_announce_table_maxsize	= RNS_ANNOUNCE_TABLE_MAX;
-// Diptych: runtime-tunable path TTLs, seeded from the Type::Transport defaults.
+// Spangap: runtime-tunable path TTLs, seeded from the Type::Transport defaults.
 /*static*/ uint32_t Transport::_destination_timeout	= Type::Transport::DESTINATION_TIMEOUT;
 /*static*/ uint32_t Transport::_ap_path_time		= Type::Transport::AP_PATH_TIME;
 /*static*/ uint32_t Transport::_roaming_path_time	= Type::Transport::ROAMING_PATH_TIME;
@@ -2105,7 +2105,7 @@ DestinationEntry empty_destination_entry;
 
 						random_blobs.insert(random_blob);
 
-						// Diptych fork: upstream RNS caps random_blobs to the
+						// Spangap fork: upstream RNS caps random_blobs to the
 						// most recent MAX_RANDOM_BLOBS per destination
 						// (Transport.py: `random_blobs = random_blobs[-MAX:]`).
 						// That cap was lost in the std::set port, so a
@@ -2458,7 +2458,7 @@ DestinationEntry empty_destination_entry;
 				// Data is basic (not destined for a link)
 				auto iter = _destinations.find(packet.destination_hash());
 				if (iter == _destinations.end()) {
-					/* Diptych diagnostic: log every DATA packet that reaches
+					/* Spangap diagnostic: log every DATA packet that reaches
 					 * us but doesn't match a registered local destination.
 					 * Transit traffic that we'd forward has already been
 					 * handled by the transport block above and would not
@@ -2472,7 +2472,7 @@ DestinationEntry empty_destination_entry;
 				      packet.hops(), packet.data().size());
 				}
 				if (iter != _destinations.end()) {
-					/* Diptych: INFOF for app destinations (LXMF, mailbox,
+					/* Spangap: INFOF for app destinations (LXMF, mailbox,
 					 * etc.) — this is the "a DATA packet for us arrived"
 					 * signal. For mR's own control destinations (path.request,
 					 * tunnel.synthesize) the hit fires on every incoming

@@ -439,7 +439,7 @@ bool Packet::unpack() {
 		return false;
 	}
 	catch (const std::exception& e) {
-		/* Diptych add: dump the first ≤8 bytes hex on parse failure so
+		/* Spangap add: dump the first ≤8 bytes hex on parse failure so
 		 * we can see flags / header type / hops / context — helps tell
 		 * "HEADER_2 truncated by HDLC" from "HEADER_1 with bad flag
 		 * bit" from "noise byte through framer". */

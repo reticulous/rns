@@ -2,9 +2,9 @@
  * Copyright (c) 2023 Chad Attermann
  * Apache-2.0. Full license in LICENSE.upstream at component root.
  *
- * Diptych fork: replaced upstream's Serial.print* / printf log sink with
- * diptych's info()/warn()/err()/dbg()/verb() macros so all µR diagnostics
- * land in the diptych log task (`[taskname]` prefix added by the macros
+ * Spangap fork: replaced upstream's Serial.print* / printf log sink with
+ * spangap's info()/warn()/err()/dbg()/verb() macros so all µR diagnostics
+ * land in the spangap log task (`[taskname]` prefix added by the macros
  * themselves).
  *
  * Per §3 of docs/component-plan.md, the upstream non-Arduino branch printed
@@ -15,15 +15,15 @@
 #include "Log.h"
 
 // FIXME: rename µR's `Log.h` to something unique (e.g. `RnsLog.h`) so we
-// can `#include <log.h>` here and route through diptych's err/warn/info/
+// can `#include <log.h>` here and route through spangap's err/warn/info/
 // dbg/verb macros directly. Right now src/ is on the component's -I list,
 // and on case-insensitive filesystems (macOS APFS default) `log.h`
 // resolves to this directory's `Log.h` (µR's own header) — even with
 // angle brackets — because src/ is searched first. The proper fix is the
-// rename; the workaround below inlines the same expansion that diptych's
+// rename; the workaround below inlines the same expansion that spangap's
 // macros use (`pcTaskGetName(NULL)` for the per-task tag), so the
 // per-caller-task `[rnsd]`/`[lxmf]`/etc. prefix is preserved. ESP-IDF's
-// vprintf hook (installed by the diptych log task) still catches the
+// vprintf hook (installed by the spangap log task) still catches the
 // output, so DRAM ring + fan-out + log file all behave identically.
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -54,7 +54,7 @@ const char* RNS::getLevelName(LogLevel level) {
 }
 
 const char* RNS::getTimeString() {
-	// Diptych's log macros prepend their own timestamp via ESP_LOGx, so the
+	// Spangap's log macros prepend their own timestamp via ESP_LOGx, so the
 	// per-message time string is unused. Kept as a stub so anything that
 	// references getTimeString() (none in our build) still links.
 	return "";
@@ -69,9 +69,9 @@ void RNS::doLog(LogLevel level, const char* msg) {
 	if (level > _level) return;
 	if (_on_log != nullptr) { _on_log(msg, level); return; }
 
-	// Map µR LogLevel onto diptych's coarser level set. CRITICAL/ERROR → err,
+	// Map µR LogLevel onto spangap's coarser level set. CRITICAL/ERROR → err,
 	// WARNING/NOTICE → warn, INFO → info, VERBOSE/MEM → verb, DEBUG/TRACE → dbg.
-	// The `pcTaskGetName(NULL)` tag mirrors diptych's err()/warn()/info()/
+	// The `pcTaskGetName(NULL)` tag mirrors spangap's err()/warn()/info()/
 	// dbg()/verb() macros — see the include block above for why we expand
 	// inline here instead of #including log.h.
 	const char* tag = pcTaskGetName(NULL);
@@ -102,7 +102,7 @@ void RNS::doLog(LogLevel level, const char* msg) {
 }
 
 void RNS::doHeadLog(LogLevel level, const char* msg) {
-	// Upstream prefixed a blank line; we drop it — diptych's log task framing
+	// Upstream prefixed a blank line; we drop it — spangap's log task framing
 	// makes it unnecessary noise.
 	doLog(level, msg);
 }

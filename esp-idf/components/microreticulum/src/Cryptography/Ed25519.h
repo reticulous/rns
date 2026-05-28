@@ -2,7 +2,7 @@
  * Copyright (c) 2023 Chad Attermann
  * Apache-2.0. Full license in LICENSE.upstream at component root.
  *
- * Diptych fork: Ed25519 backed by ed25519-donna (src/donna/ed25519.{c,h})
+ * Spangap fork: Ed25519 backed by ed25519-donna (src/donna/ed25519.{c,h})
  * instead of rweather/Crypto's Ed25519. The donna API is the canonical
  * djb-style: 32-byte secret key + derived 32-byte public key, 64-byte
  * signatures.

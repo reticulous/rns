@@ -2,7 +2,7 @@
  * Copyright (c) 2023 Chad Attermann
  * Apache-2.0. Full license in LICENSE.upstream at component root.
  *
- * Diptych fork: X25519 backed by the donna x25519 implementation
+ * Spangap fork: X25519 backed by the donna x25519 implementation
  * (src/donna/x25519.{c,h}) instead of rweather/Crypto's Curve25519.
  *
  * RFC 7748 clamping is requested via the trailing `1` argument to

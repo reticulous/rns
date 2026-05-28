@@ -10,7 +10,7 @@
 import { ref, computed } from 'vue'
 
 export function useWinZoom(key: string, defStep = 2) {
-  const lsKey = `diptych.win.${key}.zoom`
+  const lsKey = `spangap.win.${key}.zoom`
   const stored = localStorage.getItem(lsKey)
   const step = ref(stored !== null ? (Number(stored) || 0) : defStep)
 

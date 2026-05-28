@@ -39,8 +39,8 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import FloatingWindow from 'diptych-browser/components/FloatingWindow.vue'
-import { useDeviceStore } from 'diptych-browser/stores/device'
+import FloatingWindow from 'spangap-browser/components/FloatingWindow.vue'
+import { useDeviceStore } from 'spangap-browser/stores/device'
 
 defineProps<{ visible: boolean; title: string }>()
 const emit = defineEmits<{ 'update:visible': [value: boolean] }>()

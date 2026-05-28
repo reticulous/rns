@@ -2,7 +2,7 @@
  * Copyright (c) 2023 Chad Attermann
  * Apache-2.0. Full license in LICENSE.upstream at component root.
  *
- * Diptych fork: ArduinoJson dependency removed entirely. The Persistence
+ * Spangap fork: ArduinoJson dependency removed entirely. The Persistence
  * layer was upstream's hourly auto-save mechanism for destination_table /
  * packet_hashlist / known_destinations / tunnels — written through
  * OS::read_file / OS::write_file (now no-op'd, see plan §10.5) using
@@ -31,7 +31,7 @@
 namespace RNS { namespace Persistence {
 
 	// Upstream maintained a process-wide _document + _buffer. Both gone
-	// in the diptych fork — kept as comments here so future readers know
+	// in the spangap fork — kept as comments here so future readers know
 	// where to look for the upstream serialization model.
 	//   static JsonDocument _document;
 	//   static Bytes _buffer(Type::Persistence::BUFFER_MAXSIZE);

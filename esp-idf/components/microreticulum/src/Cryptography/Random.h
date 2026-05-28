@@ -2,10 +2,10 @@
  * Copyright (c) 2023 Chad Attermann
  * Apache-2.0. Full license in LICENSE.upstream at component root.
  *
- * Diptych fork: random bytes via esp_fill_random (HRNG-seeded) instead of
+ * Spangap fork: random bytes via esp_fill_random (HRNG-seeded) instead of
  * rweather/Crypto's RNG class. esp_fill_random is non-blocking and produces
  * cryptographically-strong output once WiFi or Bluetooth has initialized
- * the entropy source — true on all diptych boots before any RNS code runs.
+ * the entropy source — true on all spangap boots before any RNS code runs.
  *
  * Also fixes the upstream randomnum() bug where bytes 1–3 of the random
  * buffer were shadowed by byte 0 (typo: data()[0] used four times).

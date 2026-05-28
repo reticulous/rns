@@ -2,7 +2,7 @@
  * Copyright (c) 2023 Chad Attermann
  * Apache-2.0. Full license in LICENSE.upstream at component root.
  *
- * Diptych fork: HKDF backed by mbedtls_hkdf instead of rweather/Crypto.
+ * Spangap fork: HKDF backed by mbedtls_hkdf instead of rweather/Crypto.
  *
  * mbedtls_hkdf does extract+expand in one call (RFC 5869). The upstream
  * call signature passes salt as a separate argument; if it's missing, we

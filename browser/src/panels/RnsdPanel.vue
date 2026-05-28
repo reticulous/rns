@@ -28,7 +28,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useDeviceStore } from 'diptych-browser/stores/device'
+import { useDeviceStore } from 'spangap-browser/stores/device'
 
 const device = useDeviceStore()
 const identityHash = computed(() => String(device.get('rnsd.identity_hash') ?? ''))

@@ -9,11 +9,11 @@
  * See docs/component-plan.md §11.
  */
 #include "rnsd.h"
-#include "diptych.h"
+#include "spangap.h"
 #include "ports.h"
 
 /* mR's Log.h declares free functions `info`, `warn`, `error`, `debug`, ...
- * inside namespace RNS. diptych's log.h defines `info`/`warn`/`err`/etc. as
+ * inside namespace RNS. spangap's log.h defines `info`/`warn`/`err`/etc. as
  * preprocessor macros (ESP_LOGI shims). The macros corrupt the function
  * declarations on parse. Save + suppress around the mR include, then
  * restore.
@@ -1215,7 +1215,7 @@ static std::shared_ptr<AnnounceDebugLogger> s_announce_logger;
  *     hops(1) | dest_hash(16) | identity_hash(16) | app_data(N)
  *
  * Drop-on-full (itsSend timeout=0) — slow consumers lose announces,
- * never block the rnsd task. Same fan-out shape as diptych-core's
+ * never block the rnsd task. Same fan-out shape as spangap-core's
  * log :1 consumers (log.cpp logSlots[]). */
 
 #define RNSD_MAX_ANNOUNCE_SUBS 4
@@ -3244,7 +3244,7 @@ static void onResConcluded(const RNS::Resource& r)
         info("link[%s]: outbound resource delivered (proof ok)", c->tag);
         resSendAux(*c, RNSD_LINK_RESOURCE_OUTBOUND_DONE, nullptr, 0, 0);
     } else {
-        /* Encode the engine status so diptych-cli reveals the precise
+        /* Encode the engine status so spangap-cli reveals the precise
          * outcome without device logs: 7=FAILED 8=CORRUPT 3=still
          * TRANSFERRING-when-concluded (timeout/cancel mid-flight). */
         char st[24];
@@ -4492,7 +4492,7 @@ static void rnsdTaskMain(void*)
     }
 }
 
-#if CONFIG_DIPTYCH_LCD
+#if CONFIG_SPANGAP_LCD
 #include "lcd.h"
 /* Settings → Reticulum → General. Mirrors the web RnsdPanel. */
 static void rnsdSettingsPane(void* arg) {
@@ -4543,7 +4543,7 @@ void rnsdInit(void)
     /* Cron line per §11.3 — no-op when transport disabled, hourly otherwise. */
     cronDefault("0 * * * * N", "rnsd persist if-transport");
 
-#if CONFIG_DIPTYCH_LCD
+#if CONFIG_SPANGAP_LCD
     lcdRegisterSettings("Reticulum/General", "General", rnsdSettingsPane);
 #endif
 

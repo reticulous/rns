@@ -7,12 +7,12 @@
 ##
 ## Hard deps required by the swap list in plan §3:
 ##   - mbedTLS:        AES-CBC, HMAC, HKDF, SHA-256/512, RNG. Already linked
-##                     via diptych-core for TLS + WG. Pulled transitively
+##                     via spangap-core for TLS + WG. Pulled transitively
 ##                     via REQUIRES mbedtls in CMakeLists.txt — declared
 ##                     here for documentation.
 ##   - esp_wireguard:  software Curve25519 (X25519 ECDH). Currently vendored
-##                     under diptych-core/src/esp_wireguard with PRIV_INCLUDE_DIRS,
-##                     so we can't pull in `x25519` without diptych-core
+##                     under spangap-core/src/esp_wireguard with PRIV_INCLUDE_DIRS,
+##                     so we can't pull in `x25519` without spangap-core
 ##                     exporting the symbol. Open issue — see README.
 ##
 ## NOTE on Ed25519: esp_wireguard ships ONLY X25519, not Ed25519. The plan §3
@@ -20,7 +20,7 @@
 ## conflates the two. Ed25519 sign/verify needs a separate source — open
 ## design question, see README.
 
-description: "Reticulum Network Stack (microReticulum) — vendored fork for diptych"
+description: "Reticulum Network Stack (microReticulum) — vendored fork for spangap"
 version: "0.0.1-dev"
 license: "Apache-2.0"
 url: "https://github.com/attermann/microReticulum"
@@ -30,8 +30,8 @@ targets:
 dependencies:
   idf:
     version: ">=5.5"
-  diptych/diptych-core:
-    version: "^0.1.0"
-    # manifest sits in reticulous/components/microreticulum/; ../../../ = parent
-    # project root containing diptych/. Mirrors the pattern in main/idf_component.yml.
-    path: "../../../diptych/diptych-core"
+  # spangap-core is satisfied at build time by `spangap make`'s staging step
+  # (staging/components/spangap-core/ on the consumer, picked up via
+  # EXTRA_COMPONENT_DIRS). Listing it here would double-stage under the
+  # manager's namespaced form and break the build with duplicate symbols.
+  # CMakeLists.txt REQUIRES the short name `spangap-core` directly.

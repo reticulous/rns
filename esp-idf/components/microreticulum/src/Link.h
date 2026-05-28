@@ -194,7 +194,7 @@ namespace RNS {
 		void prove_packet(const Packet& packet);
 		void validate_proof(const Packet& packet);
 		void identify(const Identity& identity);
-		// data_packed (diptych): when true, `data` is already a complete msgpack
+		// data_packed (spangap): when true, `data` is already a complete msgpack
 		// object and is spliced as the request envelope's 3rd element verbatim
 		// (e.g. a {field_*,var_*} map for NomadNet form submission) instead of
 		// being bin-wrapped. Default false keeps the byte-for-byte GET path.

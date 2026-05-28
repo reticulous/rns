@@ -19,7 +19,7 @@
 #include "Bytes.h"
 #include "Type.h"
 
-// Diptych fork: ArduinoJson include + adapters at the bottom of this
+// Spangap fork: ArduinoJson include + adapters at the bottom of this
 // header dropped — see plan §3 (ArduinoJson → cJSON). The cJSON
 // equivalent will live in Utilities/Persistence when that file is
 // rewritten.

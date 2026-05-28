@@ -2,8 +2,8 @@
  * Copyright (c) 2023 Chad Attermann
  * Apache-2.0. Full license in LICENSE.upstream at component root.
  *
- * Diptych fork: SHA-256/512 backed by mbedTLS instead of rweather/Crypto.
- * mbedTLS is already linked for diptych's TLS + WG. ESP32-S3 hardware
+ * Spangap fork: SHA-256/512 backed by mbedTLS instead of rweather/Crypto.
+ * mbedTLS is already linked for spangap's TLS + WG. ESP32-S3 hardware
  * SHA peripherals are used automatically when MBEDTLS_SHA256_USE_INTERFACE
  * is enabled in ESP-IDF's mbedtls config (the default).
  */

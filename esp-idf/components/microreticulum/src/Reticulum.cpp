@@ -19,7 +19,7 @@
 #include "Utilities/Memory.h"
 
 //#include <TransistorNoiseSource.h>
-// Diptych fork: <RNG.h> (rweather/Crypto) gone — esp_fill_random already
+// Spangap fork: <RNG.h> (rweather/Crypto) gone — esp_fill_random already
 // seeds itself from the ESP32-S3 HRNG, no per-task setup needed. Calls to
 // RNG.begin() / RNG.loop() below are inert no-ops in this configuration.
 
@@ -254,7 +254,7 @@ void Reticulum::loop() {
 			RNS::Transport::loop();
 		}
 
-		// Diptych fork: rweather RNG.loop() removed; esp_random has no
+		// Spangap fork: rweather RNG.loop() removed; esp_random has no
 		// per-iteration housekeeping (HRNG fills entropy autonomously).
     }
     catch (const std::bad_alloc&) {

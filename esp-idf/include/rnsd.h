@@ -41,8 +41,8 @@ constexpr size_t RNSD_HASH_LEN       = 32;   /* SHA-256 */
 
 /* ──────────────── task bring-up ──────────────── */
 
-/** Bring up the rnsd task. Called from app_main between diptychInit()
- *  and diptychPostAppInit(). */
+/** Bring up the rnsd task. Called from app_main between spangapInit()
+ *  and spangapPostAppInit(). */
 void rnsdInit(void);
 
 /* ──────────────── pure crypto (caller-task safe) ──────────────── */
@@ -115,7 +115,7 @@ void rnsdRequestPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
  * through typed ITS connections. The functions below wrap the
  * itsConnect / aux-msg machinery so callers don't have to know about
  * port numbers or connect-payload struct shapes — same pattern as
- * net's TCP_DIAL or web's path registration in diptych-core.
+ * net's TCP_DIAL or web's path registration in spangap-core.
  *
  * The handle returned is bidirectional and packet-mode. Disconnect
  * with `itsDisconnect(handle)` — rnsd deregisters the underlying

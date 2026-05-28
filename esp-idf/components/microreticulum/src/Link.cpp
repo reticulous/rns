@@ -1047,7 +1047,7 @@ void Link::receive(const Packet& packet) {
 	_object->_watchdog_lock = true;
 	if (_object->_status != Type::Link::CLOSED && !(_object->_initiator && packet.context() == Type::Packet::KEEPALIVE && packet.data() == "\xFF")) {
 		if (packet.receiving_interface() != _object->_attached_interface) {
-			/* Diptych diagnostic: name AND object-identity (impl ptr) of both
+			/* Spangap diagnostic: name AND object-identity (impl ptr) of both
 			 * interfaces, plus the packet type/context. Lets us tell apart a
 			 * second TCP iface object (same name, different ptr — a reconnect)
 			 * from a different iface (LoRa) from an unset interface (<none>). */

@@ -81,7 +81,7 @@ namespace RNS { namespace Utilities {
 #ifdef ARDUINO
 		inline static void sleep(float seconds) { delay((uint32_t)(seconds * 1000)); }
 #else
-		// Diptych fork: ESP-IDF's newlib doesn't ship nanosleep. Use vTaskDelay
+		// Spangap fork: ESP-IDF's newlib doesn't ship nanosleep. Use vTaskDelay
 		// (FreeRTOS yields the CPU instead of busy-spinning, matching the
 		// upstream intent on Arduino).
 		inline static void sleep(float seconds) {
@@ -172,7 +172,7 @@ namespace RNS { namespace Utilities {
 		}
 
 
-		// Diptych fork: file I/O is no-op'd per docs/component-plan.md §10.5.
+		// Spangap fork: file I/O is no-op'd per docs/component-plan.md §10.5.
 		// We own all persistence via the rnsd CLI/cron path; mR's hourly
 		// auto-save calls (destination_table, packet_hashlist, known_destinations,
 		// tunnels, time_offset) become silent no-ops. Returning 0 / false /

@@ -27,7 +27,7 @@
 #define RNS_PSRAM_POOL_ALLOCATOR 3	 // Use PSRAM pool for allocator
 #define RNS_ALTHEAP_POOL_ALLOCATOR 4 // Use alternate HEAP pool for allocator
 
-/* Diptych: the µR containers (identity cache, announce + path tables) allocate
+/* Spangap: the µR containers (identity cache, announce + path tables) allocate
  * their nodes straight from PSRAM via heap_caps — no shared TLSF pool. The
  * nodes are tiny and already bounded by the per-table count caps, so a pool
  * adds no value; direct PSRAM keeps them out of scarce internal DRAM and lets
@@ -125,7 +125,7 @@ namespace RNS { namespace Utilities {
 #if RNS_CONTAINER_ALLOCATOR == RNS_HEAP_POOL_ALLOCATOR
 				void* p = pool_malloc(heap_pool_info, size);
 #elif RNS_CONTAINER_ALLOCATOR == RNS_PSRAM_ALLOCATOR
-				// Diptych: allocate straight from PSRAM via heap_caps (no Arduino
+				// Spangap: allocate straight from PSRAM via heap_caps (no Arduino
 				// ps_malloc, no shared pool). Falls back to any heap if PSRAM is
 				// exhausted; both are freed with the same free()/heap_caps_free.
 				void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);

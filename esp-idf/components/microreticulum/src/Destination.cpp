@@ -443,7 +443,7 @@ void Destination::receive(const Packet& packet) {
 			}
 		}
 		else {
-			// Diptych diagnostic: a packet Transport already matched to this
+			// Spangap diagnostic: a packet Transport already matched to this
 			// local destination failed to decrypt. Upstream logs the reason
 			// at DEBUG (Identity::decrypt), invisible at info level — so a
 			// "destination is local" with no delivery looked like silence.

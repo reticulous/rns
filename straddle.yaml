@@ -1,0 +1,25 @@
+# reticulous-core — Reticulum (RNS) protocol core for spangap.
+#
+# Pure protocol logic: identity, destinations, path table, transport
+# state machine, links, resources. Zero networking/radio dependencies —
+# transport straddles (reticulous-tcp/-auto/-espnow/-lora) plug their
+# interfaces in via the RNSD_PORT_TRANSPORT ITS surface.
+#
+# Vendors the µReticulum hard fork (esp-idf/components/microreticulum/)
+# and bzip2 1.0.8 (esp-idf/components/bzip2/) as nested sub-components.
+# Consumers (reticulous-tdeck and any other app-straddle) pick these
+# up via the staging/components/*/components/ glob in their top-level
+# CMakeLists.txt.
+#
+# Browser half holds shared RNS UI (RNS settings panel, Nodes window,
+# Announces window, RNS Pinia state). LXMF/Nomad/maps are separate
+# straddles that contribute their own panels.
+schema_version: 1
+name: reticulous/reticulous-core
+prefix: rns
+version: 0.1.0
+firmware: esp-idf
+browser: browser
+platforms: [idf]
+requires:
+  - spangap/spangap-core

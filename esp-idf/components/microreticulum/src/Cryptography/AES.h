@@ -2,7 +2,7 @@
  * Copyright (c) 2023 Chad Attermann
  * Apache-2.0. Full license in LICENSE.upstream at component root.
  *
- * Diptych fork: AES-128/256-CBC backed by mbedtls_aes_crypt_cbc instead of
+ * Spangap fork: AES-128/256-CBC backed by mbedtls_aes_crypt_cbc instead of
  * rweather/Crypto's CBC<AES128>/CBC<AES256> template. The IV passed to
  * mbedtls_aes_crypt_cbc is mutated in place (the implementation tracks the
  * running CBC state through it), so we copy it to a local buffer first.

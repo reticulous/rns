@@ -3,7 +3,7 @@
  * `attermann/microReticulum`'s upstream `Link.cpp` uses from the
  * hideakitai/MsgPack Arduino library.
  *
- * Diptych's microreticulum fork only needs four wire shapes:
+ * Spangap's microreticulum fork only needs four wire shapes:
  *   - serialize/deserialize a single `double`            (LRRTT echo)
  *   - serialize a single `bin_t<uint8_t>`                (transfer-size probe)
  *   - to_array(double, RNS::Bytes, RNS::Bytes)           (REQUEST)

@@ -368,7 +368,7 @@ namespace RNS {
 		inline static void path_store_segment_size(uint32_t value) { _path_store_segment_size = value; }
 		inline static uint8_t path_store_segment_count() { return _path_store_segment_count; }
 		inline static void path_store_segment_count(uint8_t value) { _path_store_segment_count = value; }
-		// Diptych: runtime-tunable path-entry TTLs (seconds). Applied at the
+		// Spangap: runtime-tunable path-entry TTLs (seconds). Applied at the
 		// live _new_path_table.put() site; govern age-based path expiry.
 		inline static uint32_t destination_timeout() { return _destination_timeout; }
 		inline static void destination_timeout(uint32_t value) { _destination_timeout = value; }
@@ -376,7 +376,7 @@ namespace RNS {
 		inline static void ap_path_time(uint32_t value) { _ap_path_time = value; }
 		inline static uint32_t roaming_path_time() { return _roaming_path_time; }
 		inline static void roaming_path_time(uint32_t value) { _roaming_path_time = value; }
-		// Diptych: runtime-tunable jobs() cadence (seconds).
+		// Spangap: runtime-tunable jobs() cadence (seconds).
 		inline static float job_interval() { return _job_interval; }
 		inline static void job_interval(float value) { _job_interval = value; }
 		inline static float tables_cull_interval() { return _tables_cull_interval; }
@@ -384,7 +384,7 @@ namespace RNS {
 		// CBA TEST
 		static inline void identity(Identity& identity) { _identity = identity; }
 
-		/* Diptych: when true, the high-volume announce/path-request
+		/* Spangap: when true, the high-volume announce/path-request
 		 * DEBUGFs in Transport.cpp are emitted at VERBOSE instead of
 		 * DEBUG, so that running rnsd at debug level surfaces only
 		 * traffic affecting this node directly. Toggled by rnsd's
@@ -397,7 +397,7 @@ namespace RNS {
 		inline static const RateTable& get_announce_rate_table() { return _announce_rate_table; }
 		inline static const LinkTable& get_link_table() { return _link_table; }
 
-		// Diptych: size getters for the Link-state tables, used by rnsd's
+		// Spangap: size getters for the Link-state tables, used by rnsd's
 		// `rnsd links` CLI / 1Hz stats publish to surface leaks during Phase B
 		// Link bringup. Read-only; std::set::size() is an atomic counter load
 		// on supported platforms, and a slightly-stale count is fine for the
@@ -405,7 +405,7 @@ namespace RNS {
 		inline static size_t pending_links_count() { return _pending_links.size(); }
 		inline static size_t active_links_count()  { return _active_links.size(); }
 
-		// Diptych: table-size + stat getters for the `rnsd memory` breakdown.
+		// Spangap: table-size + stat getters for the `rnsd memory` breakdown.
 		inline static size_t path_table_size()     { return _new_path_table.size(); }
 		inline static size_t announce_table_size() { return _announce_table.size(); }
 		inline static size_t held_announces_size() { return _held_announces.size(); }
@@ -491,7 +491,7 @@ namespace RNS {
 		static float _save_interval;
 		static uint32_t _path_table_crc;
 		static uint16_t _announce_table_maxsize;
-		// Diptych: runtime-tunable path TTLs (seeded from Type::Transport)
+		// Spangap: runtime-tunable path TTLs (seeded from Type::Transport)
 		static uint32_t _destination_timeout;
 		static uint32_t _ap_path_time;
 		static uint32_t _roaming_path_time;

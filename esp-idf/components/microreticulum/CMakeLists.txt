@@ -9,7 +9,7 @@
 #   - ed25519-donna (Andrew M. <liquidsun@gmail.com>, public domain) for
 #     Ed25519 sign/verify/key derivation.
 #   - x25519.c from Mike Hamburg / strobe (MIT) for X25519 ECDH —
-#     re-vendored rather than depending on diptych-core's PRIV_INCLUDE'd
+#     re-vendored rather than depending on spangap-core's PRIV_INCLUDE'd
 #     copy under src/esp_wireguard/.
 #   - SHA-512 backed by mbedTLS, RNG by esp_fill_random — see
 #     donna/ed25519-hash-custom.h and donna/ed25519-randombytes-custom.h.
@@ -78,9 +78,9 @@ idf_component_register(
         esp_hw_support
         # cJSON ships as ESP-IDF's `json` component — replaces ArduinoJson.
         json
-        # diptych-core — for log macros (info/warn/err/...) once Log.cpp is
+        # spangap-core — for log macros (info/warn/err/...) once Log.cpp is
         # rerouted into the build.
-        diptych-core
+        spangap-core
         # bzip2 — Resource.cpp (de)compresses bz2 Resource payloads
         # (NomadNet/Reticulum compress with bz2; every client speaks it).
         bzip2
