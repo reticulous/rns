@@ -92,7 +92,7 @@ esp-idf/components/
 └── bzip2/           bzip2 1.0.8 — used by µR's Resource compression path.
 ```
 
-The consuming app-straddle picks these up via the
+The consuming buildable straddle picks these up via the
 `staging/components/*/components/` glob in its top-level
 `CMakeLists.txt`.
 

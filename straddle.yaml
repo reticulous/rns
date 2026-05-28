@@ -7,7 +7,7 @@
 #
 # Vendors the µReticulum hard fork (esp-idf/components/microreticulum/)
 # and bzip2 1.0.8 (esp-idf/components/bzip2/) as nested sub-components.
-# Consumers (reticulous-tdeck and any other app-straddle) pick these
+# Consumers (reticulous-tdeck and any other buildable straddle) pick these
 # up via the staging/components/*/components/ glob in their top-level
 # CMakeLists.txt.
 #
