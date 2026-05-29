@@ -23,3 +23,9 @@ browser: browser
 platforms: [idf]
 requires:
   - spangap/spangap-core
+optional_requires:
+  # rnsd.cpp registers on-device Settings panes via lcdSetting* helpers,
+  # gated on CONFIG_SPANGAP_LCD. Plan-aligned future moves this into an
+  # esp-idf/lcd/ slice; until then, the integration lives in rnsd.cpp and
+  # the dep is gateable through this optional_requires.
+  - spangap/spangap-lcd
