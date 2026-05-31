@@ -1,4 +1,4 @@
-# reticulous-core — internals
+# rns — internals
 
 ## The `rnsd` task
 
@@ -114,6 +114,6 @@ LoRa, AutoInterface}`.
 The single source of truth for codebase choice, dependencies, task
 layout, ITS surface, storage conventions, and phased rollout lives in
 the consuming app straddle: see
-[`reticulous-tdeck/docs/component-plan.md`](../reticulous-tdeck/docs/component-plan.md).
+[`hw-tdeck/docs/component-plan.md`](../hw-tdeck/docs/component-plan.md).
 That document is more current than any of the planning sketches in
 `docs/plans/` — where they disagree, the component-plan wins.

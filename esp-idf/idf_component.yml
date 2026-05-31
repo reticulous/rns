@@ -1,5 +1,5 @@
-description: "reticulous-core: Reticulum (RNS) protocol core for spangap device apps. Pure protocol logic — transports plug in via the RNSD_PORT_TRANSPORT ITS surface. Vendors the µReticulum hard fork + bzip2 as nested sub-components."
-url: https://github.com/reticulous/reticulous-core
+description: "rns: Reticulum (RNS) protocol core for spangap device apps. Pure protocol logic — transports plug in via the RNSD_PORT_TRANSPORT ITS surface. Vendors the µReticulum hard fork + bzip2 as nested sub-components."
+url: https://github.com/reticulous/rns
 version: "0.1.0"
 license: "Apache-2.0"
 targets:

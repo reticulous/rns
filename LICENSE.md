@@ -1,6 +1,6 @@
 # License
 
-This repository, **reticulous-core** (Reticulum / RNS protocol core for
+This repository, **rns** (Reticulum / RNS protocol core for
 spangap device apps), is released under the **Apache License, Version 2.0**.
 
 Full license text: <https://www.apache.org/licenses/LICENSE-2.0>

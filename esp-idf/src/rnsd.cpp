@@ -1535,7 +1535,7 @@ static unsigned long long memBar(const char* name, int count, unsigned cap,
     if (count < 0)   mid[0] = '\0';
     else if (cap)    snprintf(mid, sizeof(mid), "%d / %u", count, cap);
     else             snprintf(mid, sizeof(mid), "%d", count);
-    cliPrintf("  %-14s %-11s %c%7llu B  %2u.%u%%\n",
+    cliPrintf("%-14s %-11s %c%7llu B  %2u.%u%%\n",
               name, mid, approx ? '~' : ' ', bytes, pm / 10, pm % 10);
     return bytes;
 }
@@ -1569,8 +1569,8 @@ static void cliRnsdMemory(void)
     }
 #endif
     cliPrintf("task heap (attributed to rnsd):\n");
-    cliPrintf("  DRAM   %8u B  %5u blocks\n", dramTot, dblk);
-    cliPrintf("  PSRAM  %8u B  %5u blocks\n", psramTot, pblk);
+    cliPrintf("DRAM   %8u B  %5u blocks\n", dramTot, dblk);
+    cliPrintf("PSRAM  %8u B  %5u blocks\n", psramTot, pblk);
 
     /* ---- PSRAM breakdown: one row per consumer, % of the task total, summing
      * to ~100%. ITS buffers are exact (with s.rnsd.its_no_pool on); table
@@ -1626,7 +1626,7 @@ static void cliRnsdMemory(void)
     unsigned long long misc = psramTot > base ? psramTot - base : 0;
     memBar("misc",  -1, 0, misc,     psramTot, true);
     memBar("TOTAL", -1, 0, psramTot, psramTot, false);
-    cliPrintf("  (links: pending %u active %u)\n",
+    cliPrintf("(links: pending %u active %u)\n",
               (unsigned)RNS::Transport::pending_links_count(),
               (unsigned)RNS::Transport::active_links_count());
 
@@ -1650,22 +1650,30 @@ static void cliRnsdMemory(void)
 static void cliRnsd(const char* args)
 {
     if (args && strcmp(args, "help") == 0) {
-        cliPrintf("  %-*s identity & control (see rnstatus for status)\n",
-                  CLI_HELP_COL, "rnsd [identity|persist|reload|link …|links|clink …]");
+        cliPrintf("%-*s identity & control (rnstatus for traffic)\n", CLI_HELP_COL, "rnsd [...]");
+        return;
+    }
+    if (args && cliWantsHelp(args)) {
+        cliPrintf("rnsd                             identity + link summary\n");
+        cliPrintf("rnsd identity                    identity hash + public key\n");
+        cliPrintf("rnsd persist [if-transport]      persist transport state\n");
+        cliPrintf("rnsd reload                      reload / create identity\n");
+        cliPrintf("rnsd memory                      heap usage breakdown\n");
+        cliPrintf("rnsd link <dest_hash> [aspect]   outbound Link probe (Phase B)\n");
+        cliPrintf("rnsd link teardown               drop the active probe link\n");
+        cliPrintf("rnsd links                       pending/active Link table sizes\n");
+        cliPrintf("rnsd clink <dest_hash> [aspect]  Phase C consumer-API link\n");
+        cliPrintf("rnsd clink send <text> | close\n");
+        cliPrintf("rnsd creq <dest_hash> <path>     request/response smoke (nomad)\n");
+        cliPrintf("(see also: rnstatus, rnpath, rnprobe)\n");
         return;
     }
     if (!args || !*args) {
-        cliPrintf("usage: rnsd [identity|persist [if-transport]|reload]\n");
-        cliPrintf("       rnsd memory                      — heap usage breakdown\n");
-        cliPrintf("       rnsd link <dest_hash> [aspect]   — outbound Link probe (Phase B)\n");
-        cliPrintf("       rnsd link teardown               — drop the active probe link\n");
-        cliPrintf("       rnsd links                       — pending/active Link table sizes\n");
-        cliPrintf("       rnsd clink <dest_hash> [aspect]  — Phase C consumer-API link\n");
-        cliPrintf("       rnsd clink send <text> | close\n");
-        cliPrintf("       rnsd creq <dest_hash> <path>     — request/response smoke (nomad)\n");
-        cliPrintf("       rnstatus  — interfaces & traffic\n");
-        cliPrintf("       rnpath    — routing paths\n");
-        cliPrintf("       rnprobe   — RTT probe\n");
+        if (s_identity) cliPrintf("identity: %s\n", s_identity->hexhash().c_str());
+        else            cliPrintf("identity: not loaded\n");
+        cliPrintf("transport: %s\n", storageGetInt("s.rnsd.transport_enabled", 0) ? "enabled" : "disabled");
+        cliPrintf("pending_links: %zu\n", RNS::Transport::pending_links_count());
+        cliPrintf("active_links:  %zu\n", RNS::Transport::active_links_count());
         return;
     }
     if (strcmp(args, "identity") == 0) {
@@ -1694,8 +1702,8 @@ static void cliRnsd(const char* args)
         while (*rest == ' ') rest++;
         if (!*rest) {
             cliPrintf("usage: rnsd link <dest_hash> [aspect]\n");
-            cliPrintf("       rnsd link teardown\n");
-            cliPrintf("  default aspect: rnstransport.probe\n");
+            cliPrintf("rnsd link teardown\n");
+            cliPrintf("default aspect: rnstransport.probe\n");
             return;
         }
         /* Hand off to the rnsd task via storage subscriber. CLI prints
@@ -1714,11 +1722,11 @@ static void cliRnsd(const char* args)
         while (*rest == ' ') rest++;
         if (!*rest) {
             cliPrintf("usage: rnsd clink <dest_hash> [aspect]   — Phase C outbound link\n");
-            cliPrintf("       rnsd clink send <text>\n");
-            cliPrintf("       rnsd clink close\n");
-            cliPrintf("       rnsd clink listen <aspect>        — Phase D: host dest, accept inbound Links\n");
-            cliPrintf("       rnsd clink listen off\n");
-            cliPrintf("  default aspect: lxmf.delivery; watch rnsd.links.* / log\n");
+            cliPrintf("rnsd clink send <text>\n");
+            cliPrintf("rnsd clink close\n");
+            cliPrintf("rnsd clink listen <aspect>        — Phase D: host dest, accept inbound Links\n");
+            cliPrintf("rnsd clink listen off\n");
+            cliPrintf("default aspect: lxmf.delivery; watch rnsd.links.* / log\n");
             return;
         }
         storageSet("rnsd.cmd.clink", rest);
@@ -1730,16 +1738,16 @@ static void cliRnsd(const char* args)
         while (*rest == ' ') rest++;
         if (!*rest) {
             cliPrintf("usage: rnsd creq <dest_hash> <path> [aspect]  — Phase 0 request smoke\n");
-            cliPrintf("  opens a Link + link.request(path), logs the response bytes\n");
-            cliPrintf("  default aspect: nomadnetwork.node\n");
-            cliPrintf("  e.g. rnsd creq <hash> /page/index.mu\n");
+            cliPrintf("opens a Link + link.request(path), logs the response bytes\n");
+            cliPrintf("default aspect: nomadnetwork.node\n");
+            cliPrintf("e.g. rnsd creq <hash> /page/index.mu\n");
             return;
         }
         storageSet("rnsd.cmd.creq", rest);
         cliPrintf("rnsd creq: queued (%s) — watch log for response\n", rest);
         return;
     }
-    cliPrintf("usage: rnsd [identity|persist [if-transport]|reload|link …|links|clink …|creq …]\n");
+    cliPrintf("unknown subcommand. try `rnsd -h`\n");
 }
 
 /* ─────────────── rnpath ─────────────── */
@@ -1776,13 +1784,19 @@ static void cliRnpath(const char* args)
     bool json        = false;
     bool show_help   = false;
 
+    /* `help` listing → one line; `-h`/`--help` → detail. */
+    if (args && strcmp(args, "help") == 0) {
+        cliPrintf("%-*s routing paths\n", CLI_HELP_COL, "rnpath [destination]");
+        return;
+    }
+
     if (args && *args) {
         std::string a = args;
         size_t i = 0;
         while (i < a.size()) {
             std::string t = rnpathNextToken(a, &i);
             if (t.empty()) break;
-            if      (t == "help")                       show_help = true;
+            if      (t == "-h" || t == "--help")        show_help = true;
             else if (t == "-a" || t == "--all")         show_all = true;
             else if (t == "-s" || t == "--summary")     summary  = true;
             else if (t == "-d" || t == "--drop")        drop     = true;
@@ -1800,14 +1814,14 @@ static void cliRnpath(const char* args)
     }
 
     if (show_help) {
-        cliPrintf("  %-*s routing paths\n", CLI_HELP_COL, "rnpath [destination]");
-        cliPrintf("    -i iface     filter by interface\n");
-        cliPrintf("    -m hops      filter by max hops\n");
-        cliPrintf("    -n N         row limit (default %d)\n", RNPATH_DEFAULT_LIMIT);
-        cliPrintf("    -a --all     no row limit\n");
-        cliPrintf("    -s --summary counts only, no rows\n");
-        cliPrintf("    -d --drop    drop path to destination\n");
-        cliPrintf("    -j --json    JSON output\n");
+        cliPrintf("%-*s routing paths\n", CLI_HELP_COL, "rnpath [destination]");
+        cliPrintf("-i iface     filter by interface\n");
+        cliPrintf("-m hops      filter by max hops\n");
+        cliPrintf("-n N         row limit (default %d)\n", RNPATH_DEFAULT_LIMIT);
+        cliPrintf("-a --all     no row limit\n");
+        cliPrintf("-s --summary counts only, no rows\n");
+        cliPrintf("-d --drop    drop path to destination\n");
+        cliPrintf("-j --json    JSON output\n");
         return;
     }
 
@@ -1880,9 +1894,9 @@ static void cliRnpath(const char* args)
     if ((int)rows.size() != total) cliPrintf(" (%d matching)", (int)rows.size());
     cliPrintf("\n");
 
-    cliPrintf("  by iface:");
+    cliPrintf("by iface:");
     for (auto& kv : by_iface) cliPrintf("  %s %d", kv.first.c_str(), kv.second);
-    cliPrintf("\n  by hops: ");
+    cliPrintf("\nby hops: ");
     for (auto& kv : by_hops)  cliPrintf("  %d:%d", kv.first, kv.second);
     cliPrintf("\n");
 
@@ -1890,13 +1904,13 @@ static void cliRnpath(const char* args)
 
     int to_show = show_all ? (int)rows.size() : std::min((int)rows.size(), limit);
     if (to_show < (int)rows.size())
-        cliPrintf("\n  (showing %d of %d, use -a or -n N for more)\n", to_show, (int)rows.size());
-    cliPrintf("\n  %-32s %-32s %-16s %-5s %-8s\n",
+        cliPrintf("\n(showing %d of %d, use -a or -n N for more)\n", to_show, (int)rows.size());
+    cliPrintf("\n%-32s %-32s %-16s %-5s %-8s\n",
               "destination", "next hop", "iface", "hops", "age");
 
     double now = RNS::Utilities::OS::time();
     for (int n = 0; n < to_show; n++) {
-        cliPrintf("  %-32s %-32s %-16s %-5d %lus\n",
+        cliPrintf("%-32s %-32s %-16s %-5d %lus\n",
                   rows[n].dest.c_str(),
                   rows[n].next_hop.c_str(),
                   rows[n].iface.c_str(),
@@ -1944,18 +1958,18 @@ static void rnstatusHeader(void)
     bool tx_en = storageGetInt("s.rnsd.transport_enabled", 0) != 0;
     if (s_identity) cliPrintf("Reticulum transport instance %s\n", s_identity->hexhash().c_str());
     else            cliPrintf("Reticulum (no identity)\n");
-    cliPrintf("  Transport    %s\n", tx_en ? "enabled" : "disabled");
-    cliPrintf("  Interfaces   %d up\n", countActiveIfaces());
+    cliPrintf("Transport    %s\n", tx_en ? "enabled" : "disabled");
+    cliPrintf("Interfaces   %d up\n", countActiveIfaces());
 }
 
 static void rnstatusPrintIface(const iface_t& i)
 {
     cliPrintf("\n%s\n", i.info.name);
-    cliPrintf("  Status       up\n");
-    cliPrintf("  Mode         %s\n", mode_name(i.info.mode));
-    cliPrintf("  MTU          %u\n", (unsigned)i.info.mtu);
-    cliPrintf("  Bitrate      %s\n", formatBitrate(i.info.bitrate).c_str());
-    cliPrintf("  Traffic      %s in / %s out  (%llu pkt in / %llu out)\n",
+    cliPrintf("Status       up\n");
+    cliPrintf("Mode         %s\n", mode_name(i.info.mode));
+    cliPrintf("MTU          %u\n", (unsigned)i.info.mtu);
+    cliPrintf("Bitrate      %s\n", formatBitrate(i.info.bitrate).c_str());
+    cliPrintf("Traffic      %s in / %s out  (%llu pkt in / %llu out)\n",
               formatBytes(i.rx_bytes).c_str(),
               formatBytes(i.tx_bytes).c_str(),
               (unsigned long long)i.rx_packets,
@@ -1965,10 +1979,10 @@ static void rnstatusPrintIface(const iface_t& i)
 static void rnstatusPrintTotals(void)
 {
     cliPrintf("\nTotals\n");
-    cliPrintf("  Packets      %llu in / %llu out\n",
+    cliPrintf("Packets      %llu in / %llu out\n",
               (unsigned long long)s_stats.packets_in,
               (unsigned long long)s_stats.packets_out);
-    cliPrintf("  Bytes        %s in / %s out\n",
+    cliPrintf("Bytes        %s in / %s out\n",
               formatBytes(s_stats.bytes_in).c_str(),
               formatBytes(s_stats.bytes_out).c_str());
 }
@@ -2017,6 +2031,12 @@ static void cliRnstatus(const char* args)
     bool json        = false;
     bool show_help   = false;
 
+    /* `help` listing → one line. `-h`/`--help` → detail (handled below). */
+    if (args && strcmp(args, "help") == 0) {
+        cliPrintf("%-*s interfaces & traffic\n", CLI_HELP_COL, "rnstatus [filter] [-t] [-j]");
+        return;
+    }
+
     if (args && *args) {
         std::string a = args;
         size_t i = 0;
@@ -2026,7 +2046,7 @@ static void cliRnstatus(const char* args)
             size_t s = i;
             while (i < a.size() && a[i] != ' ' && a[i] != '\t') i++;
             std::string t = a.substr(s, i - s);
-            if      (t == "help")                  show_help = true;
+            if      (t == "-h" || t == "--help")   show_help = true;
             else if (t == "-t" || t == "--totals") show_totals = true;
             else if (t == "-j" || t == "--json")   json = true;
             else if (!t.empty() && t[0] != '-')    filter = t;
@@ -2039,10 +2059,9 @@ static void cliRnstatus(const char* args)
     }
 
     if (show_help) {
-        cliPrintf("  %-*s interfaces & traffic\n",
-                  CLI_HELP_COL, "rnstatus [filter]");
-        cliPrintf("    -t  --totals  global traffic totals\n");
-        cliPrintf("    -j  --json    JSON output\n");
+        cliPrintf("%-*s interfaces & traffic\n", CLI_HELP_COL, "rnstatus [filter]");
+        cliPrintf("%-*s global traffic totals\n", CLI_HELP_COL, "  -t  --totals");
+        cliPrintf("%-*s JSON output\n", CLI_HELP_COL, "  -j  --json");
         return;
     }
 
@@ -2079,13 +2098,19 @@ static void cliRnprobe(const char* args)
     bool show_help = false;
     int  positional = 0;
 
+    /* `help` listing → one line; `-h`/`--help` (or missing args) → detail. */
+    if (args && strcmp(args, "help") == 0) {
+        cliPrintf("%-*s probe destination, measure RTT\n", CLI_HELP_COL, "rnprobe [aspect] <hash>");
+        return;
+    }
+
     if (args && *args) {
         std::string a = args;
         size_t i = 0;
         while (i < a.size()) {
             std::string t = rnpathNextToken(a, &i);
             if (t.empty()) break;
-            if      (t == "help")                    show_help = true;
+            if      (t == "-h" || t == "--help")     show_help = true;
             else if (t == "-s" || t == "--size")     size    = atoi(rnpathNextToken(a, &i).c_str());
             else if (t == "-n" || t == "--probes")   probes  = atoi(rnpathNextToken(a, &i).c_str());
             else if (t == "-t" || t == "--timeout")  timeout = atoi(rnpathNextToken(a, &i).c_str());
@@ -2120,13 +2145,12 @@ static void cliRnprobe(const char* args)
     }
 
     if (show_help || aspect.empty() || hash_hex.empty()) {
-        cliPrintf("  %-*s probe destination, measure RTT\n",
-                  CLI_HELP_COL, "rnprobe [aspect] <hash>");
-        cliPrintf("    aspect    default: rnstransport.probe\n");
-        cliPrintf("    -s SIZE   payload bytes (default %d)\n", RNPROBE_DEFAULT_SIZE);
-        cliPrintf("    -n N      probe count (only 1 supported for now)\n");
-        cliPrintf("    -t SECS   timeout (default %d)\n", RNPROBE_DEFAULT_TIMEOUT);
-        cliPrintf("    -w SECS   interval between probes\n");
+        cliPrintf("%-*s probe destination, measure RTT\n", CLI_HELP_COL, "rnprobe [aspect] <hash>");
+        cliPrintf("aspect    default: rnstransport.probe\n");
+        cliPrintf("-s SIZE   payload bytes (default %d)\n", RNPROBE_DEFAULT_SIZE);
+        cliPrintf("-n N      probe count (only 1 supported for now)\n");
+        cliPrintf("-t SECS   timeout (default %d)\n", RNPROBE_DEFAULT_TIMEOUT);
+        cliPrintf("-w SECS   interval between probes\n");
         return;
     }
     if (probes > 1)
@@ -2223,20 +2247,20 @@ static void cliRnprobe(const char* args)
                 uint8_t type = buf[3];
                 switch (type) {
                     case RNSD_DEST_AUX_REQUESTING_PATH:
-                        cliPrintf("  requesting path...\n");
+                        cliPrintf("requesting path...\n");
                         break;
                     case RNSD_DEST_AUX_EGRESS_QUEUED:
-                        cliPrintf("  egress queued\n");
+                        cliPrintf("egress queued\n");
                         break;
                     case RNSD_DEST_AUX_RETRY:
                         if (got >= 6)
-                            cliPrintf("  retry (attempt %u, reason 0x%02x)\n",
+                            cliPrintf("retry (attempt %u, reason 0x%02x)\n",
                                       (unsigned)buf[4], (unsigned)buf[5]);
                         else
-                            cliPrintf("  retry\n");
+                            cliPrintf("retry\n");
                         break;
                     default:
-                        cliPrintf("  status 0x%02x\n", (unsigned)type);
+                        cliPrintf("status 0x%02x\n", (unsigned)type);
                         break;
                 }
                 break;
