@@ -29,3 +29,10 @@ optional_requires:
   # esp-idf/lcd/ slice; until then, the integration lives in rnsd.cpp and
   # the dep is gateable through this optional_requires.
   - spangap/spangap-lcd
+# Auto-init: folded into the generated spangapInitStraddles() dispatcher in the
+# app-layer band (>150), after the spangap foundation + LCD. Transport
+# straddles (tr-*) sort after this so rnsd's ITS port surface is up before they
+# self-register their interfaces.
+init:
+  - call: rnsdInit
+    order: 160

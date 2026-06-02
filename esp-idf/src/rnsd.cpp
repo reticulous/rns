@@ -1459,6 +1459,7 @@ static std::string ifaceShortName(const std::string& mrToString)
 #define RNSD_PATHS_PUBLISH_MAX 64
 #define RNSD_PATHS_YIELD_EVERY 8
 
+#if 0  /* route publishing to our storage disabled */
 static void publishPathTable(void)
 {
     cJSON* arr = cJSON_CreateArray();
@@ -1483,6 +1484,7 @@ static void publishPathTable(void)
     }
     storageSetTree("rnsd.paths", arr);   /* takes ownership */
 }
+#endif  /* route publishing to our storage disabled */
 
 /* ─────────────── stats publishing ─────────────── */
 
@@ -4507,7 +4509,9 @@ static void rnsdTaskMain(void*)
                     }
                 }
             } else {
+#if 0  /* route publishing to our storage disabled */
                 publishPathTable();
+#endif
             }
             publishStats();   /* cheap, every tick */
             tickPhase ^= 1;
