@@ -21,18 +21,17 @@ version: 0.1.0
 firmware: esp-idf
 browser: browser
 platforms: [idf]
-requires:
-  - spangap/spangap-core
+# spangap-core is implicit (the empty-prefix platform foundation) — not listed.
 optional_requires:
   # rnsd.cpp registers on-device Settings panes via lcdSetting* helpers,
   # gated on CONFIG_SPANGAP_LCD. Plan-aligned future moves this into an
   # esp-idf/lcd/ slice; until then, the integration lives in rnsd.cpp and
   # the dep is gateable through this optional_requires.
   - spangap/spangap-lcd
-# Auto-init: folded into the generated spangapInitStraddles() dispatcher in the
-# app-layer band (>150), after the spangap foundation + LCD. Transport
-# straddles (tr-*) sort after this so rnsd's ITS port surface is up before they
-# self-register their interfaces.
+# Auto-init: folded into the generated spangapInitStraddles() dispatcher. Runs
+# in the straddle band, after the platform band (so storage/LCD are up). The
+# transport straddles (tr-*) all `requires: reticulous/rns`, so the dependency-
+# topo order brings rnsd up — and its ITS port surface with it — before they
+# self-register their interfaces. No explicit ordering needed.
 init:
   - call: rnsdInit
-    order: 160
