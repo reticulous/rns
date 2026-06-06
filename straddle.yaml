@@ -2,7 +2,7 @@
 #
 # Pure protocol logic: identity, destinations, path table, transport
 # state machine, links, resources. Zero networking/radio dependencies —
-# transport straddles (tr-tcp/-auto/-espnow/-lora) plug their
+# transport straddles (iface-tcp/-auto/-espnow/-lora) plug their
 # interfaces in via the RNSD_PORT_TRANSPORT ITS surface.
 #
 # Vendors the µReticulum hard fork (esp-idf/components/microreticulum/)
@@ -23,11 +23,25 @@ browser: browser
 platforms: [idf]
 # spangap-core is implicit (the empty-prefix platform foundation) — not listed.
 optional_requires:
-  # rnsd.cpp registers on-device Settings panes via lcdSetting* helpers,
-  # gated on CONFIG_SPANGAP_LCD. Plan-aligned future moves this into an
-  # esp-idf/lcd/ slice; until then, the integration lives in rnsd.cpp and
-  # the dep is gateable through this optional_requires.
+  # On-device Settings panes (Reticulum → General) live in the
+  # conditional/spangap-lcd/ slice and register via the when:-gated
+  # rnsdLcdRegister init hook — compiled only when spangap-lcd is staged.
   - spangap/spangap-lcd
+
+# Build settings this straddle's vendored µReticulum fork needs. They ride in
+# via the sdkconfig fragment (layered above the platform defaults), so they
+# only apply when rns is actually staged — no consumer board has to know them.
+kconfig:
+  # microReticulum uses C++ exceptions extensively — every error path in
+  # Identity, Packet, Cryptography, Persistence raises std::invalid_argument /
+  # std::runtime_error. The platform default disables exceptions for code size
+  # (CONFIG_COMPILER_CXX_EXCEPTIONS=n); re-enable here. Cost ~30 KB + libstdc++
+  # unwinder tables. EMG_POOL_SIZE=0 = no emergency throw pool.
+  - CONFIG_COMPILER_CXX_EXCEPTIONS=y
+  - CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0
+  # mbedTLS HKDF — used by µR's Cryptography/HKDF.cpp (key derivation for
+  # Fernet, IFAC, Identity prove/verify). Off by default in IDF.
+  - CONFIG_MBEDTLS_HKDF_C=y
 # Auto-init: folded into the generated spangapInitStraddles() dispatcher. Runs
 # in the straddle band, after the platform band (so storage/LCD are up). The
 # transport straddles (tr-*) all `requires: reticulous/rns`, so the dependency-
@@ -35,3 +49,5 @@ optional_requires:
 # self-register their interfaces. No explicit ordering needed.
 init:
   - call: rnsdInit
+  - call: rnsdLcdRegister
+    when: spangap/spangap-lcd

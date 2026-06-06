@@ -4520,23 +4520,6 @@ static void rnsdTaskMain(void*)
     }
 }
 
-#if CONFIG_SPANGAP_LCD
-#include "lcd.h"
-/* Settings → Reticulum → General. Mirrors the web RnsdPanel. */
-static void rnsdSettingsPane(void* arg) {
-    lv_obj_t* p = static_cast<lv_obj_t*>(arg);
-    lcdSettingSection(p, "Reticulum");
-    lcdSettingValue  (p, "Identity", "rnsd.identity_hash");
-    lcdSettingSwitch (p, "Enable", "s.rnsd.enable");
-    lcdSettingSwitch (p, "Transport node", "s.rnsd.transport_enabled");
-    lcdSettingText   (p, "Node name", "s.rnsd.name");
-    lcdSettingSlider (p, "Announce (s)", "s.rnsd.announce.interval", 0, 21600);
-    lcdSettingSection(p, "Path Table");
-    lcdSettingSlider (p, "Capacity", "s.rnsd.path.max", 64, 512);
-    lcdSettingSlider (p, "TTL (s)", "s.rnsd.path.ttl", 3600, 604800);
-}
-#endif
-
 void rnsdInit(void)
 {
     /* The iface / packet-connection tables are allocated in rnsdTaskMain (task
@@ -4570,10 +4553,6 @@ void rnsdInit(void)
 
     /* Cron line per §11.3 — no-op when transport disabled, hourly otherwise. */
     cronDefault("0 * * * * N", "rnsd persist if-transport");
-
-#if CONFIG_SPANGAP_LCD
-    lcdRegisterSettings("Reticulum/General", "General", rnsdSettingsPane);
-#endif
 
     /* PSRAM stack, core 0 alongside tcpip_thread, prio 2. */
     s_task = spawnTask(rnsdTaskMain, TAG, 12288, nullptr, 2, 0, STACK_PSRAM);

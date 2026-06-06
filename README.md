@@ -6,8 +6,8 @@
 [spangap](https://github.com/spangap/spangap) platform: identity,
 destinations, the path table, the transport state machine, Links, and
 Resources. It is the protocol brain; transport straddles
-([tcp](../tr-tcp), [auto](../tr-auto),
-[lora](../tr-lora), [espnow](../tr-espnow)) plug their
+([tcp](../iface-tcp), [auto](../iface-auto),
+[lora](../iface-lora), [espnow](../iface-espnow)) plug their
 interfaces in via the `RNSD_PORT_TRANSPORT` ITS surface — rns
 itself has **zero** networking / radio dependencies.
 
