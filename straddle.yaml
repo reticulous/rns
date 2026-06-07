@@ -22,11 +22,6 @@ firmware: esp-idf
 browser: browser
 platforms: [idf]
 # spangap-core is implicit (the empty-prefix platform foundation) — not listed.
-optional_requires:
-  # On-device Settings panes (Reticulum → General) live in the
-  # conditional/spangap-lcd/ slice and register via the when:-gated
-  # rnsdLcdRegister init hook — compiled only when spangap-lcd is staged.
-  - spangap/spangap-lcd
 
 # Build settings this straddle's vendored µReticulum fork needs. They ride in
 # via the sdkconfig fragment (layered above the platform defaults), so they
