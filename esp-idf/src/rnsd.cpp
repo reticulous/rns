@@ -413,10 +413,14 @@ static int onTransportConnect(int handle, const void* data, size_t len)
     slot->handle = handle;
     memcpy(&slot->info, data, sizeof(rnsd_transport_t));
     slot->info.name[sizeof(slot->info.name) - 1] = '\0';
+    slot->info.ifac_netname[sizeof(slot->info.ifac_netname) - 1] = '\0';
+    slot->info.ifac_netkey[sizeof(slot->info.ifac_netkey) - 1] = '\0';
     slot->rx_packets = slot->tx_packets = slot->rx_bytes = slot->tx_bytes = 0;
-    info("register: iface=%s mtu=%u bitrate=%u mode=%s in=%u out=%u fwd=%u rpt=%u",
+    bool hasIfac = slot->info.ifac_netname[0] != '\0' || slot->info.ifac_netkey[0] != '\0';
+    info("register: iface=%s mtu=%u bitrate=%u mode=%s in=%u out=%u fwd=%u rpt=%u ifac=%s",
          slot->info.name, (unsigned)slot->info.mtu, (unsigned)slot->info.bitrate,
-         mode_name(slot->info.mode), slot->info.in, slot->info.out, slot->info.fwd, slot->info.rpt);
+         mode_name(slot->info.mode), slot->info.in, slot->info.out, slot->info.fwd, slot->info.rpt,
+         hasIfac ? "on" : "off");
 
     /* Wrap in mR Interface and register with Transport so announces /
      * paths route through us. Transport stores its own copy of Interface
@@ -424,6 +428,18 @@ static int onTransportConnect(int handle, const void* data, size_t len)
     std::shared_ptr<RNS::InterfaceImpl> impl =
         std::make_shared<TaskInterface>(slot->info, handle);
     slot->mr_iface = RNS::Interface(impl);
+    /* Apply IFAC (Interface Access Codes) before registering, so the very
+     * first packet on this iface is access-coded. No-op when both strings
+     * are empty (open interface). */
+    if (hasIfac) {
+        try {
+            RNS::Transport::derive_ifac(slot->mr_iface, slot->info.ifac_netname,
+                                        slot->info.ifac_netkey,
+                                        slot->info.ifac_size ? slot->info.ifac_size : 1);
+        } catch (const std::exception& e) {
+            err("Transport::derive_ifac threw: %s", e.what());
+        }
+    }
     try {
         RNS::Transport::register_interface(slot->mr_iface);
     } catch (const std::exception& e) {
@@ -4399,6 +4415,14 @@ static void rnsdTaskMain(void*)
     NOW_AND_ON_CHANGE("s.rnsd.cull_interval_s", {
         RNS::Transport::tables_cull_interval((float)storageGetInt(key, 60));
     });
+
+    /* Hold off bringing up Reticulum/Transport until the platform clock is
+     * known-valid (or a bounded wait elapses), so announces and path-table
+     * entries aren't stamped with the pre-sync 1970 epoch. The ITS port surface
+     * is already open above, so transports can connect and queue in the
+     * meantime; each transport gates its own announce on the same signal. An
+     * offline node with no time source proceeds after the timeout. */
+    waitForTime(0);
 
     /* Bring up mR. Reticulum::transport_enabled() is a static global
      * consulted by Transport for forwarding decisions. We mirror our

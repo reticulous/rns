@@ -169,8 +169,14 @@ enum rns_iface_mode : uint8_t {
 };
 
 /** Connect payload for RNSD_PORT_TRANSPORT. Sent by transport tasks when
- *  registering with rnsd. Fixed-size struct to keep the connect path
- *  cheap (fits in ITS_MAX_MSG_DATA = 96). */
+ *  registering with rnsd. Fixed-size struct to keep the connect path cheap
+ *  (fits in ITS_MAX_MSG_DATA).
+ *
+ *  IFAC (Interface Access Codes): a transport that wants its interface on an
+ *  access-coded RNS network fills `ifac_netname` (network_name) and/or
+ *  `ifac_netkey` (passphrase); rnsd derives the IFAC identity and applies it
+ *  (Transport::derive_ifac). Both empty => an open (non-IFAC) interface.
+ *  `ifac_netkey` is a secret — transports read it from `secrets.*` storage. */
 typedef struct {
     char     name[24];      /* "tcp/0", "auto", "lora", "tcp_in/<addr:port>" */
     uint16_t mtu;           /* bytes — RNS protocol MTU is 500 */
@@ -180,8 +186,12 @@ typedef struct {
     uint8_t  out;           /* 1 if iface sends outbound packets */
     uint8_t  fwd;           /* 1 if iface forwards (transport node) */
     uint8_t  rpt;           /* 1 if iface repeats announces */
-    uint8_t  reserved[3];
+    uint8_t  ifac_size;     /* IFAC access-code length in bytes; 0 => default (1) */
+    char     ifac_netname[32]; /* IFAC network_name; "" => no IFAC */
+    char     ifac_netkey[64];  /* IFAC passphrase; "" => no IFAC */
 } rnsd_transport_t;
+static_assert(sizeof(rnsd_transport_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_transport_t must fit ITS_MAX_MSG_DATA");
 
 /* ---- RNSD_PORT_DEST frame opcodes ---- */
 

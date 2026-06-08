@@ -284,6 +284,12 @@ namespace RNS {
 		static void handle_tunnel(const Bytes& tunnel_id, const Interface& interface);
 		static void register_interface(Interface& interface);
 		static void deregister_interface(const Interface& interface);
+		// Derive and install IFAC (Interface Access Codes) on an interface from a
+		// network_name + passphrase (netkey), byte-compatible with upstream RNS.
+		// No-op when both strings are empty (interface stays open/non-IFAC).
+		static void derive_ifac(Interface& interface, const std::string& network_name,
+		                        const std::string& passphrase,
+		                        uint16_t ifac_size = Type::Reticulum::IFAC_MIN_SIZE);
 		inline static InterfaceTable& get_interfaces() { return _interfaces; }
 		static void register_destination(Destination& destination);
 		static void deregister_destination(const Destination& destination);

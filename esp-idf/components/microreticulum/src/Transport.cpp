@@ -22,6 +22,7 @@
 #include "Interface.h"
 #include "Log.h"
 #include "Cryptography/Random.h"
+#include "Cryptography/HKDF.h"
 #include "Utilities/OS.h"
 #include "Utilities/Persistence.h"
 
@@ -792,6 +793,46 @@ DestinationEntry empty_destination_entry;
 	}
 }
 
+// IFAC salt — fixed constant shared by all Reticulum nodes (RNS Reticulum.IFAC_SALT).
+// Built once from its hex; kept here (rather than Type.h) to avoid header ODR issues.
+static const Bytes& ifac_salt() {
+	static const Bytes salt = []{
+		Bytes b;
+		b.appendHex("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8");
+		return b;
+	}();
+	return salt;
+}
+
+/*static*/ void Transport::derive_ifac(Interface& interface, const std::string& network_name,
+		const std::string& passphrase, uint16_t ifac_size) {
+	// No network_name and no passphrase => leave the interface open (no IFAC).
+	if (network_name.empty() && passphrase.empty()) return;
+
+	if (ifac_size < 1) ifac_size = Type::Reticulum::IFAC_MIN_SIZE;
+	if (ifac_size > 64) ifac_size = 64;   // sig is 64 bytes; cap the access-code length
+
+	// ifac_origin = full_hash(network_name) ++ full_hash(passphrase), each only if set.
+	Bytes ifac_origin;
+	if (!network_name.empty()) ifac_origin.append(Identity::full_hash(Bytes(network_name)));
+	if (!passphrase.empty())   ifac_origin.append(Identity::full_hash(Bytes(passphrase)));
+
+	Bytes ifac_origin_hash = Identity::full_hash(ifac_origin);
+	Bytes ifac_key = Cryptography::hkdf(64, ifac_origin_hash, ifac_salt(), {Bytes::NONE});
+
+	Identity ifac_identity(false);   // false => do not auto-generate keys
+	if (!ifac_identity.load_private_key(ifac_key)) {
+		ERRORF("Failed to load IFAC identity for %s", interface.toString().c_str());
+		return;
+	}
+
+	interface.ifac_size(ifac_size);
+	interface.ifac_key(ifac_key);
+	interface.ifac_identity(ifac_key);                 // non-empty => IFAC enabled
+	interface.ifac_identity_obj(ifac_identity);
+	interface.ifac_signature(ifac_identity.sign(Identity::full_hash(ifac_key)));
+}
+
 /*static*/ void Transport::transmit(Interface& interface, const Bytes& raw) {
 	TRACE("Transport::transmit()");
 	// CBA
@@ -806,43 +847,40 @@ DestinationEntry empty_destination_entry;
 	try {
 		//if hasattr(interface, "ifac_identity") and interface.ifac_identity != None:
 		if (interface.ifac_identity()) {
-// TODO
-/*p
-			// Calculate packet access code
-			ifac = interface.ifac_identity.sign(raw)[-interface.ifac_size:]
+			const uint16_t ifac_size = interface.ifac_size();
 
-			// Generate mask
-			mask = RNS.Cryptography.hkdf(
-				length=len(raw)+interface.ifac_size,
-				derive_from=ifac,
-				salt=interface.ifac_key,
-				context=None,
-			)
+			// Access code: the last ifac_size bytes of the Ed25519 signature over
+			// the raw packet. Inbound authenticates by recomputing this signature,
+			// which relies on the signer being DETERMINISTIC (RFC 8032 Ed25519) —
+			// do not swap in a randomized/hedged signer or every inbound IFAC
+			// packet will fail verification and be dropped silently.
+			Bytes ifac = interface.ifac_identity_obj().sign(raw).right(ifac_size);
 
-			// Set IFAC flag
-			new_header = bytes([raw[0] | 0x80, raw[1]])
+			// Mask = HKDF(len(raw)+ifac_size, derive_from=ifac, salt=ifac_key).
+			Bytes mask = Cryptography::hkdf(raw.size() + ifac_size, ifac,
+				interface.ifac_key(), {Bytes::NONE});
 
-			// Assemble new payload with IFAC
-			new_raw    = new_header+ifac+raw[2:]
-			
-			// Mask payload
-			i = 0; masked_raw = b""
-			for byte in new_raw:
-				if i == 0:
-					// Mask first header byte, but make sure the
-					// IFAC flag is still set
-					masked_raw += bytes([byte ^ mask[i] | 0x80])
-				elif i == 1 or i > interface.ifac_size+1:
-					// Mask second header byte and payload
-					masked_raw += bytes([byte ^ mask[i]])
-				else:
-					// Don't mask the IFAC itself
-					masked_raw += bytes([byte])
-				i += 1
+			// new_raw = [raw[0]|0x80, raw[1]] + ifac + raw[2:]
+			Bytes new_raw;
+			new_raw.append((uint8_t)(raw[0] | 0x80));
+			new_raw.append(raw[1]);
+			new_raw.append(ifac);
+			new_raw.append(raw.mid(2));
 
-			// Send it
-			interface.on_outgoing(masked_raw)
-*/
+			// Mask every byte except the ifac field (indices 2..ifac_size+1),
+			// keeping the IFAC flag set on byte 0 after masking.
+			Bytes masked_raw;
+			for (size_t i = 0; i < new_raw.size(); ++i) {
+				uint8_t b = new_raw[i];
+				if (i == 0)
+					masked_raw.append((uint8_t)((b ^ mask[i]) | 0x80));
+				else if (i == 1 || i > (size_t)(ifac_size + 1))
+					masked_raw.append((uint8_t)(b ^ mask[i]));
+				else
+					masked_raw.append(b);
+			}
+
+			interface.send_outgoing(masked_raw);
 		}
 		else {
 			interface.send_outgoing(raw);
@@ -1358,7 +1396,10 @@ DestinationEntry empty_destination_entry;
 	return false;
 }
 
-/*static*/ void Transport::inbound(const Bytes& raw, const Interface& interface /*= {Type::NONE}*/) {
+/*static*/ void Transport::inbound(const Bytes& raw_in, const Interface& interface /*= {Type::NONE}*/) {
+	// Mutable working copy: the IFAC block below rewrites it in place to the
+	// de-IFAC'd packet, which the rest of this function then decodes.
+	Bytes raw = raw_in;
 	TRACEF("Transport::inbound: received %d bytes", raw.size());
 	++_packets_received;
 	// CBA
@@ -1370,73 +1411,70 @@ DestinationEntry empty_destination_entry;
 			DEBUGF("Error while executing receive packet callback. The contained exception was: %s", e.what());
 		}
 	}
-// TODO
-/*p
-	// If interface access codes are enabled,
-	// we must authenticate each packet.
-	//if len(raw) > 2:
+	// IFAC (Interface Access Codes): on interfaces with an IFAC network
+	// configured, authenticate and de-mask every packet; drop anything that
+	// doesn't verify. Mirrors upstream RNS Transport.inbound byte-for-byte.
 	if (raw.size() > 2) {
-		if interface != None and hasattr(interface, "ifac_identity") and interface.ifac_identity != None:
-			// Check that IFAC flag is set
-			if raw[0] & 0x80 == 0x80:
-				if len(raw) > 2+interface.ifac_size:
-					// Extract IFAC
-					ifac = raw[2:2+interface.ifac_size]
+		if (interface && interface.ifac_identity()) {
+			// IFAC enabled on this interface — the IFAC flag must be set.
+			if ((raw[0] & 0x80) == 0x80) {
+				const uint16_t ifac_size = interface.ifac_size();
+				if (raw.size() > (size_t)(2 + ifac_size)) {
+					// Extract the (unmasked) IFAC field.
+					Bytes ifac = raw.mid(2, ifac_size);
 
-					// Generate mask
-					mask = RNS.Cryptography.hkdf(
-						length=len(raw),
-						derive_from=ifac,
-						salt=interface.ifac_key,
-						context=None,
-					)
+					// Mask = HKDF(len(raw), derive_from=ifac, salt=ifac_key).
+					Bytes mask = Cryptography::hkdf(raw.size(), ifac,
+						interface.ifac_key(), {Bytes::NONE});
 
-					// Unmask payload
-					i = 0; unmasked_raw = b""
-					for byte in raw:
-						if i <= 1 or i > interface.ifac_size+1:
-							// Unmask header bytes and payload
-							unmasked_raw += bytes([byte ^ mask[i]])
-						else:
-							// Don't unmask IFAC itself
-							unmasked_raw += bytes([byte])
-						i += 1
-					raw = unmasked_raw
+					// Unmask everything except the ifac field itself.
+					Bytes unmasked_raw;
+					for (size_t i = 0; i < raw.size(); ++i) {
+						uint8_t b = raw[i];
+						if (i <= 1 || i > (size_t)(ifac_size + 1))
+							unmasked_raw.append((uint8_t)(b ^ mask[i]));
+						else
+							unmasked_raw.append(b);
+					}
 
-					// Unset IFAC flag
-					new_header = bytes([raw[0] & 0x7f, raw[1]])
+					// Clear the IFAC flag and strip the ifac field to reconstruct
+					// the exact bytes the sender signed.
+					Bytes new_raw;
+					new_raw.append((uint8_t)(unmasked_raw[0] & 0x7f));
+					new_raw.append(unmasked_raw[1]);
+					new_raw.append(unmasked_raw.mid(2 + ifac_size));
 
-					// Re-assemble packet
-					new_raw = new_header+raw[2+interface.ifac_size:]
+					Bytes expected_ifac =
+						interface.ifac_identity_obj().sign(new_raw).right(ifac_size);
 
-					// Calculate expected IFAC
-					expected_ifac = interface.ifac_identity.sign(new_raw)[-interface.ifac_size:]
-
-					// Check it
-					if ifac == expected_ifac:
-						raw = new_raw
-					else:
-						return
-
-				else:
-					return
-
-			else:
-				// If the IFAC flag is not set, but should be,
-				// drop the packet.
-				return
-
-		else:
-			// If the interface does not have IFAC enabled,
-			// check the received packet IFAC flag.
-			if raw[0] & 0x80 == 0x80:
-				// If the flag is set, drop the packet
-				return
+					if (ifac == expected_ifac) {
+						raw = new_raw;
+					}
+					else {
+						TRACE("Transport::inbound: IFAC authentication failed, dropping packet");
+						return;
+					}
+				}
+				else {
+					return;
+				}
+			}
+			else {
+				// IFAC flag not set but this interface requires IFAC — drop.
+				return;
+			}
+		}
+		else {
+			// Open (non-IFAC) interface — reject any packet that carries the
+			// IFAC flag (it belongs to an access-coded network).
+			if ((raw[0] & 0x80) == 0x80) {
+				return;
+			}
+		}
 	}
 	else {
 		return;
 	}
-*/
 
 	while (_jobs_running) {
 		TRACE("Transport::inbound: sleeping...");

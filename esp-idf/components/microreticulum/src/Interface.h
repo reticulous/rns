@@ -89,6 +89,14 @@ namespace RNS {
 		size_t _txb = 0;
 		bool _online = false;
 		Bytes _ifac_identity;
+		// IFAC (Interface Access Codes). _ifac_identity doubles as the
+		// "IFAC enabled" predicate (non-empty => on). _ifac_key is the 64-byte
+		// HKDF-derived key blob; _ifac_identity_obj is a live signer built once
+		// at derivation so the packet path doesn't reload keys per packet.
+		Bytes _ifac_key;
+		uint16_t _ifac_size = 0;
+		Bytes _ifac_signature;
+		Identity _ifac_identity_obj{Type::NONE};
 		Type::Interface::modes _mode = Type::Interface::MODE_NONE;
 		uint32_t _bitrate = 0;
 		uint16_t _HW_MTU = 0;
@@ -206,6 +214,16 @@ namespace RNS {
 		inline bool online() const { assert(_impl); return _impl->_online; }
 		inline std::string name() const { assert(_impl); return _impl->_name; }
 		inline const Bytes& ifac_identity() const { assert(_impl); return _impl->_ifac_identity; }
+		inline const Bytes& ifac_key() const { assert(_impl); return _impl->_ifac_key; }
+		inline uint16_t ifac_size() const { assert(_impl); return _impl->_ifac_size; }
+		inline const Bytes& ifac_signature() const { assert(_impl); return _impl->_ifac_signature; }
+		inline const Identity& ifac_identity_obj() const { assert(_impl); return _impl->_ifac_identity_obj; }
+		// setters — used only by Transport::derive_ifac at interface setup
+		inline void ifac_identity(const Bytes& v) { assert(_impl); _impl->_ifac_identity = v; }
+		inline void ifac_key(const Bytes& v) { assert(_impl); _impl->_ifac_key = v; }
+		inline void ifac_size(uint16_t v) { assert(_impl); _impl->_ifac_size = v; }
+		inline void ifac_signature(const Bytes& v) { assert(_impl); _impl->_ifac_signature = v; }
+		inline void ifac_identity_obj(const Identity& v) { assert(_impl); _impl->_ifac_identity_obj = v; }
 		inline Type::Interface::modes mode() const { assert(_impl); return _impl->_mode; }
 		inline void mode(Type::Interface::modes mode) { assert(_impl); _impl->_mode = mode; }
 		inline uint32_t bitrate() const { assert(_impl); return _impl->_bitrate; }
