@@ -11,10 +11,17 @@ export const nodesVisible = ref(false)
 export function registerRnsd() {
   const menu = useMenuStore()
 
-  menu.register('settings/reticulum/general', 'General', { type: 'panel', component: RnsdPanel })
+  /* Settings → Mesh Network → Reticulum / RNS (the lead item of the group). */
+  menu.setMenu('settings/mesh', { label: 'Mesh Network', placement: 3 })
+  menu.register('settings/mesh/general', 'Reticulum / RNS', { type: 'panel', component: RnsdPanel }, { placement: 1 })
 
-  menu.register('status/nodes', 'Show Nodes',
-    { type: 'action', action: () => { nodesVisible.value = !nodesVisible.value } })
-  menu.register('status/map', 'Show Map',
-    { type: 'action', action: () => { mapVisible.value = !mapVisible.value } })
+  /* #if 0 — Show Nodes / Show Map removed from the menu; the NodesWindow /
+   * MapWindow components and these visibility refs are kept for re-enabling. */
+  if (false) {
+    menu.register('status/nodes', 'Show Nodes',
+      { type: 'action', action: () => { nodesVisible.value = !nodesVisible.value } })
+    menu.register('status/map', 'Show Map',
+      { type: 'action', action: () => { mapVisible.value = !mapVisible.value } })
+  }
+  /* #endif */
 }
