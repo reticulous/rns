@@ -4300,6 +4300,21 @@ static void rnsdTaskMain(void*)
     for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++) new (&s_mailbox_conns[j]) mailbox_conn_t{};
     for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)    new (&s_link_conns[j])    link_conn_t{};
 
+    /* Gate the entire rnsd ITS/Transport surface on a known-valid clock (or a
+     * bounded wait), BEFORE opening any ITS port. Standing the ports up first —
+     * as we used to — advertises a server that isn't pumping its inbox during
+     * the wait: clients' connects sit unacked, time out, and get abandoned, and
+     * when we later drain the inbox we allocate slots/buffers for those dead
+     * connects and permanently leak them (notably all RNSD_MAX_ANNOUNCE_SUBS
+     * announce-sub slots, wedging lxmf/nomad discovery until reboot). With the
+     * ports still closed, a connecting client fails its local pre-flight
+     * (unopened port) and simply retries — no server-side state, nothing to
+     * leak. Every other mesh task (lxmf, the transports) already waits here
+     * before its ITS work; this brings rnsd into line. Waiting also keeps
+     * announces and path-table entries off the pre-sync 1970 epoch. An offline
+     * node with no time source proceeds after the timeout. */
+    waitForTime(0);
+
     /* s.rnsd.its_no_pool (default off): when on, rnsd's ITS connections bypass
      * the shared buffer pool — buffers are created on connect and freed on
      * disconnect. Returns transient buffers to the heap and makes `rnsd memory`'s
@@ -4415,14 +4430,6 @@ static void rnsdTaskMain(void*)
     NOW_AND_ON_CHANGE("s.rnsd.cull_interval_s", {
         RNS::Transport::tables_cull_interval((float)storageGetInt(key, 60));
     });
-
-    /* Hold off bringing up Reticulum/Transport until the platform clock is
-     * known-valid (or a bounded wait elapses), so announces and path-table
-     * entries aren't stamped with the pre-sync 1970 epoch. The ITS port surface
-     * is already open above, so transports can connect and queue in the
-     * meantime; each transport gates its own announce on the same signal. An
-     * offline node with no time source proceeds after the timeout. */
-    waitForTime(0);
 
     /* Bring up mR. Reticulum::transport_enabled() is a static global
      * consulted by Transport for forwarding decisions. We mirror our
