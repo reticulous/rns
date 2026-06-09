@@ -46,3 +46,9 @@ init:
   - call: rnsdInit
   - call: rnsdLcdRegister
     when: spangap/spangap-lcd
+
+# Browser-side UI registration (parallel to init: above) — auto-wired into
+# the buildable SPA via straddles.gen.ts; no web-interface edit needed.
+browser_register:
+  - call: registerRnsd
+    module: modules/rnsd

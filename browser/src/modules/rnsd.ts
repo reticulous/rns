@@ -11,19 +11,10 @@ export const nodesVisible = ref(false)
 export function registerRnsd() {
   const menu = useMenuStore()
 
-  menu.register('settings', 'Settings', [
-    { id: 'reticulum', label: 'Reticulum', type: 'submenu',
-      children: [
-        { id: 'reticulum.general', label: 'General', type: 'panel',
-          component: RnsdPanel },
-      ],
-    },
-  ])
+  menu.register('settings/reticulum/general', 'General', { type: 'panel', component: RnsdPanel })
 
-  menu.register('status', 'Status', [
-    { id: 'status.nodes', label: 'Show Nodes', type: 'action',
-      action: () => { nodesVisible.value = !nodesVisible.value } },
-    { id: 'status.map', label: 'Show Map', type: 'action',
-      action: () => { mapVisible.value = !mapVisible.value } },
-  ])
+  menu.register('status/nodes', 'Show Nodes',
+    { type: 'action', action: () => { nodesVisible.value = !nodesVisible.value } })
+  menu.register('status/map', 'Show Map',
+    { type: 'action', action: () => { mapVisible.value = !mapVisible.value } })
 }
