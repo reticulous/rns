@@ -24,5 +24,5 @@ static void rnsdSettingsPane(void* arg) {
 }
 
 void rnsdLcdRegister(void) {
-    lcdRegisterSettings("Reticulum/General", "General", rnsdSettingsPane);
+    lcdRegisterSettings("Mesh Network/General", "Reticulum / RNS", rnsdSettingsPane, 1);
 }
