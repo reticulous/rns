@@ -1599,8 +1599,9 @@ static void cliRnsdMemory(void)
     bool itsExact = storageGetInt("s.rnsd.its_no_pool", 0) != 0;
     cliPrintf("PSRAM breakdown (%% of %u B task total):  [ITS %s]\n",
               psramTot, itsExact ? "exact (no_pool)" : "approx — set s.rnsd.its_no_pool=1");
-    memBar("ITS stream buf", -1, 0, its.streamBytes, psramTot, false);
-    memBar("ITS inbox",      -1, 0, its.inboxBytes,  psramTot, false);
+    memBar("ITS stream buf", -1, 0, its.streamBytes,  psramTot, false);
+    memBar("ITS inbox",      -1, 0, its.inboxBytes,   psramTot, false);
+    memBar("ITS in-flight",  -1, 0, its.payloadBytes, psramTot, false);
 
     /* Per-entry byte costs, calibrated for the real allocation shape: tree
      * node + each Bytes field as a separate shared_ptr<vector> (control block +
@@ -3644,9 +3645,36 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     req.tag[sizeof(req.tag) - 1]                   = '\0';
 
     if (req.tag[0] == '\0') { err("link connect: empty tag"); return -1; }
-    if (linkFindByTag(req.tag)) {
-        err("link connect: duplicate tag '%s'", req.tag);
-        return -1;
+    if (link_conn_t* dup = linkFindByTag(req.tag)) {
+        if (dup->handle >= 0) {
+            /* A live consumer still holds this tag — genuine duplicate. */
+            err("link connect: duplicate tag '%s' (still active)", req.tag);
+            return -1;
+        }
+        /* Parked/orphaned slot: the consumer detached but the Link is kept warm
+         * for in-session reconnect (§10a.1). A same-tag reconnect lands here —
+         * NOT a duplicate. Reuse the warm Link if it goes to the SAME
+         * destination and the slot is clean (no pending request/resource);
+         * otherwise (Nomad switching nodes, or mid-flight state) tear it down
+         * and establish fresh. Without this, the reconnect fails and the slot
+         * stays orphaned for the full orphan_ttl, exhausting
+         * RNSD_MAX_LINK_CONNS within one browsing session. */
+        RNS::Bytes newDest(req.dest_hash, RNSD_DEST_HASH_LEN);
+        bool sameDest = (dup->dest_hash == newDest);
+        bool clean    = !dup->req_mrid.size() && !dup->pend_req_used &&
+                        !dup->pend_res_used && !dup->pend_used && !dup->res_outbound;
+        if (sameDest && clean && dup->state == LST_ACTIVE && (bool)dup->link) {
+            dup->handle        = handle;
+            dup->ref           = (int)(dup - s_link_conns);
+            dup->consumer_task = itsRemoteTask(handle);
+            dup->orphan_at     = 0;
+            dup->last_activity = RNS::Utilities::OS::time();
+            info("link[%s]: reusing warm parked Link (same dest reconnect)", dup->tag);
+            return dup->ref;
+        }
+        info("link[%s]: reclaiming parked slot (%s)", dup->tag,
+             sameDest ? "busy/mid-flight" : "different dest");
+        linkFreeSlot(*dup);
     }
     link_conn_t* c = linkAlloc();
     if (!c) { err("link connect: no slots"); return -1; }
@@ -4254,8 +4282,9 @@ static void clinkTaskMain(void*)
      * rnsdDestOpen connect to rnsd). itsServerInit sets up the shared
      * inbox; itsClientInit then reuses it. */
     if (!itsServerInit()) { err("clink itsServerInit failed"); }
-    itsServerPortOpen(CLINK_INBOX_PORT, /*packetBased=*/true,
-                      /*maxHandles=*/4, /*toSize=*/4096, /*fromSize=*/4096);
+    itsServerPortOpen(CLINK_INBOX_PORT, ITS_PACKET,
+                      /*maxHandles=*/4, /*toCap=*/4096, /*fromCap=*/4096,
+                      /*depth=*/0, /*maxMsg=*/4096);
     itsServerOnConnect(CLINK_INBOX_PORT,    onClinkInboxConnect);
     itsServerOnDisconnect(CLINK_INBOX_PORT, onClinkInboxDisc);
     itsServerOnRecv(CLINK_INBOX_PORT,       onClinkInboxRecv);
@@ -4332,9 +4361,10 @@ static void rnsdTaskMain(void*)
      * testnet can fill 2 KB before rnsd drains during the 1 Hz publish
      * block. 4 KB gives ~4× more headroom; PSRAM-allocated, ~64 KB total
      * across RNSD_MAX_IFACES=16 × 2 directions. */
-    if (!itsServerPortOpen(RNSD_PORT_TRANSPORT, /*packetBased=*/true,
+    if (!itsServerPortOpen(RNSD_PORT_TRANSPORT, ITS_PACKET,
                            /*maxHandles=*/RNSD_MAX_IFACES,
-                           /*toSize=*/4096, /*fromSize=*/4096)) {
+                           /*toCap=*/4096, /*fromCap=*/4096,
+                           /*depth=*/0, /*maxMsg=*/4096)) {
         err("RNSD_PORT_TRANSPORT open failed");
         killSelf();
         return;
@@ -4343,9 +4373,10 @@ static void rnsdTaskMain(void*)
     itsServerOnDisconnect(RNSD_PORT_TRANSPORT, onTransportDisconnect);
     itsServerOnRecv(RNSD_PORT_TRANSPORT, onTransportRecv);
 
-    if (!itsServerPortOpen(RNSD_PORT_DEST, /*packetBased=*/true,
+    if (!itsServerPortOpen(RNSD_PORT_DEST, ITS_PACKET,
                            /*maxHandles=*/RNSD_MAX_MAILBOX_CONNS,
-                           /*toSize=*/4096, /*fromSize=*/2048)) {
+                           /*toCap=*/4096, /*fromCap=*/2048,
+                           /*depth=*/0, /*maxMsg=*/4096)) {
         err("RNSD_PORT_DEST open failed");
         killSelf();
         return;
@@ -4357,9 +4388,10 @@ static void rnsdTaskMain(void*)
     /* Announce fan-out — unidirectional rnsd → subscribers (toSize=0).
      * 4 KB per-connection outbound buffer comfortably holds a few queued
      * announces (typical app_data is < 200 B). */
-    if (!itsServerPortOpen(RNSD_PORT_ANNOUNCES, /*packetBased=*/true,
+    if (!itsServerPortOpen(RNSD_PORT_ANNOUNCES, ITS_PACKET,
                            /*maxHandles=*/RNSD_MAX_ANNOUNCE_SUBS,
-                           /*toSize=*/0, /*fromSize=*/4096)) {
+                           /*toCap=*/0, /*fromCap=*/4096,
+                           /*depth=*/0, /*maxMsg=*/4096)) {
         err("RNSD_PORT_ANNOUNCES open failed");
         killSelf();
         return;
@@ -4371,9 +4403,10 @@ static void rnsdTaskMain(void*)
     /* RNSD_PORT_LINK — outbound Link consumer API (Phase C, §6.2).
      * Packet-mode: one Link plaintext per itsSend/itsRecv, no framing.
      * 4 KB/dir ≈ 9 in-flight Link packets — matches Resource cadence. */
-    if (!itsServerPortOpen(RNSD_PORT_LINK, /*packetBased=*/true,
+    if (!itsServerPortOpen(RNSD_PORT_LINK, ITS_PACKET,
                            /*maxHandles=*/RNSD_MAX_LINK_CONNS,
-                           /*toSize=*/4096, /*fromSize=*/4096)) {
+                           /*toCap=*/4096, /*fromCap=*/4096,
+                           /*depth=*/0, /*maxMsg=*/4096)) {
         err("RNSD_PORT_LINK open failed");
         killSelf();
         return;

@@ -35,14 +35,18 @@ using namespace RNS::Type::Transport;
 using namespace RNS::Utilities;
 using namespace RNS::Persistence;
 
-/* Spangap: announce/path-request DEBUGFs route through this — when
- * Transport::_demote_dbg is set (mirrors `s.rnsd.debug.only_local`),
- * they fire at VERBOSE instead of DEBUG. Used at:
- *   - "Destination X is now N hops away ..."         (every announce)
- *   - "Path request for destination X ..."           (every received PR)
- *   - "Ignoring path request for destination X ..."  (no-path PR drops)
- * Logs about local-destination DATA hits and answered path requests
- * keep their normal level (DEBUGF/INFOF) so they're never suppressed. */
+/* Spangap: announce-processing and incoming-path-request DEBUGFs route
+ * through this — when Transport::_demote_dbg is set (mirrors
+ * `s.rnsd.debug.only_local`), they fire at VERBOSE instead of DEBUG.
+ * The intent: every per-packet announce log (heard/rebroadcast/held/
+ * dropped/replaced/now-N-hops-away) and every received-path-request log
+ * (the request itself, dedup/tagless drops, not-answering decisions,
+ * discovery/forwarding on behalf of others, no-path drops, waiting-PR
+ * culls) is suppressible noise unless it concerns us.
+ * The exceptions — kept at their normal level (DEBUGF/INFOF) so they are
+ * never suppressed — are path requests that concern us, i.e. answered
+ * path requests ("Answering path request ..." INFOFs, for a local
+ * destination or a known path) and local-destination DATA hits. */
 #define DBGF_DEMOTE(...) \
 	do { if (Transport::demote_dbg()) VERBOSEF(__VA_ARGS__); else DEBUGF(__VA_ARGS__); } while (0)
 #define DBG_DEMOTE(msg) \
@@ -492,7 +496,7 @@ DestinationEntry empty_destination_entry;
 									new_packet.hops());
 							}
 							else {
-								DEBUGF("Rebroadcasting announce for %s with hop count %d", announce_destination.hash().toHex().c_str(), new_packet.hops());
+								DBGF_DEMOTE("Rebroadcasting announce for %s with hop count %d", announce_destination.hash().toHex().c_str(), new_packet.hops());
 							}
 							
 							outgoing.push_back(new_packet);
@@ -515,7 +519,7 @@ DestinationEntry empty_destination_entry;
 								_announce_table.erase(destination_hash);
 								// CBA ACCUMULATES
 								_announce_table.insert({destination_hash, held_entry});
-								DEBUG("Reinserting held announce into table");
+								DBG_DEMOTE("Reinserting held announce into table");
 								// CBA IMMEDIATE CULL
 								cull_announce_table();
 							}
@@ -691,7 +695,7 @@ DestinationEntry empty_destination_entry;
 					for (const auto& [destination_hash, path_entry] : _discovery_path_requests) {
 						if (OS::time() > path_entry._timeout) {
 							stale_discovery_path_requests.push_back(destination_hash);
-							DEBUGF("Waiting path request for %s timed out and was removed", destination_hash.toString().c_str());
+							DBGF_DEMOTE("Waiting path request for %s timed out and was removed", destination_hash.toString().c_str());
 						}
 					}
 					remove_discovery_path_requests(stale_discovery_path_requests);
@@ -1275,7 +1279,7 @@ static const Bytes& ifac_salt() {
 			}
 		}
 		else {
-			DEBUG("Dropped invalid PLAIN announce packet");
+			DBG_DEMOTE("Dropped invalid PLAIN announce packet");
 			return false;
 		}
 	}
@@ -1291,7 +1295,7 @@ static const Bytes& ifac_salt() {
 			}
 		}
 		else {
-			DEBUG("Dropped invalid GROUP announce packet");
+			DBG_DEMOTE("Dropped invalid GROUP announce packet");
 			return false;
 		}
 	}
@@ -3074,7 +3078,7 @@ Deregisters an announce handler.
 	if (iter == _path_table.end()) return empty_destination_entry;
 	DestinationEntry& destination_entry = (*iter).second;
 	if (!destination_entry.announce_packet()) {
-		DEBUGF("Entry for destination %s found but is missing announce packet, discarding", destination_hash.toHex().c_str());
+		DBGF_DEMOTE("Entry for destination %s found but is missing announce packet, discarding", destination_hash.toHex().c_str());
 		remove_path(destination_hash);
 		return empty_destination_entry;
 	}
@@ -3404,11 +3408,11 @@ will announce it.
 					);
 				}
 				else {
-					DEBUGF("Ignoring duplicate path request for %s with tag %s", destination_hash.toHex().c_str(), unique_tag.toHex().c_str());
+					DBGF_DEMOTE("Ignoring duplicate path request for %s with tag %s", destination_hash.toHex().c_str(), unique_tag.toHex().c_str());
 				}
 			}
 			else {
-				DEBUGF("Ignoring tagless path request for %s", destination_hash.toHex().c_str());
+				DBGF_DEMOTE("Ignoring tagless path request for %s", destination_hash.toHex().c_str());
 			}
 		}
 	}
@@ -3476,7 +3480,7 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 		const Interface& receiving_interface = destination_entry.receiving_interface();
 
 		if (attached_interface.mode() == Type::Interface::MODE_ROAMING && attached_interface == receiving_interface) {
-			DEBUG("Not answering path request on roaming-mode interface, since next hop is on same roaming-mode interface");
+			DBG_DEMOTE("Not answering path request on roaming-mode interface, since next hop is on same roaming-mode interface");
 		}
 		else {
 			if (requestor_transport_id && destination_entry._received_from == requestor_transport_id) {
@@ -3486,7 +3490,7 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 				// inefficient. There is probably a better way. Doing
 				// path invalidation here would decrease the network
 				// convergence time. Maybe just drop it?
-				DEBUGF("Not answering path request for destination %s%s, since next hop is the requestor", destination_hash.toHex().c_str(), interface_str.c_str());
+				DBGF_DEMOTE("Not answering path request for destination %s%s, since next hop is the requestor", destination_hash.toHex().c_str(), interface_str.c_str());
 			}
 			// Only re-emit a path back out the *same* interface the request
 			// arrived on when we are the destination's direct neighbor on
@@ -3600,7 +3604,7 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 	else if (is_from_local_client) {
 		// Forward path request on all interfaces
 		// except the local client
-		DEBUGF("Forwarding path request from local client for destination %s%s to all other interfaces", destination_hash.toHex().c_str(), interface_str.c_str());
+		DBGF_DEMOTE("Forwarding path request from local client for destination %s%s to all other interfaces", destination_hash.toHex().c_str(), interface_str.c_str());
 		Bytes request_tag = Identity::get_random_hash();
 		for (auto& [hash, interface] : _interfaces) {
 			if (interface != attached_interface) {
@@ -3611,12 +3615,12 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 	else if (should_search_for_unknown) {
 		TRACEF("Transport::path_request_handler: searching for unknown path to %s", destination_hash.toHex().c_str());
 		if (_discovery_path_requests.find(destination_hash) != _discovery_path_requests.end()) {
-			DEBUGF("There is already a waiting path request for destination %s on behalf of path request%s", destination_hash.toHex().c_str(), interface_str.c_str());
+			DBGF_DEMOTE("There is already a waiting path request for destination %s on behalf of path request%s", destination_hash.toHex().c_str(), interface_str.c_str());
 		}
 		else {
 			// Forward path request on all interfaces
 			// except the requestor interface
-			DEBUGF("Attempting to discover unknown path to destination %s on behalf of path request%s", destination_hash.toHex().c_str(), interface_str.c_str());
+			DBGF_DEMOTE("Attempting to discover unknown path to destination %s on behalf of path request%s", destination_hash.toHex().c_str(), interface_str.c_str());
 			//p pr_entry = { "destination_hash": destination_hash, "timeout": time.time()+Transport.PATH_REQUEST_TIMEOUT, "requesting_interface": attached_interface }
 			//p _discovery_path_requests[destination_hash] = pr_entry;
 			// CBA ACCUMULATES
@@ -3649,7 +3653,7 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 	else if (!is_from_local_client && _local_client_interfaces.size() > 0) {
 		// Forward the path request on all local
 		// client interfaces
-		DEBUGF("Forwarding path request for destination %s%s to local clients", destination_hash.toHex().c_str(), interface_str.c_str());
+		DBGF_DEMOTE("Forwarding path request for destination %s%s to local clients", destination_hash.toHex().c_str(), interface_str.c_str());
 		for (const Interface& interface : _local_client_interfaces) {
 			request_path(destination_hash, interface);
 		}
