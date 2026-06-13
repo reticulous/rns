@@ -57,6 +57,55 @@ Patches carried in the fork against upstream behaviour:
 - `Packet.cpp`: malformed-packet error path now dumps the first ≤ 8
   bytes hex, so we can tell HEADER_1 vs HEADER_2 mis-parse, HDLC
   desync, noise byte, etc.
+- `Packet.cpp`: **link-packet proof validation enabled** —
+  `PacketReceipt::validate_link_proof` was stubbed (`if (false)` where
+  upstream calls `link.validate(...)`); `Link::validate` exists and
+  verifies against the peer's link signing key, so the call is wired
+  up. Without it a packet sent over a Link could never conclude its
+  receipt (DELIVERED), which the per-link proof counters rely on.
+- Note (not a patch, a constraint we design around): mR concludes
+  receipts on proof (`DELIVERED`, firing the delivery callback) but
+  **never fires receipt timeout callbacks** —
+  `PacketReceipt::check_timeout()` flips status to `FAILED`/`CULLED`
+  and the upstream callback-thread spawn is unported. rnsd therefore
+  drives all receipt timeouts itself by polling receipt status (plus a
+  wall-clock backstop) from its 1 Hz tick.
+
+## Outbound delivery-proof tracking
+
+Always on (the `s.rnsd.prove_incoming` dial — default 1, applied live
+to hosted destinations — only governs whether *we* prove inbound
+packets, i.e. PROVE_ALL vs PROVE_NONE; it does not affect outbound
+receipt tracking).
+
+**Opportunistic (mailbox / `RNSD_PORT_DEST`):** `OUT_RESULT` is emitted
+*twice* per send. `SENT` (status 0) goes out immediately on egress as
+before; rnsd then keeps the mR `PacketReceipt` in a bounded table
+(8 entries, oldest evicted with a synthetic timeout) correlated to the
+`send_id`, and emits a second `OUT_RESULT`:
+
+- `DELIVERED` (1) — the cryptographic delivery proof validated
+  (rtt_ms populated). Fired promptly via the receipt's delivery
+  callback (resolved by packet hash — mR callbacks carry no userdata).
+- `PROOF_TIMEOUT` (5) — no proof before the deadline (mR's own receipt
+  timeout, observed by polling, or the `s.rnsd.proof_timeout_s`
+  backstop, default 60). **Not a failure** — the packet may well have
+  arrived; the peer may simply not prove (their `prove_incoming` is
+  off) or the proof was lost.
+
+**Link packets (`RNSD_PORT_LINK`):** consumer bytes sent over a Link
+keep their receipt in the link slot (consumers serialize sends per
+link, so one slot suffices) and the 1 Hz `linkTick` publishes per-link
+counters to the existing storage tree:
+
+- `rnsd.links.<tag>.tx_proven` — packets with a validated delivery
+  proof (count).
+- `rnsd.links.<tag>.proof_timeouts` — packets whose proof never came
+  (count).
+
+Consumers (lxmf) baseline both at send time and watch for increments.
+Resource transfers don't use packet receipts — the Resource ACK
+(`RNSD_LINK_RESOURCE_OUTBOUND_DONE`) is already proof-grade.
 
 ## Conventions reticulous adds on top of spangap
 

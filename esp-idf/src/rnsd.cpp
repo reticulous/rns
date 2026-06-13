@@ -569,6 +569,155 @@ static void mailboxClearPending(mailbox_conn_t& c)
     c.pending.bytes.clear();
 }
 
+/* ─────────────── opportunistic delivery-proof tracking ───────────────
+ *
+ * After an opportunistic OUT_PACKET egresses we keep the mR PacketReceipt
+ * (correlated to send_id) and emit a SECOND OUT_RESULT when the delivery
+ * proof lands (DELIVERED) or the receipt times out (PROOF_TIMEOUT) — the
+ * immediate SENT result still goes out first, unchanged. Upstream peers
+ * prove opportunistic packets (their prove_incoming dial), so "no native
+ * ack" never held; this closes that loop.
+ *
+ * Delivery is mR-native: proof validation in Transport::inbound fires the
+ * receipt's delivery callback synchronously on this (rnsd) task — the same
+ * context onMailboxInbound already runs ITS sends from. Timeouts are NOT
+ * mR-native: PacketReceipt::check_timeout() flips status to FAILED/CULLED
+ * but never invokes the timeout callback (the upstream thread spawn is
+ * unported), so the 1 Hz mailboxReceiptTick() polls receipt status (our
+ * slot holds a copy of the shared receipt object) plus a wall-clock
+ * backstop deadline.
+ *
+ * mR callbacks carry no userdata: onMailboxReceiptDelivery resolves the
+ * slot by receipt (packet) hash — the registry-match trick the link table
+ * uses (linkFindByReqMrid). A slot settles exactly once: every settle path
+ * nulls the receipt's delivery callback and frees the slot *before*
+ * emitting, and the callback no-ops when no slot matches its hash, so a
+ * proof validating after eviction/timeout cannot double-emit or fire into
+ * a recycled slot. */
+
+#define RNSD_MAX_PENDING_RECEIPTS 8
+
+struct mailbox_receipt_t {
+    bool               used;
+    int                conn_idx;     /* index into s_mailbox_conns */
+    int                conn_handle;  /* guards conn-slot reuse */
+    uint16_t           send_id;
+    uint8_t            hops;
+    double             deadline;     /* OS::time() backstop */
+    RNS::PacketReceipt receipt{RNS::Type::NONE};
+};
+
+static mailbox_receipt_t* s_mailbox_receipts = nullptr;
+
+static void mailboxReceiptFree(mailbox_receipt_t& r)
+{
+    /* Null the callback first: Transport's _receipts list can keep the
+     * underlying receipt object alive past this slot, and a proof that
+     * validates later must not fire into a recycled slot. */
+    if (r.receipt) {
+        try { r.receipt.set_delivery_callback(nullptr); } catch (...) {}
+    }
+    r.receipt = RNS::PacketReceipt{RNS::Type::NONE};
+    r.used = false;
+}
+
+/* Free the slot, then emit the second OUT_RESULT iff the conn slot still
+ * belongs to the consumer that sent (guards conn-slot reuse). */
+static void mailboxReceiptSettle(mailbox_receipt_t& r, uint8_t status,
+                                 uint32_t rtt_ms)
+{
+    int      conn_idx    = r.conn_idx;
+    int      conn_handle = r.conn_handle;
+    uint16_t send_id     = r.send_id;
+    uint8_t  hops        = r.hops;
+    mailboxReceiptFree(r);
+    mailbox_conn_t& c = s_mailbox_conns[conn_idx];
+    if (c.used && c.handle == conn_handle)
+        mailboxSendOutResult(c, send_id, status, rtt_ms, hops);
+}
+
+/* mR delivery callback — runs on the rnsd task during Transport proof
+ * validation. No userdata; resolve by packet hash. */
+static void onMailboxReceiptDelivery(const RNS::PacketReceipt& receipt)
+{
+    if (!s_mailbox_receipts || !receipt) return;
+    for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++) {
+        mailbox_receipt_t& r = s_mailbox_receipts[j];
+        if (!r.used || !r.receipt) continue;
+        if (!(r.receipt.hash() == receipt.hash())) continue;
+        uint32_t rtt_ms = (uint32_t)(r.receipt.get_rtt() * 1000.0);
+        info("mailbox: send_id=%u delivery proven (rtt=%u ms)",
+             (unsigned)r.send_id, (unsigned)rtt_ms);
+        mailboxReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED, rtt_ms);
+        return;
+    }
+}
+
+static void mailboxReceiptTrack(mailbox_conn_t& c, uint16_t send_id,
+                                RNS::PacketReceipt& receipt, uint8_t hops)
+{
+    if (!s_mailbox_receipts || !receipt) return;
+    mailbox_receipt_t* slot = nullptr;
+    for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++)
+        if (!s_mailbox_receipts[j].used) { slot = &s_mailbox_receipts[j]; break; }
+    if (!slot) {
+        /* Bounded table: evict the oldest (nearest deadline), settling it
+         * as PROOF_TIMEOUT so the consumer's outbox resolves instead of
+         * waiting on a result that will never come. */
+        for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++)
+            if (!slot || s_mailbox_receipts[j].deadline < slot->deadline)
+                slot = &s_mailbox_receipts[j];
+        warn("mailbox: receipt table full — evicting send_id=%u",
+             (unsigned)slot->send_id);
+        mailboxReceiptSettle(*slot, RNSD_DEST_STATUS_PROOF_TIMEOUT, 0);
+    }
+    slot->used        = true;
+    slot->conn_idx    = (int)(&c - s_mailbox_conns);
+    slot->conn_handle = c.handle;
+    slot->send_id     = send_id;
+    slot->hops        = hops;
+    slot->deadline    = RNS::Utilities::OS::time()
+                      + storageGetInt("s.rnsd.proof_timeout_s", 60);
+    slot->receipt     = receipt;
+    receipt.set_delivery_callback(onMailboxReceiptDelivery);
+}
+
+/* 1 Hz from the rnsd loop, beside mailboxTickPending. */
+static void mailboxReceiptTick(void)
+{
+    if (!s_mailbox_receipts) return;
+    double now = RNS::Utilities::OS::time();
+    for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++) {
+        mailbox_receipt_t& r = s_mailbox_receipts[j];
+        if (!r.used) continue;
+        RNS::Type::PacketReceipt::Status st = r.receipt
+            ? r.receipt.status() : RNS::Type::PacketReceipt::FAILED;
+        if (st == RNS::Type::PacketReceipt::DELIVERED) {
+            /* Normally settled by the delivery callback; backstop in case
+             * a proof validated without it firing. */
+            mailboxReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED,
+                                 (uint32_t)(r.receipt.get_rtt() * 1000.0));
+        } else if (st != RNS::Type::PacketReceipt::SENT || now >= r.deadline) {
+            /* FAILED/CULLED — mR's own receipt timeout (Transport's sweep
+             * flips status but never fires timeout callbacks) — or our
+             * wall-clock backstop. Not a failure: the packet may well have
+             * arrived; the peer just didn't prove it (in time). */
+            info("mailbox: send_id=%u no delivery proof", (unsigned)r.send_id);
+            mailboxReceiptSettle(r, RNSD_DEST_STATUS_PROOF_TIMEOUT, 0);
+        }
+    }
+}
+
+/* Consumer conn closed — drop its pending receipts (nulls callbacks). */
+static void mailboxReceiptPurgeConn(int conn_idx)
+{
+    if (!s_mailbox_receipts) return;
+    for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++) {
+        mailbox_receipt_t& r = s_mailbox_receipts[j];
+        if (r.used && r.conn_idx == conn_idx) mailboxReceiptFree(r);
+    }
+}
+
 /* Debug: when `rnsd.debug.log_msg_content` (ephemeral, toggle live via
  * CLI/storage) is set, dump a stable FNV-1a/32 hash + printable preview
  * of a message payload. The on-send and after-decryption payloads are
@@ -662,9 +811,12 @@ static int mailboxTrySend(mailbox_conn_t& c, uint16_t send_id,
             return -1;
         }
         mailboxSendOutStatusBare(c, send_id, RNSD_DEST_AUX_EGRESS_QUEUED);
-        /* Opportunistic: there is no native ack, so we promote "sent" the
-         * moment Transport accepted the packet. See lxmf.md §15. */
+        /* Egress accepted → SENT immediately (the UI's fast grey check).
+         * Upstream peers prove opportunistic packets, so keep the receipt
+         * and follow up with a second OUT_RESULT — DELIVERED when the
+         * proof lands, PROOF_TIMEOUT otherwise. */
         mailboxSendOutResult(c, send_id, RNSD_DEST_STATUS_SENT, 0, hops);
+        mailboxReceiptTrack(c, send_id, receipt, hops);
         RNS::Interface oif = RNS::Transport::next_hop_interface(dh);
         info("mailbox: send_id=%u sent to %s via %s (hops=%u, %zuB payload)",
              (unsigned)send_id, dh.toHex().c_str(),
@@ -778,6 +930,18 @@ static int onMailboxConnect(int handle, const void* data, size_t len)
          * inbound LRs spawn Link objects with no callbacks attached. */
         d.accepts_links(false);
         d.set_packet_callback(onMailboxInbound);
+        /* Delivery proofs are an operator dial: s.rnsd.prove_incoming
+         * (default ON, like upstream LXMF's delivery destinations — senders
+         * of opportunistic / direct packets keep a PacketReceipt and settle
+         * DELIVERED on our proof; without it every peer's send to us "times
+         * out" on their side and they retry / fall back to propagation, even
+         * though we displayed the message). OFF = mR's PROVE_NONE: receive
+         * silently, at the cost of senders treating us as undeliverable.
+         * Live-mirrored onto open destinations by the NOW_AND_ON_CHANGE sub
+         * in rnsdTaskMain; per-peer granularity (PROVE_APP) is a later dial. */
+        d.set_proof_strategy(storageGetInt("s.rnsd.prove_incoming", 1)
+                                 ? RNS::Type::Destination::PROVE_ALL
+                                 : RNS::Type::Destination::PROVE_NONE);
         slot->listener_identity = id;
         slot->listener_dest     = d;
         slot->listener_hash     = d.hash();
@@ -809,6 +973,7 @@ static void onMailboxDisconnect(int ref)
     if (!c.used) return;
     info("mailbox conn %d close (dest=%s)", ref,
          c.listener_hash ? c.listener_hash.toHex().c_str() : "-");
+    mailboxReceiptPurgeConn(ref);
     if (c.listener_dest) {
         try { RNS::Transport::deregister_destination(c.listener_dest); }
         catch (const std::exception& e) { warn("deregister_destination threw: %s", e.what()); }
@@ -2242,23 +2407,37 @@ static void cliRnprobe(const char* args)
                 uint8_t  hops   = buf[8];
                 switch (status) {
                     case RNSD_DEST_STATUS_SENT:
-                        cliPrintf("sent to %s: hops=%u\n", short_hash.c_str(), (unsigned)hops);
+                        /* Non-terminal: a second OUT_RESULT follows when
+                         * the delivery proof lands or times out. */
+                        cliPrintf("sent to %s: hops=%u (awaiting proof)\n",
+                                  short_hash.c_str(), (unsigned)hops);
                         break;
                     case RNSD_DEST_STATUS_DELIVERED:
                         cliPrintf("delivered to %s: rtt=%u ms hops=%u\n",
                                   short_hash.c_str(), (unsigned)rtt_ms, (unsigned)hops);
+                        done = true;
+                        break;
+                    case RNSD_DEST_STATUS_PROOF_TIMEOUT:
+                        cliPrintf("no delivery proof from %s\n", short_hash.c_str());
+                        done = true;
                         break;
                     case RNSD_DEST_STATUS_CANCELLED:
                         cliPrintf("cancelled probe to %s\n", short_hash.c_str());
+                        done = true;
                         break;
                     case RNSD_DEST_STATUS_EVICTED:
                         cliPrintf("evicted: rnsd dropped the probe (resource limit)\n");
+                        done = true;
+                        break;
+                    case RNSD_DEST_STATUS_FAILED:
+                        cliPrintf("failed: no route to %s\n", short_hash.c_str());
+                        done = true;
                         break;
                     default:
                         cliPrintf("rnprobe: unknown OUT_RESULT status %u\n", (unsigned)status);
+                        done = true;
                         break;
                 }
-                done = true;
                 break;
             }
             case RNSD_DEST_OUT_STATUS: {
@@ -2847,6 +3026,16 @@ struct link_conn_t {
     bool                 pend_used;     /* one-packet pre-active outbox */
     std::vector<uint8_t> pend_bytes;
 
+    /* Delivery-proof tracking for consumer packets sent over this Link.
+     * lxmf serializes sends per link (at most one unsettled outbound), so
+     * one receipt slot suffices and the per-link counters published to
+     * rnsd.links.<tag>.{tx_proven,proof_timeouts} are unambiguous.
+     * linkTick polls the receipt status — mR validates link-packet proofs
+     * and flips the receipt DELIVERED, but never fires timeout callbacks,
+     * so both outcomes are observed by polling. */
+    RNS::PacketReceipt   tx_receipt{RNS::Type::NONE};
+    double               tx_receipt_deadline;   /* 0 = none pending */
+
     /* Phase F resource transfer (link.md §9). One in-flight resource
      * per link in v1 (the §9.5 soak is sequential). consumer_task is
      * where the rnsd_link_resource_done_t aux is delivered. */
@@ -2988,6 +3177,28 @@ static void linkSetInt(const link_conn_t& c, const char* field, int v)
     storageSet(k, v);
 }
 
+static void linkBumpInt(link_conn_t& c, const char* field)
+{
+    char k[96];
+    linkKey(c, field, k, sizeof(k));
+    storageSet(k, storageGetInt(k, 0) + 1);
+}
+
+/* Adopt the receipt of a just-sent consumer packet for proof tracking. */
+static void linkTrackTxReceipt(link_conn_t& c, const RNS::PacketReceipt& receipt)
+{
+    if (!receipt) return;
+    if (c.tx_receipt) {
+        /* A previous send is still unsettled (consumers are expected to
+         * serialize) — close it out as unproven before replacing, so the
+         * counters always account for every tracked send. */
+        linkBumpInt(c, "proof_timeouts");
+    }
+    c.tx_receipt = receipt;
+    c.tx_receipt_deadline = RNS::Utilities::OS::time()
+                          + storageGetInt("s.rnsd.proof_timeout_s", 60);
+}
+
 static void linkPublishState(link_conn_t& c)
 {
     linkSetStr(c, "state", lstName(c.state));
@@ -3086,6 +3297,10 @@ static void onLinkEstablishedCb(RNS::Link& link)
     linkSetInt(*c, "mtu", (int)link.get_mtu());
     linkSetInt(*c, "rtt_ms", (int)(link.rtt() * 1000.0));
     linkSetInt(*c, "activated_s", (int)RNS::Utilities::OS::time());
+    /* Per-link delivery-proof counters (consumers baseline these at send
+     * time and watch for increments — publish zeros so the keys exist). */
+    linkSetInt(*c, "tx_proven", 0);
+    linkSetInt(*c, "proof_timeouts", 0);
     linkPublishState(*c);
     /* Reverse index for inbound/link_id-only lookups (Phase D uses it). */
     {
@@ -3099,7 +3314,7 @@ static void onLinkEstablishedCb(RNS::Link& link)
         try {
             RNS::Packet pkt(c->link,
                             RNS::Bytes(c->pend_bytes.data(), c->pend_bytes.size()));
-            pkt.send();
+            linkTrackTxReceipt(*c, pkt.send());
             linkSetInt(*c, "tx_packets", 1);
             linkSetInt(*c, "last_outbound_s", (int)RNS::Utilities::OS::time());
             info("link[%s]: flushed queued %zuB on establish",
@@ -3534,6 +3749,8 @@ static void linkFreeSlot(link_conn_t& c)
     c.identity_key.clear();
     c.pend_used = false;
     c.pend_bytes.clear();
+    c.tx_receipt = RNS::PacketReceipt{RNS::Type::NONE};
+    c.tx_receipt_deadline = 0;
     if (c.pend_res_used && c.pend_res_buf) free(c.pend_res_buf);
     c.pend_res_used = false;
     c.pend_res_buf = nullptr;
@@ -3568,6 +3785,28 @@ static void linkTick(void)
     for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++) {
         link_conn_t& c = s_link_conns[j];
         if (!c.used) continue;
+
+        /* Settle the outstanding packet delivery-proof receipt, if any.
+         * mR validates link-packet proofs (flipping the receipt to
+         * DELIVERED) but never fires timeout callbacks, so poll status —
+         * the receipt object is shared with Transport's _receipts list. */
+        if (c.tx_receipt) {
+            RNS::Type::PacketReceipt::Status pst = c.tx_receipt.status();
+            if (pst == RNS::Type::PacketReceipt::DELIVERED) {
+                linkBumpInt(c, "tx_proven");
+                info("link[%s]: packet delivery proven (rtt=%d ms)",
+                     c.tag, (int)(c.tx_receipt.get_rtt() * 1000.0));
+                c.tx_receipt = RNS::PacketReceipt{RNS::Type::NONE};
+                c.tx_receipt_deadline = 0;
+            } else if (pst != RNS::Type::PacketReceipt::SENT ||
+                       (c.tx_receipt_deadline != 0 &&
+                        now >= c.tx_receipt_deadline)) {
+                linkBumpInt(c, "proof_timeouts");
+                info("link[%s]: packet delivery proof timed out", c.tag);
+                c.tx_receipt = RNS::PacketReceipt{RNS::Type::NONE};
+                c.tx_receipt_deadline = 0;
+            }
+        }
 
         /* Request timeout backstop. µR does not drive RequestReceipt
          * timeouts (the upstream response-timeout thread isn't ported),
@@ -3759,7 +3998,7 @@ static void onLinkRecv(int handle, size_t /*bytesAvail*/)
         }
         try {
             RNS::Packet pkt(c->link, RNS::Bytes(buf, n));
-            pkt.send();
+            linkTrackTxReceipt(*c, pkt.send());
             linkTouch(*c);
             char k[96];
             linkKey(*c, "tx_packets", k, sizeof(k));
@@ -4322,12 +4561,16 @@ static void rnsdTaskMain(void*)
         RNSD_MAX_MAILBOX_CONNS * sizeof(mailbox_conn_t), MALLOC_CAP_SPIRAM);
     s_link_conns = (link_conn_t*)heap_caps_malloc(
         RNSD_MAX_LINK_CONNS * sizeof(link_conn_t), MALLOC_CAP_SPIRAM);
-    if (!s_ifaces || !s_mailbox_conns || !s_link_conns) {
+    s_mailbox_receipts = (mailbox_receipt_t*)heap_caps_malloc(
+        RNSD_MAX_PENDING_RECEIPTS * sizeof(mailbox_receipt_t), MALLOC_CAP_SPIRAM);
+    if (!s_ifaces || !s_mailbox_conns || !s_link_conns || !s_mailbox_receipts) {
         err("rnsd table PSRAM alloc failed"); killSelf();
     }
     for (int j = 0; j < RNSD_MAX_IFACES; j++)        new (&s_ifaces[j])        iface_t{};
     for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++) new (&s_mailbox_conns[j]) mailbox_conn_t{};
     for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)    new (&s_link_conns[j])    link_conn_t{};
+    for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++)
+        new (&s_mailbox_receipts[j]) mailbox_receipt_t{};
 
     /* Gate the entire rnsd ITS/Transport surface on a known-valid clock (or a
      * bounded wait), BEFORE opening any ITS port. Standing the ports up first —
@@ -4431,6 +4674,17 @@ static void rnsdTaskMain(void*)
      * route, so Identity::recall fails and rnprobe can't proceed. Default 1000. */
     NOW_AND_ON_CHANGE("s.rnsd.identity.cache_max", {
         RNS::Identity::known_destinations_maxsize(storageGetInt(key, 1000));
+    });
+    /* Delivery-proof dial (see the mailbox-dest comment): applies to every
+     * already-open consumer destination, and mailboxOpen reads the same key
+     * for new ones. */
+    NOW_AND_ON_CHANGE("s.rnsd.prove_incoming", {
+        auto strat = storageGetInt(key, 1) ? RNS::Type::Destination::PROVE_ALL
+                                           : RNS::Type::Destination::PROVE_NONE;
+        if (s_mailbox_conns)
+            for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++)
+                if (s_mailbox_conns[j].used && s_mailbox_conns[j].listener_dest)
+                    s_mailbox_conns[j].listener_dest.set_proof_strategy(strat);
     });
     /* Path table: engages BasicHeapStore set_max_recs (uncapped until now —
      * only the 24h TTL pruned it). */
@@ -4543,6 +4797,7 @@ static void rnsdTaskMain(void*)
                 try { RNS::Transport::jobs(); }
                 catch (const std::exception& e) { warn("Transport::jobs threw: %s", e.what()); }
                 mailboxTickPending();
+                mailboxReceiptTick();
                 linkTick();
 
                 /* Rnsd-hosted announces — debounce fire + periodic check.

@@ -220,13 +220,22 @@ typedef struct {
 static_assert(sizeof(rnsd_link_incoming_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_incoming_t must fit ITS_MAX_MSG_DATA");
 
-/** OUT_RESULT.status. */
+/** OUT_RESULT.status.
+ *
+ *  Opportunistic sends emit OUT_RESULT *twice*: SENT immediately on
+ *  egress (transfer accepted by Transport), then a second result when
+ *  the delivery proof lands (DELIVERED) or the receipt times out
+ *  (PROOF_TIMEOUT). PROOF_TIMEOUT is not a failure — the packet may
+ *  well have arrived; the peer may simply not prove (their
+ *  prove_incoming dial is off) or the proof was lost. */
 enum : uint8_t {
-    RNSD_DEST_STATUS_SENT      = 0,   /* opportunistic egress acknowledged */
-    RNSD_DEST_STATUS_DELIVERED = 1,   /* DIRECT link-proof received */
-    RNSD_DEST_STATUS_CANCELLED = 2,   /* client wrote OUT_CANCEL */
-    RNSD_DEST_STATUS_EVICTED   = 3,   /* rnsd buffer/memory limit */
-    RNSD_DEST_STATUS_FAILED    = 4,   /* gave up — no route found before deadline */
+    RNSD_DEST_STATUS_SENT          = 0,  /* opportunistic egress acknowledged */
+    RNSD_DEST_STATUS_DELIVERED     = 1,  /* cryptographic delivery proof received */
+    RNSD_DEST_STATUS_CANCELLED     = 2,  /* client wrote OUT_CANCEL */
+    RNSD_DEST_STATUS_EVICTED       = 3,  /* rnsd buffer/memory limit */
+    RNSD_DEST_STATUS_FAILED        = 4,  /* gave up — no route found before deadline */
+    RNSD_DEST_STATUS_PROOF_TIMEOUT = 5,  /* no delivery proof before the receipt
+                                          * deadline (follows an earlier SENT) */
 };
 
 /** OUT_STATUS.type — aux progress narration. See lxmf.md §5.2. */

@@ -875,8 +875,13 @@ bool PacketReceipt::validate_link_proof(const Bytes& proof, const Link& link, co
 		Bytes proof_hash = proof.left(Type::Identity::HASHLENGTH/8);
 		Bytes signature = proof.mid(Type::Identity::HASHLENGTH/8, Type::Identity::SIGLENGTH/8);
 		if (proof_hash == _object->_hash) {
-			//z if (link.validate(signature, _object->_hash)) {
-			if (false) {
+			/* Was stubbed (`if (false)`) — Link::validate exists and verifies
+			 * against the peer's link signing key, so enable it. Without this
+			 * a packet sent over a Link can never conclude its PacketReceipt
+			 * (DELIVERED), which rnsd's per-link proof counters rely on.
+			 * const_cast mirrors Transport::inbound's handling of links from
+			 * the active set (Link state lives behind a shared_ptr). */
+			if (const_cast<Link&>(link).validate(signature, _object->_hash)) {
 				_object->_status = DELIVERED;
 				_object->_proved = true;
 				_object->_concluded_at = OS::time();
