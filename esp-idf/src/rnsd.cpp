@@ -4755,6 +4755,35 @@ static void rnsdTaskMain(void*)
     storageSet("rnsd.up", 1);
     if (s_identity) storageSet("rnsd.identity_hash", s_identity->hexhash().c_str());
 
+    /* ── Boot barrier: publish rns.ready (ephemeral) ─────────────────────────
+     * rnsd's ports are open now, but the whole RNS universe stays quiet until
+     * this fires: every iface/client gates its task body on rns.ready before it
+     * connects, registers, or transmits. Three reasons to hold off:
+     *   1. mesh hygiene — a node stuck in a brownout / boot-loop must never reach
+     *      the transmit phase and spam the shared LoRa/ESPnow medium, so we
+     *      enforce a hard minimum-settle floor (10 s, hardcoded below; a proper
+     *      per-interface safeguard for dangerous RF ifaces is planned);
+     *   2. no announces under a pre-sync ~1970 clock (waitForTime already ran
+     *      before we opened ports, so the clock wait is folded into uptime here);
+     *   3. don't engage before the network we depend on is up — but only when
+     *      WiFi is actually configured: net publishes net.want / net.up via
+     *      ephemeral storage, so rns needs no net dependency and a net-less LoRa
+     *      build skips the wait entirely.
+     * All waits are bounded, so rns.ready is guaranteed to fire. */
+    if (storageGetInt("net.want", 0))
+        waitForFlag("net.up", storageGetInt("s.net.up_wait_s", 20));
+    {
+        /* Hard minimum-settle floor — a brownout/boot-loop node never survives
+         * this long, so it can't reach the transmit phase and spam the mesh.
+         * Hardcoded for now; a per-interface safeguard for dangerous (RF) ifaces
+         * is planned to supersede this blanket delay. */
+        const uint32_t settle_ms = 10000;
+        uint32_t up = millis();
+        if (up < settle_ms) vTaskDelay(pdMS_TO_TICKS(settle_ms - up));
+    }
+    storageSet("rns.ready", 1);
+    info("rns: ready to engage (uptime %lu ms)\n", (unsigned long)millis());
+
     /* Runtime-tunable mR caps/TTLs/cadence. Each fires once now (applying the
      * current stored value, or the fallback default if unset) and re-applies
      * on later `set`. Fallbacks are the working defaults; operators override
