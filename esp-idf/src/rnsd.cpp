@@ -520,6 +520,40 @@ static mailbox_conn_t* mailboxAlloc(void)
 
 /* Frame helpers. Headers are small; we stack-allocate. */
 
+/* Human-readable OUT_STATUS.type (RNSD_DEST_AUX_* in ports.h). Static
+ * fallback buffer is fine: callers all run on the rnsd/CLI task and the
+ * value is consumed by the log/print call immediately. */
+static const char* destAuxName(uint8_t type)
+{
+    switch (type) {
+        case RNSD_DEST_AUX_REQUESTING_PATH:   return "requesting_path";
+        case RNSD_DEST_AUX_PATH_KNOWN:        return "path_known";
+        case RNSD_DEST_AUX_EGRESS_QUEUED:     return "egress_queued";
+        case RNSD_DEST_AUX_LINK_ESTABLISHING: return "link_establishing";
+        case RNSD_DEST_AUX_RESOURCE_PROGRESS: return "resource_progress";
+        case RNSD_DEST_AUX_RETRY:             return "retry";
+        case RNSD_DEST_AUX_PATH_LOST:         return "path_lost";
+        default: {
+            static char b[24];
+            snprintf(b, sizeof(b), "unknown(0x%02x)", (unsigned)type);
+            return b;
+        }
+    }
+}
+
+/* Human-readable RNSD_DEST_AUX_RETRY reason byte. */
+static const char* destRetryReasonName(uint8_t reason)
+{
+    switch (reason) {
+        case RNSD_DEST_RETRY_REASON_PATH_TIMEOUT: return "path timeout";
+        default: {
+            static char b[24];
+            snprintf(b, sizeof(b), "unknown(0x%02x)", (unsigned)reason);
+            return b;
+        }
+    }
+}
+
 static void mailboxSendOutResult(mailbox_conn_t& c, uint16_t send_id,
                                  uint8_t status, uint32_t rtt_ms, uint8_t hops)
 {
@@ -545,8 +579,8 @@ static void mailboxSendOutStatusBare(mailbox_conn_t& c, uint16_t send_id, uint8_
     f[2] = (uint8_t)(send_id & 0xFF);
     f[3] = type;
     if (itsSend(c.handle, f, sizeof(f), pdMS_TO_TICKS(100)) == 0)
-        warn("mailbox: OUT_STATUS send dropped (send_id=%u type=0x%02x)",
-             (unsigned)send_id, (unsigned)type);
+        warn("mailbox: OUT_STATUS send dropped (send_id=%u type=%s)",
+             (unsigned)send_id, destAuxName(type));
 }
 
 static void mailboxSendOutStatusRetry(mailbox_conn_t& c, uint16_t send_id,
@@ -1126,7 +1160,7 @@ static void mailboxTickPending(void)
             c.pending.attempts++;
             mailboxSendOutStatusRetry(c, c.pending.send_id,
                                       (uint8_t)std::min(c.pending.attempts, 255),
-                                      /*reason=path_timeout*/ 0x01);
+                                      RNSD_DEST_RETRY_REASON_PATH_TIMEOUT);
             c.pending.last_request_path_at = now;
         }
     }
@@ -2452,13 +2486,13 @@ static void cliRnprobe(const char* args)
                         break;
                     case RNSD_DEST_AUX_RETRY:
                         if (got >= 6)
-                            cliPrintf("retry (attempt %u, reason 0x%02x)\n",
-                                      (unsigned)buf[4], (unsigned)buf[5]);
+                            cliPrintf("retry (attempt %u, reason %s)\n",
+                                      (unsigned)buf[4], destRetryReasonName(buf[5]));
                         else
                             cliPrintf("retry\n");
                         break;
                     default:
-                        cliPrintf("status 0x%02x\n", (unsigned)type);
+                        cliPrintf("status %s\n", destAuxName(type));
                         break;
                 }
                 break;
@@ -2821,6 +2855,24 @@ static void onCmdRequestPath(const char* key, const char* val)
  * `rnsd link teardown` drops the active probe link (if any). Without
  * that, a stuck-in-PENDING link stays until mR's stale-time cull. */
 
+/* Human-readable Link teardown reason (mR Type.h teardown_reason).
+ * Link callbacks all run on the rnsd task, so the static fallback
+ * buffer is safe. */
+static const char* tdrName(unsigned reason)
+{
+    switch (reason) {
+        case RNS::Type::Link::TEARDOWN_NONE:      return "none";
+        case RNS::Type::Link::TIMEOUT:            return "timeout";
+        case RNS::Type::Link::INITIATOR_CLOSED:   return "initiator closed";
+        case RNS::Type::Link::DESTINATION_CLOSED: return "destination closed";
+        default: {
+            static char b[24];
+            snprintf(b, sizeof(b), "unknown(%u)", reason);
+            return b;
+        }
+    }
+}
+
 static RNS::Link s_probe_link{RNS::Type::NONE};
 
 static void onProbeLinkEstablished(RNS::Link& link)
@@ -2850,8 +2902,8 @@ static void onProbeLinkEstablished(RNS::Link& link)
 
 static void onProbeLinkClosed(RNS::Link& link)
 {
-    info("rnsd link: CLOSED reason=%u",
-         (unsigned)link.teardown_reason());
+    info("rnsd link: CLOSED reason=%s",
+         tdrName((unsigned)link.teardown_reason()));
     /* Single-slot design — clear unconditionally so the next `rnsd link
      * <hash>` doesn't trip the "previous probe link still exists" branch.
      * Comparing &link == &s_probe_link wouldn't work: mR copies Link
@@ -3356,7 +3408,7 @@ static void onLinkClosedCb(RNS::Link& link)
     link_conn_t* c = linkFindByLink(link);
     if (!c) return;   /* already culled */
     unsigned reason = (unsigned)link.teardown_reason();
-    info("link[%s]: CLOSED reason=%u", c->tag, reason);
+    info("link[%s]: CLOSED reason=%s", c->tag, tdrName(reason));
     c->state   = LST_CLOSED;
     c->dead_at = RNS::Utilities::OS::time();
     if (reason == (unsigned)RNS::Type::Link::TIMEOUT)
@@ -3409,6 +3461,23 @@ static link_conn_t* linkFindByResHash(const RNS::Bytes& h)
     return nullptr;
 }
 
+/* Human-readable resource/request aux opcode (RNSD_LINK_* in ports.h). */
+static const char* lnkAuxOpName(uint8_t opcode)
+{
+    switch (opcode) {
+        case RNSD_LINK_RESOURCE_INBOUND_DONE:  return "resource_inbound_done";
+        case RNSD_LINK_RESOURCE_OUTBOUND_DONE: return "resource_outbound_done";
+        case RNSD_LINK_RESOURCE_FAILED:        return "resource_failed";
+        case RNSD_LINK_REQUEST_RESPONSE:       return "request_response";
+        case RNSD_LINK_REQUEST_FAILED:         return "request_failed";
+        default: {
+            static char b[24];
+            snprintf(b, sizeof(b), "unknown(%u)", (unsigned)opcode);
+            return b;
+        }
+    }
+}
+
 /* One small ITS aux frame to the consumer's resource-aux port (§9.1). */
 static void resSendAux(link_conn_t& c, uint8_t opcode,
                        void* buf, uint32_t len, uint8_t flags)
@@ -3431,7 +3500,8 @@ static void resSendAux(link_conn_t& c, uint8_t opcode,
     d.flags     = flags;
     if (!itsSendAuxByTaskHandle(c.consumer_task, LXMF_LINK_RESOURCE_AUX_PORT,
                                 &d, sizeof(d), pdMS_TO_TICKS(2000))) {
-        warn("link[%s]: resource aux send failed (op=%u)", c.tag, opcode);
+        warn("link[%s]: resource aux send failed (op=%s)",
+             c.tag, lnkAuxOpName(opcode));
         if (buf) free(buf);   /* consumer never took ownership */
     }
 }
@@ -3474,6 +3544,27 @@ static bool onResAdvertised(const RNS::ResourceAdvertisement& adv)
     return true;
 }
 
+/* Human-readable mR resource engine status (Type.h Resource::status). */
+static const char* resStatusName(int s)
+{
+    switch (s) {
+        case RNS::Type::Resource::NONE:           return "none";
+        case RNS::Type::Resource::QUEUED:         return "queued";
+        case RNS::Type::Resource::ADVERTISED:     return "advertised";
+        case RNS::Type::Resource::TRANSFERRING:   return "transferring";
+        case RNS::Type::Resource::AWAITING_PROOF: return "awaiting_proof";
+        case RNS::Type::Resource::ASSEMBLING:     return "assembling";
+        case RNS::Type::Resource::COMPLETE:       return "complete";
+        case RNS::Type::Resource::FAILED:         return "failed";
+        case RNS::Type::Resource::CORRUPT:        return "corrupt";
+        default: {
+            static char b[24];
+            snprintf(b, sizeof(b), "unknown(%d)", s);
+            return b;
+        }
+    }
+}
+
 static void onResConcluded(const RNS::Resource& r)
 {
     link_conn_t* c = linkFindByResHash(r.hash());
@@ -3509,9 +3600,9 @@ static void onResConcluded(const RNS::Resource& r)
         snprintf(st, sizeof(st), "failed:%s:%d",
                  c->res_outbound ? "out" : "in", (int)r.status());
         linkKey(*c, "resource.state", k, sizeof(k)); storageSet(k, st);
-        warn("link[%s]: resource %s failed (status=%d)",
+        warn("link[%s]: resource %s failed (status=%s)",
              c->tag, c->res_outbound ? "outbound" : "inbound",
-             (int)r.status());
+             resStatusName((int)r.status()));
         resSendAux(*c, RNSD_LINK_RESOURCE_FAILED, nullptr, 0, 0);
     }
     c->res_hash     = RNS::Bytes();
@@ -3576,7 +3667,8 @@ static void reqSendAux(link_conn_t& c, uint8_t opcode, void* buf, uint32_t len)
     d.opaque_id = c.req_cid;
     if (!itsSendAuxByTaskHandle(c.req_task, c.req_port, &d, sizeof(d),
                                 pdMS_TO_TICKS(2000))) {
-        warn("link[%s]: request aux send failed (op=%u)", c.tag, opcode);
+        warn("link[%s]: request aux send failed (op=%s)",
+             c.tag, lnkAuxOpName(opcode));
         if (buf) free(buf);   /* consumer never took ownership */
     }
 }

@@ -249,6 +249,12 @@ enum : uint8_t {
     RNSD_DEST_AUX_PATH_LOST         = 0x07,
 };
 
+/** RNSD_DEST_AUX_RETRY reason byte. */
+enum : uint8_t {
+    RNSD_DEST_RETRY_REASON_PATH_TIMEOUT = 0x01,  /* path request unanswered,
+                                                  * asked the network again */
+};
+
 /** Connect payload for RNSD_PORT_ANNOUNCES. Optional aspect filter — if
  *  non-empty, rnsd only delivers announces whose destination hash
  *  matches `Destination::hash_from_name_and_identity(aspect, identity)`,
