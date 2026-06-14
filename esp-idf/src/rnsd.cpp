@@ -9,6 +9,7 @@
  * See docs/component-plan.md §11.
  */
 #include "rnsd.h"
+#include "mem.h"
 #include "spangap.h"
 #include "ports.h"
 
@@ -3575,7 +3576,7 @@ static void onResConcluded(const RNS::Resource& r)
     if (ok && !c->res_outbound) {
         const RNS::Bytes& d = r.data();
         size_t len = d.size();
-        void* buf = (len > 0) ? malloc(len) : nullptr;
+        void* buf = (len > 0) ? gp_alloc(len) : nullptr;
         if (len > 0 && !buf) {
             warn("link[%s]: resource malloc %zuB failed", c->tag, len);
             resSendAux(*c, RNSD_LINK_RESOURCE_FAILED, nullptr, 0, 0);
@@ -3692,7 +3693,7 @@ static void onReqResponseCb(const RNS::RequestReceipt& rr)
     linkTouch(*c);
     RNS::Bytes resp = rr.get_response();
     size_t len = resp.size();
-    void* buf = (len > 0) ? malloc(len) : nullptr;
+    void* buf = (len > 0) ? gp_alloc(len) : nullptr;
     if (len > 0 && !buf) {
         warn("link[%s]: response malloc %zuB failed", c->tag, len);
         reqSendAux(*c, RNSD_LINK_REQUEST_FAILED, nullptr, 0);
