@@ -39,11 +39,16 @@ components/microreticulum/
     │   │                       # re-vendored from spangap-core's
     │   │                       # esp_wireguard tree — X25519 ECDH.
     │   └── x25519-license.txt  # MIT attribution for x25519.c
-    ├── Cryptography/           # AES, CBC, HKDF, HMAC, Hashes, Ed25519, X25519,
-    │                           # Fernet, PKCS7, Random, Token — TODO: wrappers
-    │                           # need to call into donna/ + mbedTLS.
-    ├── Persistence/            # DestinationEntry — TODO: ArduinoJson swap
-    └── Utilities/              # OS, Memory, Crc, Persistence, tlsf
+    ├── Cryptography/           # Hashes, HKDF, Fernet, Token, X25519, Ed25519
+    │                           # rewritten against donna/ + mbedTLS; AES, HMAC,
+    │                           # Random, PKCS7 header-only; CBC dropped.
+    ├── Persistence/            # DestinationEntry — ArduinoJson dependency dropped.
+    ├── Utilities/              # OS, Memory, Crc, Persistence, tlsf
+    ├── MsgPack.h               # hand-rolled msgpack shim (Packer/Unpacker/
+    │                           # bin_t<uint8_t>) — replaces hideakitai/MsgPack.
+    └── *.cpp / *.h             # core engine, all in the build: Bytes, Identity,
+                                # Destination, Interface, Packet, Resource,
+                                # Channel, Transport, Reticulum, Link, + Type.h.
 ```
 
 `microStore` is vendored under `include/microStore/` rather than declared as
@@ -87,49 +92,41 @@ fails to track through the inlining).
     `libmicroreticulum.a`. The wrapper rewrite in `src/Cryptography/X25519.cpp`
     + `Ed25519.cpp` will call into these directly.
 
-## Phase 0 — what's NOT done yet
+## Port status (beyond Phase 0)
 
-The component compiles as an empty library — `MICRORET_SRCS` in
-[CMakeLists.txt](CMakeLists.txt) is empty. Each upstream `.cpp` gets added
-to the list as its dependencies are ported. The remaining work is the bulk
-of Phase 0:
+The library is now substantially ported. `MICRORET_SRCS` in
+[CMakeLists.txt](CMakeLists.txt) lists the full core engine — `Bytes`,
+`Identity`, `Destination`, `Interface`, `Packet`, `Resource`, `Channel`,
+`Transport`, `Reticulum`, and `Link` — plus the `Cryptography/`, `Utilities/`,
+and `Persistence/` support modules and the `donna/` crypto primitives.
+**`CMakeLists.txt` is the source of truth for what compiles** — consult it,
+not prose, before assuming a file is or isn't in the build.
 
-1. **Crypto rewrite (`src/Cryptography/`).** Upstream's `<AES.h>`,
-   `<SHA256.h>`, `<SHA512.h>`, `<Hash.h>`, `<HKDF.h>`, `<Curve25519.h>`,
-   `<Ed25519.h>` come from `attermann/Crypto` (a fork of `rweather/Crypto`).
-   The wrappers in `src/Cryptography/` need their bodies rewritten against:
-   - **mbedTLS** — AES-CBC, HMAC, HKDF, SHA-256/512, Fernet primitives,
-     RNG (`mbedtls_ctr_drbg` or `esp_fill_random`). All already linked.
-   - **`donna/x25519.h`** — `x25519(out, scalar, point, /*clamp=*/1)` for
-     `RNS::Cryptography::X25519PrivateKey::exchange`. Use `x25519_base()`
-     for public-key derivation.
-   - **`donna/ed25519.h`** — `ed25519_publickey`, `ed25519_sign`,
-     `ed25519_sign_open` for `RNS::Cryptography::Ed25519*` wrappers.
-   The `RNS::Cryptography::*` wrapper class signatures stay; only the
-   bodies change. Bench numbers required (plan §19): X25519 scalar mult,
-   Ed25519 sign/verify on the T-Deck S3.
+Resolved since the original Phase 0 plan:
 
-2. **`ArduinoJson → cJSON`.** `ArduinoJson.h` is included by `Bytes.h`,
-   `Interface.h`, `Packet.h`, `Utilities/Persistence.h`, and used as a
-   serialization backbone in `Packet.cpp`, `Interface.cpp`,
-   `Utilities/Persistence.cpp`, with type-conversion specializations in
-   the headers. cJSON ships as ESP-IDF's `json` component (already in
-   `REQUIRES`); the call sites need source-level rewrites.
+1. **Crypto rewrite (`src/Cryptography/`)** — done. `Hashes`, `HKDF`, `Fernet`,
+   `Token`, `X25519`, `Ed25519` are rewritten against mbedTLS + `donna/`
+   (X25519 via `donna/x25519.h`, Ed25519 via `donna/ed25519.h`); `AES.h`,
+   `HMAC.h`, `Random.h`, `PKCS7.h` are header-only; `CBC` was dropped.
 
-3. **`MsgPack → msgpack-c`.** `<MsgPack.h>` (Arduino lib) is used heavily
-   in `Link.cpp` for `Packer`/`Unpacker`/`bin_t<uint8_t>` around request
-   IDs, request data, response data. msgpack-c needs to be added as a
-   managed dep (or vendored); `Link.cpp` rewritten.
+2. **`ArduinoJson → cJSON`** — the ArduinoJson dependency is gone. The
+   `convertToJson`/`convertFromJson` adapters in `Bytes.h`, `Interface.{h,cpp}`,
+   and `Packet.{h,cpp}` are removed or block-commented; `json` stays in
+   `REQUIRES` for the cJSON path.
 
-4. **Strip remaining `#ifdef ARDUINO` branches** from `Reticulum.cpp`,
-   `Packet.cpp`, `Interface.cpp/h`, `Bytes.h`, `Packet.h`, `Log.h`,
-   `Memory.cpp`, `OS.h`, `Persistence.h`. None of those branches activate
-   without `ARDUINO` defined, so they're inert — but cleaning them up
-   reduces surprise during ports.
+3. **`MsgPack`** — solved without a msgpack-c dep. The hand-rolled
+   [`src/MsgPack.h`](src/MsgPack.h) shim covers the narrow `Packer`/`Unpacker`/
+   `bin_t<uint8_t>` surface `Link.cpp` uses (Phase A of `docs/plans/link.md`).
+   This is why **`Link.cpp` is in the build** and `Link_stub.cpp` is gone.
 
-5. **Wire up `microreticulum` to `main/`.** Currently `main/CMakeLists.txt`
-   only requires `spangap-core`; once at least one µR header is consumed
-   by `rnsd.cpp`, add `microreticulum` to the REQUIRES list there.
+4. **`microreticulum` wired into the build** — `rnsd.cpp` consumes µR types
+   (`RNS::Link`, `RNS::Resource`, `RNS::Type::*`) directly.
+
+Genuine remaining cleanup:
+
+- **Strip the inert `#ifdef ARDUINO` branches** still present in
+  `Reticulum.cpp`, `Log.h`, `Transport.cpp`, and `Utilities/OS.h`. None
+  activate without `ARDUINO` defined, so they're harmless — purely a tidy-up.
 
 ## Resolved design issues
 
@@ -218,3 +215,24 @@ registered (so its include path becomes available to consumers via
 
 As each upstream `.cpp` is ported, add it to `MICRORET_SRCS` and rebuild.
 Build failures will surface the next dep to swap.
+
+## Enum name tables mirror µR `Type.h` — update on every bump
+
+rnsd surfaces several µR status enums to logs/CLI as words rather than
+raw numbers. The string tables that do this are hand-maintained copies of
+the enumerators in [`src/Type.h`](src/Type.h), living in
+[`../../src/rnsd.cpp`](../../src/rnsd.cpp):
+
+- `resStatusName()` — `RNS::Type::Resource` status (NONE…CORRUPT)
+- `tdrName()` — `RNS::Type::Link` `teardown_reason` (NONE/TIMEOUT/…)
+
+These switch on the µR enum *values*, so they stay correct as long as the
+values don't change — but a µR bump that **adds or renumbers** an enumerator
+will silently fall through to the `unknown(N)` numeric fallback. **When you
+re-pin µR (change the commit above), diff `Type.h`'s status/reason enums and
+extend these tables to match.** The numeric fallback is the safety net, not
+the intended output.
+
+(The vendored `Link.cpp` `DEBUGF("…status: %d", resource.status())` lines
+are upstream debug logging and are deliberately left numeric — we don't
+patch vendored sources for cosmetics.)
