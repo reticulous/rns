@@ -247,6 +247,12 @@ enum : uint8_t {
     RNSD_DEST_AUX_RESOURCE_PROGRESS = 0x05,   /* + pct(1) */
     RNSD_DEST_AUX_RETRY             = 0x06,   /* + attempt(1) reason(1) */
     RNSD_DEST_AUX_PATH_LOST         = 0x07,
+    RNSD_DEST_AUX_QUEUE_FULL        = 0x08,   /* rnsd's per-conn pending
+                                               * path-search table is full; the
+                                               * send was NOT accepted. The app
+                                               * holds the message and resends
+                                               * once a slot frees (backpressure,
+                                               * never a drop). */
 };
 
 /** RNSD_DEST_AUX_RETRY reason byte. */

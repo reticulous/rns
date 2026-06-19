@@ -178,9 +178,10 @@ static TickType_t s_lastPublishTick = 0;
  *     emits 0x05 OUT_STATUS REQUESTING_PATH, requests the path, and
  *     parks the send for the periodic walker to retry.
  *
- * One pending send slot per conn keeps the state machine bounded for
- * Phase 4a. The lxmf task throttles its own OUT_PACKET cadence via the
- * stage-driven lifecycle. */
+ * A small pending table per conn (RNSD_MAILBOX_MAX_PENDING slots) lets
+ * sends to different peers search for routes concurrently. When every slot
+ * is occupied a further send is backpressured with OUT_STATUS QUEUE_FULL —
+ * not accepted, not dropped — and the app holds it for resend. */
 
 /* Connect payload for RNSD_PORT_DEST — rnsd-private. Consumers go
  * through rnsdDestOpen(), which fills this from typed args. Fixed size
@@ -207,6 +208,13 @@ static_assert(sizeof(rnsd_link_connect_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_connect_t must fit ITS_MAX_MSG_DATA");
 
 #define RNSD_MAX_MAILBOX_CONNS    4
+/* Per-conn pending path-search slots. Each holds one parked OUT_PACKET (its
+ * full LXM wire, ~≤500B) whose path hasn't resolved yet, so multiple sends to
+ * different peers can search for routes concurrently instead of evicting one
+ * another. When all slots are full a new send is backpressured (OUT_STATUS
+ * QUEUE_FULL) rather than dropped — the app holds it and resends. Kept small:
+ * the bytes vectors land on the internal heap, which is scarce on the T-Deck. */
+#define RNSD_MAILBOX_MAX_PENDING  4
 /* Generous — costs only a slot struct + (lazily, PSRAM) ITS buffers each.
  * When the table is full a new open evicts the longest-idle link rather than
  * failing (linkAlloc), so this is a soft concurrency ceiling, never a hard
@@ -244,7 +252,7 @@ struct mailbox_conn_t {
     TaskHandle_t               link_listener_task = nullptr;
     uint16_t                   link_inbox_port    = 0;
 
-    mailbox_pending_t          pending;                /* one in-flight at a time */
+    mailbox_pending_t          pending[RNSD_MAILBOX_MAX_PENDING];  /* concurrent path searches */
 };
 
 static mailbox_conn_t* s_mailbox_conns = nullptr;
@@ -534,6 +542,7 @@ static const char* destAuxName(uint8_t type)
         case RNSD_DEST_AUX_RESOURCE_PROGRESS: return "resource_progress";
         case RNSD_DEST_AUX_RETRY:             return "retry";
         case RNSD_DEST_AUX_PATH_LOST:         return "path_lost";
+        case RNSD_DEST_AUX_QUEUE_FULL:        return "queue_full";
         default: {
             static char b[24];
             snprintf(b, sizeof(b), "unknown(0x%02x)", (unsigned)type);
@@ -598,10 +607,26 @@ static void mailboxSendOutStatusRetry(mailbox_conn_t& c, uint16_t send_id,
         warn("mailbox: OUT_STATUS RETRY send dropped");
 }
 
-static void mailboxClearPending(mailbox_conn_t& c)
+static void mailboxClearPendingSlot(mailbox_pending_t& p)
 {
-    c.pending.used = false;
-    c.pending.bytes.clear();
+    p.used = false;
+    p.bytes.clear();
+}
+
+/* First free pending slot in this conn, or nullptr if the table is full. */
+static mailbox_pending_t* mailboxPendingFindFree(mailbox_conn_t& c)
+{
+    for (auto& p : c.pending)
+        if (!p.used) return &p;
+    return nullptr;
+}
+
+/* Parked send matching send_id in this conn, or nullptr. */
+static mailbox_pending_t* mailboxPendingFind(mailbox_conn_t& c, uint16_t send_id)
+{
+    for (auto& p : c.pending)
+        if (p.used && p.send_id == send_id) return &p;
+    return nullptr;
 }
 
 /* ─────────────── opportunistic delivery-proof tracking ───────────────
@@ -919,7 +944,7 @@ static int onMailboxConnect(int handle, const void* data, size_t len)
     slot->listener_identity = RNS::Identity(RNS::Type::NONE);
     slot->listener_dest     = RNS::Destination(RNS::Type::NONE);
     slot->listener_hash     = RNS::Bytes();
-    slot->pending           = mailbox_pending_t{};
+    for (auto& p : slot->pending) p = mailbox_pending_t{};
 
     /* Load listener identity. */
     const char* key = slot->req.identity_key[0] ? slot->req.identity_key : "secrets.rnsd.identity";
@@ -1025,7 +1050,7 @@ static void onMailboxDisconnect(int ref)
     c.listener_identity = RNS::Identity(RNS::Type::NONE);
     c.listener_dest     = RNS::Destination(RNS::Type::NONE);
     c.listener_hash     = RNS::Bytes();
-    c.pending = mailbox_pending_t{};
+    for (auto& p : c.pending) p = mailbox_pending_t{};
 }
 
 static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
@@ -1048,27 +1073,34 @@ static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
             size_t lxm_n = n - 3;
             int r = mailboxTrySend(*c, send_id, lxm, lxm_n);
             if (r == 0) {
-                /* Park for the periodic walker. One slot per conn — if
-                 * something else is parked, the lxmf task is supposed to
-                 * pace itself; we still take this one (lifo) to keep the
-                 * latest in flight. */
-                if (c->pending.used)
-                    warn("mailbox: dropping previous pending send_id=%u for new send_id=%u",
-                         (unsigned)c->pending.send_id, (unsigned)send_id);
-                c->pending.used    = true;
-                c->pending.send_id = send_id;
-                c->pending.bytes.assign(lxm, lxm + lxm_n);
-                c->pending.first_seen_at        = RNS::Utilities::OS::time();
-                c->pending.last_request_path_at = c->pending.first_seen_at;
-                c->pending.attempts             = 0;
+                /* Park for the periodic walker — one free slot per parked
+                 * send, so concurrent sends to different peers each get
+                 * their own path search. */
+                mailbox_pending_t* slot = mailboxPendingFindFree(*c);
+                if (!slot) {
+                    /* Table full: backpressure instead of evicting an
+                     * in-flight search. The app holds this send (stage
+                     * stays "queued") and resends once a slot frees. */
+                    warn("mailbox: pending table full (%d in flight), holding send_id=%u",
+                         RNSD_MAILBOX_MAX_PENDING, (unsigned)send_id);
+                    mailboxSendOutStatusBare(*c, send_id, RNSD_DEST_AUX_QUEUE_FULL);
+                    break;
+                }
+                slot->used    = true;
+                slot->send_id = send_id;
+                slot->bytes.assign(lxm, lxm + lxm_n);
+                slot->first_seen_at        = RNS::Utilities::OS::time();
+                slot->last_request_path_at = slot->first_seen_at;
+                slot->attempts             = 0;
             }
             break;
         }
         case RNSD_DEST_OUT_CANCEL: {
             if (n < 3) { err("mailbox: OUT_CANCEL too short (%zu)", n); return; }
             uint16_t send_id = ((uint16_t)buf[1] << 8) | (uint16_t)buf[2];
-            if (c->pending.used && c->pending.send_id == send_id) {
-                mailboxClearPending(*c);
+            mailbox_pending_t* p = mailboxPendingFind(*c, send_id);
+            if (p) {
+                mailboxClearPendingSlot(*p);
                 mailboxSendOutResult(*c, send_id, RNSD_DEST_STATUS_CANCELLED, 0, 0);
             } else {
                 /* Not parked — already terminal. Send a synthetic
@@ -1130,39 +1162,50 @@ static void mailboxTickPending(void)
     double now = RNS::Utilities::OS::time();
     for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++) {
         mailbox_conn_t& c = s_mailbox_conns[j];
-        if (!c.used || !c.pending.used) continue;
+        if (!c.used) continue;
 
-        RNS::Bytes dh(c.pending.bytes.data(), 16);
+        for (mailbox_pending_t& p : c.pending) {
+            if (!p.used) continue;
 
-        if (RNS::Transport::has_path(dh) && RNS::Identity::recall(dh)) {
-            uint16_t send_id = c.pending.send_id;
-            std::vector<uint8_t> bytes = c.pending.bytes;
-            mailboxClearPending(c);
-            mailboxTrySend(c, send_id, bytes.data(), bytes.size());
-            continue;
-        }
+            RNS::Bytes dh(p.bytes.data(), 16);
 
-        if (now - c.pending.first_seen_at >= RNSD_MAILBOX_PATH_GIVEUP_S) {
-            uint16_t send_id = c.pending.send_id;
-            info("mailbox: send_id=%u giving up path search for %s after %.0fs",
-                 (unsigned)send_id, dh.toHex().c_str(),
-                 now - c.pending.first_seen_at);
-            mailboxClearPending(c);
-            mailboxSendOutResult(c, send_id, RNSD_DEST_STATUS_FAILED, 0, 0);
-            continue;
-        }
+            if (RNS::Transport::has_path(dh) && RNS::Identity::recall(dh)) {
+                uint16_t send_id = p.send_id;
+                RNS::Interface oif = RNS::Transport::next_hop_interface(dh);
+                info("mailbox: send_id=%u path found for %s via %s (hops=%u, after %u request%s)",
+                     (unsigned)send_id, dh.toHex().c_str(),
+                     oif ? oif.toString().c_str() : "<none>",
+                     (unsigned)RNS::Transport::hops_to(dh),
+                     (unsigned)p.attempts,
+                     p.attempts == 1 ? "" : "s");
+                std::vector<uint8_t> bytes = p.bytes;
+                mailboxClearPendingSlot(p);
+                mailboxTrySend(c, send_id, bytes.data(), bytes.size());
+                continue;
+            }
 
-        if (now - c.pending.last_request_path_at >= mailboxRetryDelay(c.pending.attempts)) {
-            info("mailbox: send_id=%u retrying path request for %s (attempt %u)",
-                 (unsigned)c.pending.send_id, dh.toHex().c_str(),
-                 (unsigned)(c.pending.attempts + 1));
-            try { RNS::Transport::request_path(dh); }
-            catch (const std::exception& e) { warn("mailbox: request_path threw: %s", e.what()); }
-            c.pending.attempts++;
-            mailboxSendOutStatusRetry(c, c.pending.send_id,
-                                      (uint8_t)std::min(c.pending.attempts, 255),
-                                      RNSD_DEST_RETRY_REASON_PATH_TIMEOUT);
-            c.pending.last_request_path_at = now;
+            if (now - p.first_seen_at >= RNSD_MAILBOX_PATH_GIVEUP_S) {
+                uint16_t send_id = p.send_id;
+                info("mailbox: send_id=%u giving up path search for %s after %.0fs",
+                     (unsigned)send_id, dh.toHex().c_str(),
+                     now - p.first_seen_at);
+                mailboxClearPendingSlot(p);
+                mailboxSendOutResult(c, send_id, RNSD_DEST_STATUS_FAILED, 0, 0);
+                continue;
+            }
+
+            if (now - p.last_request_path_at >= mailboxRetryDelay(p.attempts)) {
+                info("mailbox: send_id=%u retrying path request for %s (attempt %u)",
+                     (unsigned)p.send_id, dh.toHex().c_str(),
+                     (unsigned)(p.attempts + 1));
+                try { RNS::Transport::request_path(dh); }
+                catch (const std::exception& e) { warn("mailbox: request_path threw: %s", e.what()); }
+                p.attempts++;
+                mailboxSendOutStatusRetry(c, p.send_id,
+                                          (uint8_t)std::min(p.attempts, 255),
+                                          RNSD_DEST_RETRY_REASON_PATH_TIMEOUT);
+                p.last_request_path_at = now;
+            }
         }
     }
 }
@@ -3916,6 +3959,11 @@ static void linkTick(void)
         switch (c.state) {
         case LST_AWAITING_PATH:
             if (RNS::Identity::recall(c.dest_hash)) {
+                RNS::Interface oif = RNS::Transport::next_hop_interface(c.dest_hash);
+                info("link[%s]: path found for %s via %s (hops=%u)",
+                     c.tag, c.dest_hash.toHex().c_str(),
+                     oif ? oif.toString().c_str() : "<none>",
+                     (unsigned)RNS::Transport::hops_to(c.dest_hash));
                 linkKickoff(c);
             } else if (now >= c.path_deadline) {
                 warn("link[%s]: no path within budget", c.tag);
