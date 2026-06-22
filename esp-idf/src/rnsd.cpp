@@ -203,6 +203,7 @@ typedef struct {
     char     identity_key[40];               /* our id privkey path; "" → default */
     char     tag[24];                        /* caller tag, keys rnsd.links.<tag>.* */
     uint32_t path_timeout_ms;                /* 0 → s.rnsd.link.path_timeout_s */
+    uint32_t link_timeout_ms;                /* 0 → ref-impl outbound budget; else THE estab timeout */
 } rnsd_link_connect_t;
 static_assert(sizeof(rnsd_link_connect_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_connect_t must fit ITS_MAX_MSG_DATA");
@@ -2746,6 +2747,7 @@ int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                  const char*   identity_key,
                  const char*   tag,
                  uint32_t      path_timeout_ms,
+                 uint32_t      link_timeout_ms,
                  int           ref,
                  void (*on_recv)(int, size_t),
                  void (*on_disconnect)(int))
@@ -2759,6 +2761,7 @@ int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
     if (identity_key && *identity_key)
         safeStrncpy(req.identity_key, identity_key, sizeof(req.identity_key));
     req.path_timeout_ms = path_timeout_ms;
+    req.link_timeout_ms = link_timeout_ms;
     return itsConnect("rnsd", RNSD_PORT_LINK,
                       &req, sizeof(req), pdMS_TO_TICKS(2000),
                       ref, on_recv, on_disconnect);
@@ -3117,6 +3120,7 @@ struct link_conn_t {
     double               last_activity; /* OS::time() of last open/establish/traffic — LRU eviction key */
     double               path_deadline; /* OS::time() a path must answer by */
     double               estab_deadline;/* OS::time() ACTIVE must arrive by */
+    uint32_t             link_timeout_ms;/* consumer override; 0 = ref-impl budget */
     double               orphan_at;     /* OS::time() consumer left; 0 = attached */
     double               dead_at;       /* OS::time() entered CLOSED/FAILED; 0 = n/a */
     bool                 pend_used;     /* one-packet pre-active outbox */
@@ -3847,10 +3851,30 @@ static bool linkKickoff(link_conn_t& c)
         c.link.set_packet_callback(onLinkPacketCb);
         linkWireResource(c.link);                 /* Phase F */
         c.state = LST_ESTABLISHING;
-        c.estab_deadline = RNS::Utilities::OS::time() + 60.0;
+
+        /* Establishment timeout. A consumer-supplied value is THE timeout,
+         * used verbatim. Otherwise match the Python reference's outbound
+         * budget: the next hop's first-hop timeout (which mR already stored
+         * in the Link) plus ESTABLISHMENT_TIMEOUT_PER_HOP (6 s) per hop — mR
+         * itself omits the per-hop term. Push it back onto the Link so mR's
+         * own watchdog uses the same deadline rather than its shorter one. */
+        double estab;
+        const char* estab_src;
+        if (c.link_timeout_ms != 0) {
+            estab = (double)c.link_timeout_ms / 1000.0;
+            estab_src = "supplied";
+        } else {
+            int hops = (int)RNS::Transport::hops_to(c.dest_hash);
+            estab = c.link.establishment_timeout()
+                  + (double)RNS::Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP
+                    * (double)std::max(1, hops);
+            estab_src = "calculated";
+        }
+        c.link.establishment_timeout(estab);
+        c.estab_deadline = RNS::Utilities::OS::time() + estab;
         linkPublishState(c);
-        info("link[%s]: kickoff → %s aspect=%s", c.tag,
-             c.dest_hash.toHex().c_str(), c.aspect.c_str());
+        info("link[%s]: kickoff → %s aspect=%s estab_timeout=%.1fs (%s)", c.tag,
+             c.dest_hash.toHex().c_str(), c.aspect.c_str(), estab, estab_src);
     } catch (const std::exception& e) {
         warn("link[%s]: kickoff threw: %s", c.tag, e.what());
         c.state = LST_FAILED;
@@ -4097,6 +4121,7 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     int path_to_s = storageGetInt("s.rnsd.link.path_timeout_s", 30);
     if (req.path_timeout_ms != 0) path_to_s = (int)(req.path_timeout_ms / 1000);
     c->path_deadline = c->opened_at + (path_to_s > 0 ? path_to_s : 30);
+    c->link_timeout_ms = req.link_timeout_ms;   /* 0 = ref-impl budget (linkKickoff) */
 
     /* Initial state tree. storageSet (not Default) so the browser /
      * consumer subscribers fire on every field. */
@@ -4566,7 +4591,7 @@ static void onCmdCreq(const char* key, const char* val)
     if (s_clink_handle >= 0) { itsDisconnect(s_clink_handle); s_clink_handle = -1; }
     rnsdLinkTeardown(CLINK_TAG);   /* clear any parked/lingering prior link */
     int h = rnsdLinkOpen(dh.data(), aspect.c_str(), "", CLINK_TAG,
-                         /*path_timeout_ms=*/0, /*ref=*/0,
+                         /*path_timeout_ms=*/0, /*link_timeout_ms=*/0, /*ref=*/0,
                          onClinkRecv, onClinkDisc);
     if (h < 0) { warn("creq: rnsdLinkOpen failed (%d)", h); return; }
     s_clink_handle = h;
@@ -4643,7 +4668,7 @@ static void onCmdClink(const char* key, const char* val)
     if (s_clink_handle >= 0) { itsDisconnect(s_clink_handle); s_clink_handle = -1; }
     rnsdLinkTeardown(CLINK_TAG);   /* clear any parked/lingering prior link */
     int h = rnsdLinkOpen(dh.data(), aspect.c_str(), "", CLINK_TAG,
-                         /*path_timeout_ms=*/0, /*ref=*/0,
+                         /*path_timeout_ms=*/0, /*link_timeout_ms=*/0, /*ref=*/0,
                          onClinkRecv, onClinkDisc);
     if (h < 0) { warn("clink: rnsdLinkOpen failed (%d)", h); return; }
     s_clink_handle = h;

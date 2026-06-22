@@ -172,6 +172,12 @@ int rnsdDestOpen(const char* aspect,
  *  default ("secrets.rnsd.identity"). `path_timeout_ms` overrides the
  *  path-wait budget; 0 = use `s.rnsd.link.path_timeout_s` (default 30).
  *
+ *  `link_timeout_ms` overrides the establishment timeout (how long the Link
+ *  may sit "establishing" before it is failed). When non-zero it is **the**
+ *  timeout — used verbatim, neither floored nor capped by rnsd, and it also
+ *  governs mR's own link watchdog. When 0, rnsd computes the Python-reference
+ *  outbound budget: the next hop's first-hop timeout plus 6 s per hop.
+ *
  *  Returns the ITS handle (≥ 0) on accept, or negative on immediate
  *  failure (rnsd down, slot table full, duplicate tag, bad args). */
 int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
@@ -179,6 +185,7 @@ int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                  const char*   identity_key,
                  const char*   tag,
                  uint32_t      path_timeout_ms,
+                 uint32_t      link_timeout_ms,
                  int           ref,
                  void (*on_recv)(int handle, size_t bytes_avail),
                  void (*on_disconnect)(int handle));
