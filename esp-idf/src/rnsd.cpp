@@ -486,7 +486,7 @@ static void onTransportRecv(int handle, size_t /*bytesAvail*/)
      * Plain static — only the rnsd task dispatches this callback, so no
      * concurrency. Avoid `thread_local` (lazy libgcc TLS init has been seen
      * to corrupt FreeRTOS scheduler state at boot). */
-    static uint8_t pktbuf[600];   /* > RNS MTU 500 */
+    PSRAM_BSS static uint8_t pktbuf[600];   /* > RNS MTU 500 */
     size_t n = itsRecv(handle, pktbuf, sizeof(pktbuf), 0);
     if (n == 0) return;
     i->rx_packets++;
@@ -1058,7 +1058,7 @@ static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
 {
     mailbox_conn_t* c = mailboxFindByHandle(handle);
     if (!c) return;
-    static uint8_t buf[1 + RNSD_MAILBOX_INBOUND_MAX];
+    PSRAM_BSS static uint8_t buf[1 + RNSD_MAILBOX_INBOUND_MAX];
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n == 0) return;
 
@@ -1813,7 +1813,7 @@ static void cliRnsdMemory(void)
 #ifdef CONFIG_HEAP_TASK_TRACKING
     {
         constexpr size_t MAX_HT = 40;
-        static heap_task_totals_t htotals[MAX_HT];
+        PSRAM_BSS static heap_task_totals_t htotals[MAX_HT];
         memset(htotals, 0, sizeof(htotals));
         size_t ntot = 0;
         heap_task_info_params_t p = {};
@@ -4152,7 +4152,7 @@ static void onLinkRecv(int handle, size_t /*bytesAvail*/)
 {
     link_conn_t* c = linkFindByHandle(handle);
     if (!c) return;
-    static uint8_t buf[2048];
+    PSRAM_BSS static uint8_t buf[2048];
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n == 0) return;
 
@@ -4449,7 +4449,7 @@ static int s_clink_dest_handle = -1;   /* hosted RNSD_PORT_DEST handle (listen) 
 
 static void onClinkRecv(int handle, size_t /*bytesAvail*/)
 {
-    static uint8_t buf[1024];
+    PSRAM_BSS static uint8_t buf[1024];
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n == 0) return;
     size_t show = n < 48 ? n : 48;
@@ -4470,7 +4470,7 @@ static void onClinkDestRecv(int handle, size_t /*n*/)
     /* Drain whatever rnsd sends on the hosted-dest handle (IN_PACKET,
      * OUT_RESULT, …). The test only cares about inbound Links, which
      * arrive on CLINK_INBOX_PORT, not here. */
-    static uint8_t b[700];
+    PSRAM_BSS static uint8_t b[700];
     itsRecv(handle, b, sizeof(b), 0);
 }
 static void onClinkDestDisc(int /*handle*/)
@@ -4499,7 +4499,7 @@ static int onClinkInboxConnect(int /*handle*/, const void* data, size_t len)
 }
 static void onClinkInboxRecv(int handle, size_t /*n*/)
 {
-    static uint8_t b[1024];
+    PSRAM_BSS static uint8_t b[1024];
     size_t n = itsRecv(handle, b, sizeof(b), 0);
     if (n == 0) return;
     size_t show = n < 48 ? n : 48;
