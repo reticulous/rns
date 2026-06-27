@@ -154,8 +154,11 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `s.rnsd.transport_enabled` | `0` | Act as a Reticulum transport node (forward for others). |
+| `s.rnsd.enable` | `1` | Master switch — is this node on the mesh at all. **Read once at boot**: when `0`, rnsd brings up no Transport/ports and never sets `rns.ready`, so interfaces and clients never start. **Changing it requires a reboot.** |
+| `s.rnsd.transport_enabled` | `0` | Act as a Reticulum transport node (forward for others). Live (no reboot). |
 | `s.rnsd.announce.interval` | `1800` | Seconds between periodic destination announces. |
+| `s.rnsd.path.max` | `100` | Path-table capacity cap (`Transport::path_table_maxsize`). |
+| `s.rnsd.path.ttl` | `86400` | Path-entry age-out, seconds (`Transport::destination_timeout`). |
 | `s.rnsd.remote_management` | `1` | Host the `rnstransport.remote.management` destination. |
 | `s.rnsd.respond_to_probes` | `0` | Host `rnstransport.probe` and answer probes (PROVE_ALL). |
 | `s.rnsd.prove_incoming` | `1` | Emit delivery proofs for inbound packets we receive. |
@@ -173,7 +176,8 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | Key | Meaning |
 |---|---|
 | `rns.ready` | Boot barrier — set once the clock, network, and a settle delay have passed; consumers wait on this before using rnsd. |
-| `rnsd.up` | Task is alive. |
+| `rnsd.up` | Task is alive and the mesh is running. |
+| `rnsd.enabled` | `1` running, `0` when `s.rnsd.enable=0` held the node off (distinguishes "disabled by config" from "not up yet"). |
 | `rnsd.identity_hash` | Hex hash of rnsd's default identity. |
 | `rnsd.iface_event_seq` | Monotonic counter bumped on interface up/down. |
 | `rnsd.stats.{packets_in,packets_out,bytes_in,bytes_out,ifaces_up}` | Traffic counters. |
@@ -181,7 +185,6 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.links.byid.<link_id>` | Reverse index: link_id → tag. |
 | `rnsd.dest.<idx>.{aspect,dest}` | Hosted-destination (our-dest) observability. |
 | `rnsd.ifaces.<name>.{up,mode,mtu,bitrate,rx_bytes,rx_packets,tx_bytes,tx_packets}` | Per-interface state and counters. |
-| `rnsd.paths` | Path-table snapshot (up to 64 entries: `{dest, next_hop_addr, next_hop, hops, last_announce}`) — the browser Nodes window reads this. |
 
 ### Command sentinels (read, self-clearing)
 

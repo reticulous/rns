@@ -4689,6 +4689,20 @@ static void rnsdTaskMain(void*)
     for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++)
         new (&s_our_dest_receipts[j]) our_dest_receipt_t{};
 
+    /* Master enable, read ONCE at boot. When off, rnsd brings up nothing — no
+     * Transport, no ITS ports, and crucially rns.ready is never set, so every
+     * iface and client waits on the boot barrier, times out, and bails (the
+     * node stays dark). Changing it requires a reboot by design — there is no
+     * live path. The task idles (rather than exiting) so the CLI registered in
+     * rnsdInit still reports state and the empty tables stay valid for it. */
+    if (storageGetInt("s.rnsd.enable", 1) == 0) {
+        warn("[%s] s.rnsd.enable=0 — RNS disabled; mesh not started "
+             "(set s.rnsd.enable=1 and reboot to enable)", TAG);
+        storageSet("rnsd.up", 0);
+        storageSet("rnsd.enabled", 0);
+        for (;;) vTaskDelay(portMAX_DELAY);
+    }
+
     /* Gate the entire rnsd ITS/Transport surface on a known-valid clock (or a
      * bounded wait), BEFORE opening any ITS port. Standing the ports up first
      * advertises a server that isn't pumping its inbox during the
@@ -4778,6 +4792,7 @@ static void rnsdTaskMain(void*)
 
     loadOrCreateIdentity();
     storageSet("rnsd.up", 1);
+    storageSet("rnsd.enabled", 1);
     if (s_identity) storageSet("rnsd.identity_hash", s_identity->hexhash().c_str());
 
     /* ── Boot barrier: publish rns.ready (ephemeral) ─────────────────────────

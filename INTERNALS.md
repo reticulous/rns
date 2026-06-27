@@ -330,6 +330,16 @@ settle delay has passed. **ITS ports are not opened until the clock is valid** �
 opening them earlier crashes (timestamps feed receipt/announce logic). This
 ordering is load-bearing; don't move port creation ahead of the clock check.
 
+**`s.rnsd.enable` is the master switch, read once at boot.** When `0`, `rnsdTaskMain`
+brings up nothing — no Transport, no ITS ports — and **never sets `rns.ready`**,
+so every interface and client waits on the barrier, times out (`waitForFlag`,
+~120 s), and bails: the node stays dark. The task then idles (so the CLI still
+reports state) and publishes `rnsd.enabled = 0`. **There is no live toggle —
+changing `s.rnsd.enable` requires a reboot.** This is deliberate: it keeps
+`rns.ready` a pure one-shot barrier (never goes false) rather than a runtime
+signal everything would have to re-check. (Contrast `s.rnsd.transport_enabled`,
+which *is* live — it's read at runtime for forwarding.)
+
 ## 7. Persistence
 
 Storage is the source of truth for the durable layer; the `rnsd.*` runtime tree
@@ -369,13 +379,17 @@ auto-create an application identity at boot — that is the app's call.
   (`tickPhase ^= 1`). Both in one tick parks rnsd past tcp's 100 ms `itsSend`
   timeout (symptom: `[tcp] rnsd ITS send dropped`). The cost is that
   `Transport::jobs()` effectively runs at ~2 s cadence. Don't collapse them.
-- **Path-table publish is an unbounded-growth hazard.** µR's path table is an
-  unbounded heap store pruned only by `PATHFINDER_E` (24 h); `publishPathTable()`
-  O(N)-snapshots it each tick. It's capped at `RNSD_PATHS_PUBLISH_MAX = 64`
-  (≈150 B/entry vs the 60 KB storage-patch cap) with a `vTaskDelay(1)` every 8
-  entries — the `DestinationEntry` dtor walks a PSRAM RB-tree of `_random_blobs`,
-  so an uncapped loop starves IDLE0 and has tripped the task watchdog *inside*
-  `publishPathTable()` under churn. A real fix waits on storage→SD.
+- **Path table: bounded by caps; the snapshot publisher is disabled.** µR's path
+  table would grow unbounded (age-pruned only), so it's capped at `s.rnsd.path.max`
+  entries (`Transport::path_table_maxsize`, default 100) with age-out at
+  `s.rnsd.path.ttl` seconds (`Transport::destination_timeout`, default 86400) —
+  wired via `NOW_AND_ON_CHANGE`. Separately, `publishPathTable()` (which mirrored
+  the table to `rnsd.paths` for the browser Nodes window) is currently `#if 0`'d:
+  O(N)-snapshotting every tick tripped the task watchdog *inside* it under churn —
+  the `DestinationEntry` dtor walks a PSRAM RB-tree of `_random_blobs`, starving
+  IDLE0 — even with its 64-row cap and a `vTaskDelay(1)` every 8 entries. So
+  **`rnsd.paths` is not published today**; re-enabling needs that bounded/yielded
+  walk and ideally storage→SD. Don't re-enable it blind.
 - **Resolve link callbacks by shared `LinkData`, not pointer.** µR hands callbacks
   `Link` wrapper *copies* (different address, same `shared_ptr<LinkData>`), so
   `&slot->link == &link` never matches. Use `sameLink(a,b)` (built on µR's public
