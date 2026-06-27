@@ -44,11 +44,30 @@ kconfig:
 # self-register their interfaces. No explicit ordering needed.
 init:
   - call: rnsdInit
-  - call: rnsdLcdRegister
-    when: spangap/spangap-lcd
 
 # Browser-side UI registration (parallel to init: above) — auto-wired into
 # the buildable SPA via straddles.gen.ts; no web-interface edit needed.
 browser_register:
   - call: registerRnsd
     module: modules/rnsd
+
+# Declarative settings: LCD pane + storage defaults generated from this block.
+# web: false — RnsdPanel.vue keeps owning the web leaf (its rows match, but the
+# module also wires status nodes). path.max/path.ttl are deliberately defaultless
+# (mR's path table is unbounded). LCD leaf label kept "General" to preserve the
+# existing menu node; the non-setting rnsd defaults stay in rnsd.cpp.
+settings:
+  - menu:
+      - { id: mesh, label: "Mesh Network", placement: 3 }
+      - { id: general, label: "General", placement: 1 }
+    web: false
+    rows:
+      - section: "Reticulum"
+      - value:  { label: "Identity", key: "rnsd.identity_hash" }
+      - switch: { label: "Enable", key: "s.rnsd.enable", default: 1 }
+      - switch: { label: "Transport node", key: "s.rnsd.transport_enabled", default: 0 }
+      - text:   { label: "Node name", key: "s.rnsd.name", default: "" }
+      - slider: { label: "Announce (s)", key: "s.rnsd.announce.interval", min: 0, max: 21600, default: 1800 }
+      - section: "Path Table"
+      - slider: { label: "Capacity", key: "s.rnsd.path.max", min: 64, max: 512 }
+      - slider: { label: "TTL (s)", key: "s.rnsd.path.ttl", min: 3600, max: 604800 }
