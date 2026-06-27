@@ -1,8 +1,5 @@
 /**
  * ports.h — ITS port constants for reticulous tasks.
- *
- * See docs/component-plan.md §9 and docs/plans/lxmf.md §5 for the full
- * ITS port surface.
  */
 #pragma once
 
@@ -11,12 +8,12 @@
 
 /* ---- rnsd task ports ---- */
 
-/** Transport registration. Connect payload is `rnsd_transport_t` describing
+/** Interface registration. Connect payload is `rnsd_iface_t` describing
  *  the interface (name, MTU, bitrate, mode, capabilities). The connect
  *  handle then carries inbound RNS packets to rnsd and outbound RNS
  *  packets from rnsd (packet-mode ITS — one packet per send/recv).
  *  Disconnect = deregister. */
-constexpr uint16_t RNSD_PORT_TRANSPORT = 1;
+constexpr uint16_t RNSD_PORT_IFACE = 1;
 
 /** Browser network-map DC. Announce / path / link / iface events. */
 constexpr uint16_t RNSD_PORT_MAP = 2;
@@ -29,9 +26,7 @@ constexpr uint16_t RNSD_PORT_CTL = 3;
  *  Open with `rnsdDestOpen()` from rnsd.h — connect payload is an
  *  rnsd-private struct, callers never construct it directly. After
  *  open, the handle carries type-tagged frames in both directions
- *  per the RNSD_DEST_* opcodes below.
- *
- *  See [docs/plans/lxmf.md §5](../docs/plans/lxmf.md#5-its-port). */
+ *  per the RNSD_DEST_* opcodes below. */
 constexpr uint16_t RNSD_PORT_DEST = 4;
 
 /** Datagram send. Aux for small (≤ITS aux cap), stream for larger
@@ -53,43 +48,40 @@ constexpr uint16_t RNSD_PORT_DGRAM = 5;
  *  spangap-core's log `:1` consumers (see core `log.cpp`). */
 constexpr uint16_t RNSD_PORT_ANNOUNCES = 6;
 
-/** Generic Reticulum Link → ITS connection (Phase C — link.md §6).
+/** Generic Reticulum Link → ITS connection.
  *  Connect payload (rnsd-private rnsd_link_connect_t, built by
  *  rnsdLinkOpen()) identifies the remote destination; rnsd establishes
  *  the Link asynchronously and bridges plaintext packets to/from the
  *  packet-mode ITS handle (no framing bytes on the data path).
  *
- *  Consumer-initiated **explicit teardown** is an out-of-band aux frame
- *  on this same port (the data path stays type-byte-free): the payload
- *  is the link's `tag` string. itsDisconnect alone only *parks* the
- *  Link for `s.rnsd.link.orphan_ttl_s` (§10a.1 in-session reconnect);
- *  the aux is how a consumer says "really close it now, free the tag".
- *  Sent via rnsdLinkTeardown(tag) from rnsd.h. */
+ *  The Link's lifetime tracks the consumer's ITS handle 1:1: closing the
+ *  handle (itsDisconnect) tears the Link down and frees the slot + tag.
+ *  There is no separate teardown frame and no parking. */
 constexpr uint16_t RNSD_PORT_LINK = 10;
 
 enum : uint8_t {
-    RNSD_LINK_AUX_TEARDOWN     = 0x01,  /* payload: tag string (≤23 chars) */
+    /* 0x01 was RNSD_LINK_AUX_TEARDOWN — removed; itsDisconnect tears down. */
     RNSD_LINK_AUX_SEND_RESOURCE = 0x02, /* payload: rnsd_link_send_resource_t —
-                                         * Phase F outbound big send (link.md
-                                         * §9.2). rnsd takes ownership of buf
-                                         * and frees it once the engine has
-                                         * copied it into encrypted parts. */
+                                         * outbound big send (Resource). rnsd
+                                         * takes ownership of buf and frees it
+                                         * once the engine has copied it into
+                                         * encrypted parts. */
     RNSD_LINK_AUX_REQUEST      = 0x03,  /* payload: rnsd_link_request_t header
                                          * followed inline by path[path_len]
                                          * then data[data_len] — the nomad
                                          * page-fetch / request-response
-                                         * primitive (nomad.md §1). Sent via
+                                         * primitive. Sent via
                                          * rnsdLinkRequest(). */
 };
 
-/** Request/response issue (RNSD_PORT_LINK aux, nomad.md §1). Sent by
+/** Request/response issue (RNSD_PORT_LINK aux). Sent by
  *  rnsdLinkRequest(): bridges a consumer byte-array request to µR's
  *  Link::request(path, data, …) on the Link already opened as `tag`. The
  *  path and request data are appended *inline* after this fixed header in
  *  the same aux frame: path occupies the next `path_len` bytes, the request
  *  data the following `data_len` bytes (`data_len == 0` → plain GET). The
  *  whole frame must fit ITS_MAX_MSG_DATA, so this rides packets only;
- *  request-as-Resource (large form uploads) is a later phase. */
+ *  request-as-Resource (large form uploads) is not yet implemented. */
 typedef struct {
     uint8_t  op;            /* RNSD_LINK_AUX_REQUEST */
     char     tag[24];       /* outbound link tag (rnsdLinkOpen) */
@@ -107,7 +99,7 @@ typedef struct {
 static_assert(sizeof(rnsd_link_request_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_request_t must fit ITS_MAX_MSG_DATA");
 
-/** Outbound Resource send request (RNSD_PORT_LINK aux, Phase F).
+/** Outbound Resource send request (RNSD_PORT_LINK aux).
  *  Sent by rnsdLinkSendResource(). `buf` is a heap pointer in the shared
  *  address space; rnsd reads it on its own task, constructs the Resource
  *  (the engine copies the bytes), then free()s it. Caller must not touch
@@ -124,7 +116,7 @@ static_assert(sizeof(rnsd_link_send_resource_t) <= ITS_MAX_MSG_DATA,
 
 /** Resource-aux opcodes (consumer's resource/response aux port). The
  *  REQUEST_* opcodes reuse the same handoff struct + delivery path as the
- *  RESOURCE_* ones (nomad.md §1): a request response can be a whole page,
+ *  RESOURCE_* ones: a request response can be a whole page,
  *  so it comes back as a heap buffer the consumer owns, tagged by the
  *  consumer's req_id (carried in opaque_id). */
 enum : uint8_t {
@@ -168,17 +160,17 @@ enum rns_iface_mode : uint8_t {
     RNS_IFACE_MODE_BOUNDARY      = 0x10,
 };
 
-/** Connect payload for RNSD_PORT_TRANSPORT. Sent by transport tasks when
+/** Connect payload for RNSD_PORT_IFACE. Sent by interface tasks when
  *  registering with rnsd. Fixed-size struct to keep the connect path cheap
  *  (fits in ITS_MAX_MSG_DATA).
  *
- *  IFAC (Interface Access Codes): a transport that wants its interface on an
+ *  IFAC (Interface Access Codes): an interface that wants to be on an
  *  access-coded RNS network fills `ifac_netname` (network_name) and/or
  *  `ifac_netkey` (passphrase); rnsd derives the IFAC identity and applies it
  *  (Transport::derive_ifac). Both empty => an open (non-IFAC) interface.
- *  `ifac_netkey` is a secret — transports read it from `secrets.*` storage. */
+ *  `ifac_netkey` is a secret — interfaces read it from `secrets.*` storage. */
 typedef struct {
-    char     name[24];      /* "tcp/0", "auto", "lora", "tcp_in/<addr:port>" */
+    char     name[24];      /* "tcp/0", "auto", "lora/0", "tcp_in/<addr:port>" */
     uint16_t mtu;           /* bytes — RNS protocol MTU is 500 */
     uint32_t bitrate;       /* bits/sec on the wire */
     uint8_t  mode;          /* rns_iface_mode */
@@ -189,9 +181,9 @@ typedef struct {
     uint8_t  ifac_size;     /* IFAC access-code length in bytes; 0 => default (1) */
     char     ifac_netname[32]; /* IFAC network_name; "" => no IFAC */
     char     ifac_netkey[64];  /* IFAC passphrase; "" => no IFAC */
-} rnsd_transport_t;
-static_assert(sizeof(rnsd_transport_t) <= ITS_MAX_MSG_DATA,
-              "rnsd_transport_t must fit ITS_MAX_MSG_DATA");
+} rnsd_iface_t;
+static_assert(sizeof(rnsd_iface_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_iface_t must fit ITS_MAX_MSG_DATA");
 
 /* ---- RNSD_PORT_DEST frame opcodes ---- */
 
@@ -202,11 +194,11 @@ enum : uint8_t {
     RNSD_DEST_IN_PACKET  = 0x04,   /* rnsd → app: bytes (decrypted plaintext) */
     RNSD_DEST_OUT_STATUS = 0x05,   /* rnsd → app: send_id(2) | type(1) | tail */
     RNSD_DEST_ANNOUNCE   = 0x06,   /* app → rnsd: app_data bytes (may be empty) */
-    RNSD_DEST_LINK_LISTEN = 0x07,  /* app → rnsd: link_inbox_port(2 BE) — Phase D */
+    RNSD_DEST_LINK_LISTEN = 0x07,  /* app → rnsd: link_inbox_port(2 BE) */
 };
 
 /** Connect payload rnsd sends to the consumer's registered
- *  link_inbox_port on every accepted *inbound* Link (Phase D, §7.2).
+ *  link_inbox_port on every accepted *inbound* Link.
  *  ≤ ITS_MAX_MSG_DATA. The consumer learns the rnsd-generated tag here
  *  so it can cross-reference rnsd.links.<tag>.* state. */
 typedef struct {
@@ -238,7 +230,7 @@ enum : uint8_t {
                                           * deadline (follows an earlier SENT) */
 };
 
-/** OUT_STATUS.type — aux progress narration. See lxmf.md §5.2. */
+/** OUT_STATUS.type — aux progress narration. */
 enum : uint8_t {
     RNSD_DEST_AUX_REQUESTING_PATH   = 0x01,
     RNSD_DEST_AUX_PATH_KNOWN        = 0x02,   /* + iface(24) hops(1) next_hop(16) */
@@ -276,12 +268,12 @@ static_assert(sizeof(rnsd_announces_connect_t) <= ITS_MAX_MSG_DATA,
 
 /* lxmf has no client-facing ports. Storage is the API — every frontend
  * is a view over `s.lxmf.*` / `lxmf.*` / `secrets.lxmf.*` keys, and the
- * lxmf task subscribes to its own subtree to drive state changes. See
- * docs/plans/lxmf.md §3 for the rationale.
+ * lxmf task subscribes to its own subtree to drive state changes.
  *
  * The two ports below are *internal* (rnsd → lxmf only), not client-
  * facing: rnsd back-connects accepted inbound Links here after lxmf
  * registers via rnsdDestListenLinks() on its lxmf.delivery handle.
- * Phase E uses LINK_INBOX; LINK_RESOURCE_AUX is reserved for Phase F. */
+ * LINK_INBOX carries inbound Link forwards; LINK_RESOURCE_AUX carries
+ * Resource handoffs. */
 constexpr uint16_t LXMF_LINK_INBOX_PORT        = 100;  /* inbound Link forwards */
-constexpr uint16_t LXMF_LINK_RESOURCE_AUX_PORT = 101;  /* Resource handoff (Phase F) */
+constexpr uint16_t LXMF_LINK_RESOURCE_AUX_PORT = 101;  /* Resource handoff */

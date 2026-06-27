@@ -3,7 +3,7 @@
  *
  * Owns: identity, destinations, path table, transport state machine,
  *       links, resources. Zero networking/radio dependencies — receives
- *       RNS-format packets via ITS streams from transport tasks and
+ *       RNS-format packets via ITS streams from interface tasks and
  *       sends them back the same way.
  *
  * This header also exposes a small byte-array C-style API that
@@ -22,8 +22,6 @@
  * take a recursive mutex around mR's `_known_destinations` table.
  * `rnsdRequestPath` writes a storage sentinel; the work runs on
  * rnsd's task asynchronously.
- *
- * See docs/component-plan.md §4 / §5.1 / §9 / §11.
  */
 #pragma once
 
@@ -190,14 +188,6 @@ int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                  void (*on_recv)(int handle, size_t bytes_avail),
                  void (*on_disconnect)(int handle));
 
-/** Explicitly tear down the outbound Link identified by `tag` and free
- *  its slot + `rnsd.links.<tag>.*` state. Use this — not bare
- *  itsDisconnect — when the consumer is truly done with the Link:
- *  itsDisconnect only *parks* it for `s.rnsd.link.orphan_ttl_s` so a
- *  returning consumer can re-attach (§10a.1). Returns true if the
- *  teardown aux was queued to rnsd (not whether the Link existed). */
-bool rnsdLinkTeardown(const char* tag);
-
 /** Tell rnsd to forward incoming Reticulum Links for the destination
  *  behind `dest_handle` (obtained from rnsdDestOpen) to ITS port
  *  `target_port` on the *same task* that owns `dest_handle`. rnsd
@@ -211,12 +201,12 @@ bool rnsdLinkTeardown(const char* tag);
  *  task. Registering links this way means you can't accidentally
  *  forward Links for a destination you don't own.
  *
- *  NOT YET IMPLEMENTED: needs mR Link support. Returns false until
- *  Link support lands. */
+ *  Returns true if the listen request was queued to rnsd (an in-band
+ *  frame on `dest_handle`), false on bad args or a full ITS buffer. */
 bool rnsdDestListenLinks(int      dest_handle,
                          uint16_t target_port);
 
-/* ──────────────── Resource transfer (Phase F, link.md §9) ────────────────
+/* ──────────────── Resource transfer ────────────────
  *
  * Messages larger than a single Link packet (~440 B encrypted) ride a
  * Reticulum Resource instead. The data path is NOT the packet-mode ITS
@@ -247,7 +237,7 @@ bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
  *  wrapper over free() — a symmetry hook in case the allocator changes. */
 void rnsdResourceRelease(void* buf);
 
-/* ──────────────── request / response (nomad page fetch, nomad.md §1) ────────────────
+/* ──────────────── request / response (nomad page fetch) ────────────────
  *
  * Reticulum's request/response layer rides an established Link: the
  * consumer issues `link.request(path, data)`, the remote's registered
@@ -275,7 +265,7 @@ void rnsdResourceRelease(void* buf);
  *
  *  v1 limit: path+data are sent inline in the aux, so they must fit
  *  ITS_MAX_MSG_DATA (ample for a page GET; large form uploads as a
- *  request-Resource are a later phase). One in-flight request per link.
+ *  request-Resource are not yet implemented). One in-flight request per link.
  *
  *  `data_packed` (default false): when true, `data` is already a complete
  *  msgpack object (e.g. a NomadNet `{field_*,var_*}` form map built by the

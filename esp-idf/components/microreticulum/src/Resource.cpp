@@ -40,7 +40,7 @@ using namespace RNS::Utilities;
 //
 // ratspeak/microReticulum (the algorithm reference the spec named) hashes
 // the *whole ciphertext* with a single random hash. Upstream Reticulum —
-// the wire we must interop with (link.md §3.3; the §9.5 echo is real
+// the wire we must interop with (the echo is real
 // Python LXMF) — instead uses TWO 4-byte random hashes:
 //
 //   • a "stream" random hash, prepended to the plaintext, encrypted into

@@ -203,8 +203,7 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 					// Clamp to base MTU unless this build's transports
 					// actually support discovery — they don't (tcp HDLC
 					// caps at 500 B); a larger link MTU makes the peer
-					// chunk Resources too big for our own wire (link.md
-					// §12.1).
+					// chunk Resources too big for our own wire.
 					if (!RNS::Reticulum::link_mtu_discovery() &&
 					    use_mtu > Type::Reticulum::MTU)
 						use_mtu = Type::Reticulum::MTU;
@@ -374,7 +373,7 @@ void Link::validate_proof(const Packet& packet) {
 					_object->__remote_identity = _object->_destination.identity();
 					if (confirmed_mtu) _object->_mtu = confirmed_mtu;
 					else _object->_mtu = RNS::Type::Reticulum::MTU;
-					// Never exceed what our transports carry (link.md §12.1).
+					// Never exceed what our interfaces carry.
 					if (!RNS::Reticulum::link_mtu_discovery() &&
 					    _object->_mtu > RNS::Type::Reticulum::MTU)
 						_object->_mtu = RNS::Type::Reticulum::MTU;

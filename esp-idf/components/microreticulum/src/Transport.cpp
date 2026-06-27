@@ -2514,7 +2514,7 @@ static const Bytes& ifac_salt() {
 				      packet.hops(), packet.data().size());
 				}
 				if (iter != _destinations.end()) {
-					/* Spangap: INFOF for app destinations (LXMF, mailbox,
+					/* Spangap: INFOF for app destinations (LXMF, our-dest,
 					 * etc.) — this is the "a DATA packet for us arrived"
 					 * signal. For mR's own control destinations (path.request,
 					 * tunnel.synthesize) the hit fires on every incoming

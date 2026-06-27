@@ -1,6 +1,6 @@
 # microReticulum vendored fork.
 #
-# Phase 0 status: source is vendored under src/, microStore headers under
+# Source is vendored under src/, microStore headers under
 # include/microStore/. The bulk of the µR cpp files wait on per-module
 # porting (crypto, JSON, msgpack swaps) and are added to MICRORET_SRCS one
 # at a time. The donna/ subdirectory is fully wired and compiles — it
@@ -55,7 +55,7 @@ set(MICRORET_SRCS
     "src/Transport.cpp"
     "src/Reticulum.cpp"
 
-    # Phase A of docs/plans/link.md flipped this in: Link.cpp now builds
+    # Link.cpp builds
     # against the hand-rolled src/MsgPack.h shim, which covers the narrow
     # Packer.serialize / Packer.to_array / Unpacker.feed / Unpacker.deserialize
     # / Unpacker.from_array / bin_t<uint8_t> surface upstream's Link.cpp
@@ -86,7 +86,7 @@ idf_component_register(
         bzip2
 )
 
-# Plan §2: explicitly do NOT define RNS_USE_FS or RNS_PERSIST_PATHS so that
+# Explicitly do NOT define RNS_USE_FS or RNS_PERSIST_PATHS so that
 # Persistence/DestinationEntry.h falls back to microStore::BasicHeapStore.
 # mR's hourly autopersist is harmless because OS::read_file/write_file are
 # no-op'd (see src/Utilities/OS.h).

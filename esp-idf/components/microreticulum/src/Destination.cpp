@@ -177,7 +177,11 @@ Destination::Destination(const Identity& identity, const Type::Destination::dire
 
 	std::string name(app_name);
 
-	if (aspects != nullptr) {
+	// Empty aspects must add no separator: an app-name-only destination
+	// (e.g. rnsh's "rnsh") expands to "rnsh", not "rnsh.". A trailing dot
+	// changes the name_hash and yields a different address than upstream
+	// RNS computes for the same destination, breaking interop.
+	if (aspects != nullptr && aspects[0] != '\0') {
 		name += std::string(".") + aspects;
 	}
 

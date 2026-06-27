@@ -1,12 +1,9 @@
 /**
  * rnsd — RNS protocol task.
  *
- * Phase 1 scope: identity load/generate, RNSD_PORT_TRANSPORT server,
- * iface table, basic stats, CLI. Path table integration with mR's
- * Transport machinery comes when transports start delivering real
- * packets (full Phase 1 milestone).
- *
- * See docs/component-plan.md §11.
+ * Identity load/generate, RNSD_PORT_IFACE server, iface table, basic
+ * stats, CLI, and path-table integration with mR's Transport machinery
+ * (interfaces deliver real packets through to Transport::inbound).
  */
 #include "rnsd.h"
 #include "mem.h"
@@ -84,8 +81,8 @@ static bool s_dbg_only_local = false;
 
 #define RNSD_VERSION 1
 
-/* Up to N concurrent registered transport ifaces. Each TCP peer is its
- * own iface, so this caps total transports (lora + auto + espnow + N tcp). */
+/* Up to N concurrent registered interfaces. Each TCP peer is its
+ * own iface, so this caps total interfaces (lora + auto + espnow + N tcp). */
 #define RNSD_MAX_IFACES 16
 
 /* mR Interface impl wrapping the ITS handle to a transport task. mR's
@@ -112,7 +109,7 @@ static RNS::Type::Interface::modes mapIfaceMode(uint8_t m) {
 
 class TaskInterface : public RNS::InterfaceImpl {
 public:
-    TaskInterface(const rnsd_transport_t& info, int handle) : _handle(handle) {
+    TaskInterface(const rnsd_iface_t& info, int handle) : _handle(handle) {
         _name = info.name;
         _online = true;
         _IN  = info.in  != 0;
@@ -134,7 +131,7 @@ private:
 struct iface_t {
     bool used;
     int  handle;            /* ITS server handle for this connection */
-    rnsd_transport_t info;
+    rnsd_iface_t info;
     uint64_t rx_packets;
     uint64_t tx_packets;
     uint64_t rx_bytes;
@@ -178,7 +175,7 @@ static TickType_t s_lastPublishTick = 0;
  *     emits 0x05 OUT_STATUS REQUESTING_PATH, requests the path, and
  *     parks the send for the periodic walker to retry.
  *
- * A small pending table per conn (RNSD_MAILBOX_MAX_PENDING slots) lets
+ * A small pending table per conn (RNSD_OUR_DEST_MAX_PENDING slots) lets
  * sends to different peers search for routes concurrently. When every slot
  * is occupied a further send is backpressured with OUT_STATUS QUEUE_FULL —
  * not accepted, not dropped — and the app holds it for resend. */
@@ -196,7 +193,7 @@ static_assert(sizeof(rnsd_dest_connect_t) <= ITS_MAX_MSG_DATA,
 
 /* RNSD_PORT_LINK connect payload — rnsd-private (mirrors
  * rnsd_dest_connect_t; consumers go through rnsdLinkOpen() in rnsd.h,
- * which fills it from typed args). Phase C — docs/plans/link.md §6.1. */
+ * which fills it from typed args). */
 typedef struct {
     uint8_t  dest_hash[RNSD_DEST_HASH_LEN];  /* target destination hash */
     char     aspect[32];                     /* "lxmf.delivery" */
@@ -208,14 +205,14 @@ typedef struct {
 static_assert(sizeof(rnsd_link_connect_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_connect_t must fit ITS_MAX_MSG_DATA");
 
-#define RNSD_MAX_MAILBOX_CONNS    4
+#define RNSD_MAX_OUR_DESTS    4
 /* Per-conn pending path-search slots. Each holds one parked OUT_PACKET (its
  * full LXM wire, ~≤500B) whose path hasn't resolved yet, so multiple sends to
  * different peers can search for routes concurrently instead of evicting one
  * another. When all slots are full a new send is backpressured (OUT_STATUS
  * QUEUE_FULL) rather than dropped — the app holds it and resends. Kept small:
  * the bytes vectors land on the internal heap, which is scarce on the T-Deck. */
-#define RNSD_MAILBOX_MAX_PENDING  4
+#define RNSD_OUR_DEST_MAX_PENDING  4
 /* Generous — costs only a slot struct + (lazily, PSRAM) ITS buffers each.
  * When the table is full a new open evicts the longest-idle link rather than
  * failing (linkAlloc), so this is a soft concurrency ceiling, never a hard
@@ -224,9 +221,9 @@ static_assert(sizeof(rnsd_link_connect_t) <= ITS_MAX_MSG_DATA,
 
 /* Length-checked inbound buffer for the IN destination dispatcher. RNS
  * MTU is 500 — 600 covers framing slack. */
-#define RNSD_MAILBOX_INBOUND_MAX  600
+#define RNSD_OUR_DEST_INBOUND_MAX  600
 
-struct mailbox_pending_t {
+struct our_dest_pending_t {
     bool                 used;
     uint16_t             send_id;
     std::vector<uint8_t> bytes;          /* full LXM wire (incl. 16B target hash prefix) */
@@ -235,43 +232,43 @@ struct mailbox_pending_t {
     int                  attempts;       /* RETRY frames emitted so far */
 };
 
-struct mailbox_conn_t {
+struct our_dest_t {
     bool                       used;
     int                        handle;
     rnsd_dest_connect_t     req;
 
-    /* Listener identity + IN destination — built in onMailboxConnect.
+    /* Listener identity + IN destination — built in onOurDestConnect.
      * Empty (Type::NONE) on failure; that conn drops all OUT/IN traffic
      * silently with err() logged. */
     RNS::Identity              listener_identity{RNS::Type::NONE};
     RNS::Destination           listener_dest{RNS::Type::NONE};
     RNS::Bytes                 listener_hash;          /* for inbound dispatch lookup */
 
-    /* Phase D — RNSD_DEST_LINK_LISTEN. Zero = not listening for Links.
+    /* RNSD_DEST_LINK_LISTEN. Zero = not listening for Links.
      * link_listener_task is itsRemoteTask(handle) cached at register
      * time so inbound Links back-connect without a name lookup. */
     TaskHandle_t               link_listener_task = nullptr;
     uint16_t                   link_inbox_port    = 0;
 
-    mailbox_pending_t          pending[RNSD_MAILBOX_MAX_PENDING];  /* concurrent path searches */
+    our_dest_pending_t          pending[RNSD_OUR_DEST_MAX_PENDING];  /* concurrent path searches */
 };
 
-static mailbox_conn_t* s_mailbox_conns = nullptr;
+static our_dest_t* s_our_dests = nullptr;
 
 /* Path-request retry cadence: exponential backoff, not a fixed interval.
- * A parked send fires its first request immediately; mailboxRetryDelay()
+ * A parked send fires its first request immediately; ourDestRetryDelay()
  * gives the gap before each *subsequent* request, indexed by how many
  * retries have already gone out (pending.attempts). Steady state caps at
  * 30 min so a long-unreachable peer keeps a slow heartbeat without
- * flooding the mesh. After RNSD_MAILBOX_PATH_GIVEUP_S with no path the
+ * flooding the mesh. After RNSD_OUR_DEST_PATH_GIVEUP_S with no path the
  * send is failed (OUT_RESULT status=FAILED) and unparked. */
-static double mailboxRetryDelay(int attempts) {
+static double ourDestRetryDelay(int attempts) {
     static const double S[] = { 5, 30, 60, 120, 240, 480, 960 };
     if (attempts < 0) attempts = 0;
     if (attempts >= (int)(sizeof(S) / sizeof(S[0]))) return 1800.0;
     return S[attempts];
 }
-#define RNSD_MAILBOX_PATH_GIVEUP_S   (6.0 * 3600.0)
+#define RNSD_OUR_DEST_PATH_GIVEUP_S   (6.0 * 3600.0)
 
 /* ─────────────── Identity ─────────────── */
 
@@ -410,7 +407,7 @@ static void publishIfaceDown(const iface_t& i)
 
 static int onTransportConnect(int handle, const void* data, size_t len)
 {
-    if (len < sizeof(rnsd_transport_t)) {
+    if (len < sizeof(rnsd_iface_t)) {
         err("register: payload too small (%zu)", len);
         return -1;
     }
@@ -421,7 +418,7 @@ static int onTransportConnect(int handle, const void* data, size_t len)
     }
     slot->used = true;
     slot->handle = handle;
-    memcpy(&slot->info, data, sizeof(rnsd_transport_t));
+    memcpy(&slot->info, data, sizeof(rnsd_iface_t));
     slot->info.name[sizeof(slot->info.name) - 1] = '\0';
     slot->info.ifac_netname[sizeof(slot->info.ifac_netname) - 1] = '\0';
     slot->info.ifac_netkey[sizeof(slot->info.ifac_netkey) - 1] = '\0';
@@ -505,26 +502,26 @@ static void onTransportRecv(int handle, size_t /*bytesAvail*/)
 
 /* ─────────────── RNSD_PORT_DEST handlers ─────────────── */
 
-static mailbox_conn_t* mailboxFindByHandle(int handle)
+static our_dest_t* ourDestFindByHandle(int handle)
 {
-    for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++)
-        if (s_mailbox_conns[j].used && s_mailbox_conns[j].handle == handle) return &s_mailbox_conns[j];
+    for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++)
+        if (s_our_dests[j].used && s_our_dests[j].handle == handle) return &s_our_dests[j];
     return nullptr;
 }
 
-static mailbox_conn_t* mailboxFindByDestHash(const RNS::Bytes& h)
+static our_dest_t* ourDestFindByDestHash(const RNS::Bytes& h)
 {
-    for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++) {
-        mailbox_conn_t& c = s_mailbox_conns[j];
+    for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++) {
+        our_dest_t& c = s_our_dests[j];
         if (c.used && c.listener_hash == h) return &c;
     }
     return nullptr;
 }
 
-static mailbox_conn_t* mailboxAlloc(void)
+static our_dest_t* ourDestAlloc(void)
 {
-    for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++)
-        if (!s_mailbox_conns[j].used) return &s_mailbox_conns[j];
+    for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++)
+        if (!s_our_dests[j].used) return &s_our_dests[j];
     return nullptr;
 }
 
@@ -565,7 +562,7 @@ static const char* destRetryReasonName(uint8_t reason)
     }
 }
 
-static void mailboxSendOutResult(mailbox_conn_t& c, uint16_t send_id,
+static void ourDestSendOutResult(our_dest_t& c, uint16_t send_id,
                                  uint8_t status, uint32_t rtt_ms, uint8_t hops)
 {
     uint8_t f[9];
@@ -579,10 +576,10 @@ static void mailboxSendOutResult(mailbox_conn_t& c, uint16_t send_id,
     f[7] = (uint8_t)( rtt_ms        & 0xFF);
     f[8] = hops;
     if (itsSend(c.handle, f, sizeof(f), pdMS_TO_TICKS(100)) == 0)
-        warn("mailbox: OUT_RESULT send dropped (send_id=%u)", (unsigned)send_id);
+        warn("our-dest: OUT_RESULT send dropped (send_id=%u)", (unsigned)send_id);
 }
 
-static void mailboxSendOutStatusBare(mailbox_conn_t& c, uint16_t send_id, uint8_t type)
+static void ourDestSendOutStatusBare(our_dest_t& c, uint16_t send_id, uint8_t type)
 {
     uint8_t f[4];
     f[0] = RNSD_DEST_OUT_STATUS;
@@ -590,11 +587,11 @@ static void mailboxSendOutStatusBare(mailbox_conn_t& c, uint16_t send_id, uint8_
     f[2] = (uint8_t)(send_id & 0xFF);
     f[3] = type;
     if (itsSend(c.handle, f, sizeof(f), pdMS_TO_TICKS(100)) == 0)
-        warn("mailbox: OUT_STATUS send dropped (send_id=%u type=%s)",
+        warn("our-dest: OUT_STATUS send dropped (send_id=%u type=%s)",
              (unsigned)send_id, destAuxName(type));
 }
 
-static void mailboxSendOutStatusRetry(mailbox_conn_t& c, uint16_t send_id,
+static void ourDestSendOutStatusRetry(our_dest_t& c, uint16_t send_id,
                                       uint8_t attempt, uint8_t reason)
 {
     uint8_t f[6];
@@ -605,17 +602,17 @@ static void mailboxSendOutStatusRetry(mailbox_conn_t& c, uint16_t send_id,
     f[4] = attempt;
     f[5] = reason;
     if (itsSend(c.handle, f, sizeof(f), pdMS_TO_TICKS(100)) == 0)
-        warn("mailbox: OUT_STATUS RETRY send dropped");
+        warn("our-dest: OUT_STATUS RETRY send dropped");
 }
 
-static void mailboxClearPendingSlot(mailbox_pending_t& p)
+static void ourDestClearPendingSlot(our_dest_pending_t& p)
 {
     p.used = false;
     p.bytes.clear();
 }
 
 /* First free pending slot in this conn, or nullptr if the table is full. */
-static mailbox_pending_t* mailboxPendingFindFree(mailbox_conn_t& c)
+static our_dest_pending_t* ourDestPendingFindFree(our_dest_t& c)
 {
     for (auto& p : c.pending)
         if (!p.used) return &p;
@@ -623,7 +620,7 @@ static mailbox_pending_t* mailboxPendingFindFree(mailbox_conn_t& c)
 }
 
 /* Parked send matching send_id in this conn, or nullptr. */
-static mailbox_pending_t* mailboxPendingFind(mailbox_conn_t& c, uint16_t send_id)
+static our_dest_pending_t* ourDestPendingFind(our_dest_t& c, uint16_t send_id)
 {
     for (auto& p : c.pending)
         if (p.used && p.send_id == send_id) return &p;
@@ -641,14 +638,14 @@ static mailbox_pending_t* mailboxPendingFind(mailbox_conn_t& c, uint16_t send_id
  *
  * Delivery is mR-native: proof validation in Transport::inbound fires the
  * receipt's delivery callback synchronously on this (rnsd) task — the same
- * context onMailboxInbound already runs ITS sends from. Timeouts are NOT
+ * context onOurDestInbound already runs ITS sends from. Timeouts are NOT
  * mR-native: PacketReceipt::check_timeout() flips status to FAILED/CULLED
  * but never invokes the timeout callback (the upstream thread spawn is
- * unported), so the 1 Hz mailboxReceiptTick() polls receipt status (our
+ * unported), so the 1 Hz ourDestReceiptTick() polls receipt status (our
  * slot holds a copy of the shared receipt object) plus a wall-clock
  * backstop deadline.
  *
- * mR callbacks carry no userdata: onMailboxReceiptDelivery resolves the
+ * mR callbacks carry no userdata: onOurDestReceiptDelivery resolves the
  * slot by receipt (packet) hash — the registry-match trick the link table
  * uses (linkFindByReqMrid). A slot settles exactly once: every settle path
  * nulls the receipt's delivery callback and frees the slot *before*
@@ -658,9 +655,9 @@ static mailbox_pending_t* mailboxPendingFind(mailbox_conn_t& c, uint16_t send_id
 
 #define RNSD_MAX_PENDING_RECEIPTS 8
 
-struct mailbox_receipt_t {
+struct our_dest_receipt_t {
     bool               used;
-    int                conn_idx;     /* index into s_mailbox_conns */
+    int                conn_idx;     /* index into s_our_dests */
     int                conn_handle;  /* guards conn-slot reuse */
     uint16_t           send_id;
     uint8_t            hops;
@@ -668,9 +665,9 @@ struct mailbox_receipt_t {
     RNS::PacketReceipt receipt{RNS::Type::NONE};
 };
 
-static mailbox_receipt_t* s_mailbox_receipts = nullptr;
+static our_dest_receipt_t* s_our_dest_receipts = nullptr;
 
-static void mailboxReceiptFree(mailbox_receipt_t& r)
+static void ourDestReceiptFree(our_dest_receipt_t& r)
 {
     /* Null the callback first: Transport's _receipts list can keep the
      * underlying receipt object alive past this slot, and a proof that
@@ -684,98 +681,98 @@ static void mailboxReceiptFree(mailbox_receipt_t& r)
 
 /* Free the slot, then emit the second OUT_RESULT iff the conn slot still
  * belongs to the consumer that sent (guards conn-slot reuse). */
-static void mailboxReceiptSettle(mailbox_receipt_t& r, uint8_t status,
+static void ourDestReceiptSettle(our_dest_receipt_t& r, uint8_t status,
                                  uint32_t rtt_ms)
 {
     int      conn_idx    = r.conn_idx;
     int      conn_handle = r.conn_handle;
     uint16_t send_id     = r.send_id;
     uint8_t  hops        = r.hops;
-    mailboxReceiptFree(r);
-    mailbox_conn_t& c = s_mailbox_conns[conn_idx];
+    ourDestReceiptFree(r);
+    our_dest_t& c = s_our_dests[conn_idx];
     if (c.used && c.handle == conn_handle)
-        mailboxSendOutResult(c, send_id, status, rtt_ms, hops);
+        ourDestSendOutResult(c, send_id, status, rtt_ms, hops);
 }
 
 /* mR delivery callback — runs on the rnsd task during Transport proof
  * validation. No userdata; resolve by packet hash. */
-static void onMailboxReceiptDelivery(const RNS::PacketReceipt& receipt)
+static void onOurDestReceiptDelivery(const RNS::PacketReceipt& receipt)
 {
-    if (!s_mailbox_receipts || !receipt) return;
+    if (!s_our_dest_receipts || !receipt) return;
     for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++) {
-        mailbox_receipt_t& r = s_mailbox_receipts[j];
+        our_dest_receipt_t& r = s_our_dest_receipts[j];
         if (!r.used || !r.receipt) continue;
         if (!(r.receipt.hash() == receipt.hash())) continue;
         uint32_t rtt_ms = (uint32_t)(r.receipt.get_rtt() * 1000.0);
-        info("mailbox: send_id=%u delivery proven (rtt=%u ms)",
+        info("our-dest: send_id=%u delivery proven (rtt=%u ms)",
              (unsigned)r.send_id, (unsigned)rtt_ms);
-        mailboxReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED, rtt_ms);
+        ourDestReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED, rtt_ms);
         return;
     }
 }
 
-static void mailboxReceiptTrack(mailbox_conn_t& c, uint16_t send_id,
+static void ourDestReceiptTrack(our_dest_t& c, uint16_t send_id,
                                 RNS::PacketReceipt& receipt, uint8_t hops)
 {
-    if (!s_mailbox_receipts || !receipt) return;
-    mailbox_receipt_t* slot = nullptr;
+    if (!s_our_dest_receipts || !receipt) return;
+    our_dest_receipt_t* slot = nullptr;
     for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++)
-        if (!s_mailbox_receipts[j].used) { slot = &s_mailbox_receipts[j]; break; }
+        if (!s_our_dest_receipts[j].used) { slot = &s_our_dest_receipts[j]; break; }
     if (!slot) {
         /* Bounded table: evict the oldest (nearest deadline), settling it
          * as PROOF_TIMEOUT so the consumer's outbox resolves instead of
          * waiting on a result that will never come. */
         for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++)
-            if (!slot || s_mailbox_receipts[j].deadline < slot->deadline)
-                slot = &s_mailbox_receipts[j];
-        warn("mailbox: receipt table full — evicting send_id=%u",
+            if (!slot || s_our_dest_receipts[j].deadline < slot->deadline)
+                slot = &s_our_dest_receipts[j];
+        warn("our-dest: receipt table full — evicting send_id=%u",
              (unsigned)slot->send_id);
-        mailboxReceiptSettle(*slot, RNSD_DEST_STATUS_PROOF_TIMEOUT, 0);
+        ourDestReceiptSettle(*slot, RNSD_DEST_STATUS_PROOF_TIMEOUT, 0);
     }
     slot->used        = true;
-    slot->conn_idx    = (int)(&c - s_mailbox_conns);
+    slot->conn_idx    = (int)(&c - s_our_dests);
     slot->conn_handle = c.handle;
     slot->send_id     = send_id;
     slot->hops        = hops;
     slot->deadline    = RNS::Utilities::OS::time()
                       + storageGetInt("s.rnsd.proof_timeout_s", 60);
     slot->receipt     = receipt;
-    receipt.set_delivery_callback(onMailboxReceiptDelivery);
+    receipt.set_delivery_callback(onOurDestReceiptDelivery);
 }
 
-/* 1 Hz from the rnsd loop, beside mailboxTickPending. */
-static void mailboxReceiptTick(void)
+/* 1 Hz from the rnsd loop, beside ourDestTickPending. */
+static void ourDestReceiptTick(void)
 {
-    if (!s_mailbox_receipts) return;
+    if (!s_our_dest_receipts) return;
     double now = RNS::Utilities::OS::time();
     for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++) {
-        mailbox_receipt_t& r = s_mailbox_receipts[j];
+        our_dest_receipt_t& r = s_our_dest_receipts[j];
         if (!r.used) continue;
         RNS::Type::PacketReceipt::Status st = r.receipt
             ? r.receipt.status() : RNS::Type::PacketReceipt::FAILED;
         if (st == RNS::Type::PacketReceipt::DELIVERED) {
             /* Normally settled by the delivery callback; backstop in case
              * a proof validated without it firing. */
-            mailboxReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED,
+            ourDestReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED,
                                  (uint32_t)(r.receipt.get_rtt() * 1000.0));
         } else if (st != RNS::Type::PacketReceipt::SENT || now >= r.deadline) {
             /* FAILED/CULLED — mR's own receipt timeout (Transport's sweep
              * flips status but never fires timeout callbacks) — or our
              * wall-clock backstop. Not a failure: the packet may well have
              * arrived; the peer just didn't prove it (in time). */
-            info("mailbox: send_id=%u no delivery proof", (unsigned)r.send_id);
-            mailboxReceiptSettle(r, RNSD_DEST_STATUS_PROOF_TIMEOUT, 0);
+            info("our-dest: send_id=%u no delivery proof", (unsigned)r.send_id);
+            ourDestReceiptSettle(r, RNSD_DEST_STATUS_PROOF_TIMEOUT, 0);
         }
     }
 }
 
 /* Consumer conn closed — drop its pending receipts (nulls callbacks). */
-static void mailboxReceiptPurgeConn(int conn_idx)
+static void ourDestReceiptPurgeConn(int conn_idx)
 {
-    if (!s_mailbox_receipts) return;
+    if (!s_our_dest_receipts) return;
     for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++) {
-        mailbox_receipt_t& r = s_mailbox_receipts[j];
-        if (r.used && r.conn_idx == conn_idx) mailboxReceiptFree(r);
+        our_dest_receipt_t& r = s_our_dest_receipts[j];
+        if (r.used && r.conn_idx == conn_idx) ourDestReceiptFree(r);
     }
 }
 
@@ -808,33 +805,33 @@ static void rnsdDbgMsgContent(const char* dir, const uint8_t* p, size_t n)
  *   0  — pending: REQUESTING_PATH emitted, send is parked
  *  -1  — terminal failure (recall/Destination/send threw): OUT_RESULT
  *        status=evicted emitted */
-static int mailboxTrySend(mailbox_conn_t& c, uint16_t send_id,
+static int ourDestTrySend(our_dest_t& c, uint16_t send_id,
                           const uint8_t* bytes, size_t n)
 {
     if (n < 16) {
-        err("mailbox: OUT_PACKET too short (%zu)", n);
-        mailboxSendOutResult(c, send_id, RNSD_DEST_STATUS_EVICTED, 0, 0);
+        err("our-dest: OUT_PACKET too short (%zu)", n);
+        ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_EVICTED, 0, 0);
         return -1;
     }
 
     RNS::Bytes dh(bytes, 16);
 
     if (!RNS::Transport::has_path(dh)) {
-        info("mailbox: send_id=%u requesting path for %s (no entry)",
+        info("our-dest: send_id=%u requesting path for %s (no entry)",
              (unsigned)send_id, dh.toHex().c_str());
         try { RNS::Transport::request_path(dh); }
-        catch (const std::exception& e) { warn("mailbox: request_path threw: %s", e.what()); }
-        mailboxSendOutStatusBare(c, send_id, RNSD_DEST_AUX_REQUESTING_PATH);
+        catch (const std::exception& e) { warn("our-dest: request_path threw: %s", e.what()); }
+        ourDestSendOutStatusBare(c, send_id, RNSD_DEST_AUX_REQUESTING_PATH);
         return 0;
     }
 
     RNS::Identity target = RNS::Identity::recall(dh);
     if (!target) {
-        info("mailbox: send_id=%u requesting path for %s (have path, no identity)",
+        info("our-dest: send_id=%u requesting path for %s (have path, no identity)",
              (unsigned)send_id, dh.toHex().c_str());
         try { RNS::Transport::request_path(dh); }
-        catch (const std::exception& e) { warn("mailbox: request_path threw: %s", e.what()); }
-        mailboxSendOutStatusBare(c, send_id, RNSD_DEST_AUX_REQUESTING_PATH);
+        catch (const std::exception& e) { warn("our-dest: request_path threw: %s", e.what()); }
+        ourDestSendOutStatusBare(c, send_id, RNSD_DEST_AUX_REQUESTING_PATH);
         return 0;
     }
 
@@ -867,27 +864,27 @@ static int mailboxTrySend(mailbox_conn_t& c, uint16_t send_id,
         uint8_t hops = (uint8_t)RNS::Transport::hops_to(dh);
         RNS::PacketReceipt receipt = pkt.send();
         if (!receipt) {
-            warn("mailbox: pkt.send() returned no receipt");
-            mailboxSendOutResult(c, send_id, RNSD_DEST_STATUS_EVICTED, 0, 0);
+            warn("our-dest: pkt.send() returned no receipt");
+            ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_EVICTED, 0, 0);
             return -1;
         }
-        mailboxSendOutStatusBare(c, send_id, RNSD_DEST_AUX_EGRESS_QUEUED);
+        ourDestSendOutStatusBare(c, send_id, RNSD_DEST_AUX_EGRESS_QUEUED);
         /* Egress accepted → SENT immediately (the UI's fast grey check).
          * Upstream peers prove opportunistic packets, so keep the receipt
          * and follow up with a second OUT_RESULT — DELIVERED when the
          * proof lands, PROOF_TIMEOUT otherwise. */
-        mailboxSendOutResult(c, send_id, RNSD_DEST_STATUS_SENT, 0, hops);
-        mailboxReceiptTrack(c, send_id, receipt, hops);
+        ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_SENT, 0, hops);
+        ourDestReceiptTrack(c, send_id, receipt, hops);
         RNS::Interface oif = RNS::Transport::next_hop_interface(dh);
-        info("mailbox: send_id=%u sent to %s via %s (hops=%u, %zuB payload)",
+        info("our-dest: send_id=%u sent to %s via %s (hops=%u, %zuB payload)",
              (unsigned)send_id, dh.toHex().c_str(),
              oif ? oif.toString().c_str() : "<none>",
              (unsigned)hops, n);
         rnsdDbgMsgContent("send", bytes + 16, n - 16);
         return 1;
     } catch (const std::exception& e) {
-        err("mailbox: send threw: %s", e.what());
-        mailboxSendOutResult(c, send_id, RNSD_DEST_STATUS_EVICTED, 0, 0);
+        err("our-dest: send threw: %s", e.what());
+        ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_EVICTED, 0, 0);
         return -1;
     }
 }
@@ -895,15 +892,16 @@ static int mailboxTrySend(mailbox_conn_t& c, uint16_t send_id,
 /* mR's packet callback for incoming LXM-style packets on any listener
  * destination. We don't get a user-data slot, so the dispatcher walks
  * the conn table comparing destination hashes. */
-/* Phase D: inbound-Link established callback, set on every listening IN
- * destination. Defined in the Phase C block (needs s_link_conns etc.). */
+/* Inbound-Link established callback, set on every listening IN
+ * destination. Defined in the consumer-API block below (needs
+ * s_link_conns etc.). */
 static void onIncomingLinkEstablished(RNS::Link& link);
 
-static void onMailboxInbound(const RNS::Bytes& plaintext, const RNS::Packet& packet)
+static void onOurDestInbound(const RNS::Bytes& plaintext, const RNS::Packet& packet)
 {
-    mailbox_conn_t* c = mailboxFindByDestHash(packet.destination().hash());
+    our_dest_t* c = ourDestFindByDestHash(packet.destination().hash());
     if (!c) {
-        info("mailbox inbound: no conn for dest %s (%zuB plaintext)",
+        info("our-dest inbound: no conn for dest %s (%zuB plaintext)",
              packet.destination().hash().toHex().c_str(), plaintext.size());
         return;
     }
@@ -911,31 +909,31 @@ static void onMailboxInbound(const RNS::Bytes& plaintext, const RNS::Packet& pac
      * destination hash; reconstruct the full LXM wire by prepending our
      * own destination hash (the IN destination that received this packet)
      * before handing off to the consumer. Symmetric with the strip done
-     * in mailboxTrySend. See LXMF LXMRouter.delivery_packet(). */
-    if (plaintext.size() + 1 + 16 > RNSD_MAILBOX_INBOUND_MAX) {
-        warn("mailbox inbound: oversize plaintext %zu B (dropping)", plaintext.size());
+     * in ourDestTrySend. See LXMF LXMRouter.delivery_packet(). */
+    if (plaintext.size() + 1 + 16 > RNSD_OUR_DEST_INBOUND_MAX) {
+        warn("our-dest inbound: oversize plaintext %zu B (dropping)", plaintext.size());
         return;
     }
-    info("mailbox inbound: %zuB for dest %s → handle=%d",
+    info("our-dest inbound: %zuB for dest %s → handle=%d",
          plaintext.size(), packet.destination().hash().toHex().c_str(), c->handle);
     rnsdDbgMsgContent("recv", plaintext.data(), plaintext.size());
-    uint8_t f[RNSD_MAILBOX_INBOUND_MAX];
+    uint8_t f[RNSD_OUR_DEST_INBOUND_MAX];
     f[0] = RNSD_DEST_IN_PACKET;
     memcpy(f + 1,      packet.destination().hash().data(), 16);
     memcpy(f + 1 + 16, plaintext.data(), plaintext.size());
     if (itsSend(c->handle, f, 1 + 16 + plaintext.size(), pdMS_TO_TICKS(100)) == 0)
-        warn("mailbox inbound: ITS send dropped (%zu B)", plaintext.size());
+        warn("our-dest inbound: ITS send dropped (%zu B)", plaintext.size());
 }
 
-static int onMailboxConnect(int handle, const void* data, size_t len)
+static int onOurDestConnect(int handle, const void* data, size_t len)
 {
     if (len != sizeof(rnsd_dest_connect_t)) {
-        err("mailbox connect: bad payload len %zu (want %zu)",
+        err("our-dest connect: bad payload len %zu (want %zu)",
             len, sizeof(rnsd_dest_connect_t));
         return -1;
     }
-    mailbox_conn_t* slot = mailboxAlloc();
-    if (!slot) { err("mailbox connect: no slots"); return -1; }
+    our_dest_t* slot = ourDestAlloc();
+    if (!slot) { err("our-dest connect: no slots"); return -1; }
 
     slot->used   = true;
     slot->handle = handle;
@@ -945,28 +943,28 @@ static int onMailboxConnect(int handle, const void* data, size_t len)
     slot->listener_identity = RNS::Identity(RNS::Type::NONE);
     slot->listener_dest     = RNS::Destination(RNS::Type::NONE);
     slot->listener_hash     = RNS::Bytes();
-    for (auto& p : slot->pending) p = mailbox_pending_t{};
+    for (auto& p : slot->pending) p = our_dest_pending_t{};
 
     /* Load listener identity. */
     const char* key = slot->req.identity_key[0] ? slot->req.identity_key : "secrets.rnsd.identity";
     char hex[160] = {};
     storageGetStr(key, hex, sizeof(hex), "");
     if (strlen(hex) != 128) {
-        err("mailbox connect: no identity at %s — accepting outbound-only mode", key);
-        info("mailbox conn %d open: aspect=%s outbound-only",
-             (int)(slot - s_mailbox_conns), slot->req.aspect);
-        return (int)(slot - s_mailbox_conns);
+        err("our-dest connect: no identity at %s — accepting outbound-only mode", key);
+        info("our-dest conn %d open: aspect=%s outbound-only",
+             (int)(slot - s_our_dests), slot->req.aspect);
+        return (int)(slot - s_our_dests);
     }
     RNS::Bytes prv;
     prv.assignHex((const uint8_t*)hex, 128);
     if (prv.size() != 64) {
-        err("mailbox connect: bad identity hex at %s", key);
-        return (int)(slot - s_mailbox_conns);
+        err("our-dest connect: bad identity hex at %s", key);
+        return (int)(slot - s_our_dests);
     }
     RNS::Identity id(false);
     if (!id.load_private_key(prv)) {
-        err("mailbox connect: identity load failed for %s", key);
-        return (int)(slot - s_mailbox_conns);
+        err("our-dest connect: identity load failed for %s", key);
+        return (int)(slot - s_our_dests);
     }
 
     /* Split aspect into app_name + remaining. */
@@ -984,13 +982,13 @@ static int onMailboxConnect(int handle, const void* data, size_t len)
     try {
         RNS::Destination d(id, RNS::Type::Destination::IN, dtype,
                            app_name.c_str(), aspects.c_str());
-        /* Phase A of docs/plans/link.md §4.3: mR defaults
-         * Destination::_accept_link_requests to true. Until Phase D's
-         * RNSD_DEST_LINK_LISTEN aux flips it back on per-consumer, every
-         * IN destination must explicitly refuse Link requests — otherwise
-         * inbound LRs spawn Link objects with no callbacks attached. */
+        /* mR defaults Destination::_accept_link_requests to true. Until
+         * the RNSD_DEST_LINK_LISTEN aux flips it back on per-consumer,
+         * every IN destination must explicitly refuse Link requests —
+         * otherwise inbound LRs spawn Link objects with no callbacks
+         * attached. */
         d.accepts_links(false);
-        d.set_packet_callback(onMailboxInbound);
+        d.set_packet_callback(onOurDestInbound);
         /* Delivery proofs are an operator dial: s.rnsd.prove_incoming
          * (default ON, like upstream LXMF's delivery destinations — senders
          * of opportunistic / direct packets keep a PacketReceipt and settle
@@ -1006,42 +1004,42 @@ static int onMailboxConnect(int handle, const void* data, size_t len)
         slot->listener_identity = id;
         slot->listener_dest     = d;
         slot->listener_hash     = d.hash();
-        info("mailbox conn %d open: aspect=%s identity=%s dest=%s",
-             (int)(slot - s_mailbox_conns), slot->req.aspect,
+        info("our-dest conn %d open: aspect=%s identity=%s dest=%s",
+             (int)(slot - s_our_dests), slot->req.aspect,
              id.hexhash().c_str(), d.hash().toHex().c_str());
         /* Observability: surface hosted destinations to storage so the
          * browser / CLI can see what we host (and so tests can resolve
          * a dest hash without log access). */
         {
-            int idx = (int)(slot - s_mailbox_conns);
+            int idx = (int)(slot - s_our_dests);
             char k[64];
-            snprintf(k, sizeof(k), "rnsd.mailbox.%d.aspect", idx);
+            snprintf(k, sizeof(k), "rnsd.dest.%d.aspect", idx);
             storageSet(k, slot->req.aspect);
-            snprintf(k, sizeof(k), "rnsd.mailbox.%d.dest", idx);
+            snprintf(k, sizeof(k), "rnsd.dest.%d.dest", idx);
             storageSet(k, d.hash().toHex().c_str());
         }
     } catch (const std::exception& e) {
-        err("mailbox connect: Destination ctor threw: %s", e.what());
+        err("our-dest connect: Destination ctor threw: %s", e.what());
     }
 
-    return (int)(slot - s_mailbox_conns);
+    return (int)(slot - s_our_dests);
 }
 
-static void onMailboxDisconnect(int ref)
+static void onOurDestDisconnect(int ref)
 {
-    if (ref < 0 || ref >= RNSD_MAX_MAILBOX_CONNS) return;
-    mailbox_conn_t& c = s_mailbox_conns[ref];
+    if (ref < 0 || ref >= RNSD_MAX_OUR_DESTS) return;
+    our_dest_t& c = s_our_dests[ref];
     if (!c.used) return;
-    info("mailbox conn %d close (dest=%s)", ref,
+    info("our-dest conn %d close (dest=%s)", ref,
          c.listener_hash ? c.listener_hash.toHex().c_str() : "-");
-    mailboxReceiptPurgeConn(ref);
+    ourDestReceiptPurgeConn(ref);
     if (c.listener_dest) {
         try { RNS::Transport::deregister_destination(c.listener_dest); }
         catch (const std::exception& e) { warn("deregister_destination threw: %s", e.what()); }
     }
     {
         char p[48];
-        snprintf(p, sizeof(p), "rnsd.mailbox.%d", ref);
+        snprintf(p, sizeof(p), "rnsd.dest.%d", ref);
         storageDeleteTree(p);
     }
     c.used   = false;
@@ -1051,14 +1049,14 @@ static void onMailboxDisconnect(int ref)
     c.listener_identity = RNS::Identity(RNS::Type::NONE);
     c.listener_dest     = RNS::Destination(RNS::Type::NONE);
     c.listener_hash     = RNS::Bytes();
-    for (auto& p : c.pending) p = mailbox_pending_t{};
+    for (auto& p : c.pending) p = our_dest_pending_t{};
 }
 
-static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
+static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
 {
-    mailbox_conn_t* c = mailboxFindByHandle(handle);
+    our_dest_t* c = ourDestFindByHandle(handle);
     if (!c) return;
-    PSRAM_BSS static uint8_t buf[1 + RNSD_MAILBOX_INBOUND_MAX];
+    PSRAM_BSS static uint8_t buf[1 + RNSD_OUR_DEST_INBOUND_MAX];
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n == 0) return;
 
@@ -1066,25 +1064,25 @@ static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
     switch (op) {
         case RNSD_DEST_OUT_PACKET: {
             if (n < 3 + 16) {
-                err("mailbox: OUT_PACKET too short (%zu)", n);
+                err("our-dest: OUT_PACKET too short (%zu)", n);
                 return;
             }
             uint16_t send_id = ((uint16_t)buf[1] << 8) | (uint16_t)buf[2];
             const uint8_t* lxm = buf + 3;
             size_t lxm_n = n - 3;
-            int r = mailboxTrySend(*c, send_id, lxm, lxm_n);
+            int r = ourDestTrySend(*c, send_id, lxm, lxm_n);
             if (r == 0) {
                 /* Park for the periodic walker — one free slot per parked
                  * send, so concurrent sends to different peers each get
                  * their own path search. */
-                mailbox_pending_t* slot = mailboxPendingFindFree(*c);
+                our_dest_pending_t* slot = ourDestPendingFindFree(*c);
                 if (!slot) {
                     /* Table full: backpressure instead of evicting an
                      * in-flight search. The app holds this send (stage
                      * stays "queued") and resends once a slot frees. */
-                    warn("mailbox: pending table full (%d in flight), holding send_id=%u",
-                         RNSD_MAILBOX_MAX_PENDING, (unsigned)send_id);
-                    mailboxSendOutStatusBare(*c, send_id, RNSD_DEST_AUX_QUEUE_FULL);
+                    warn("our-dest: pending table full (%d in flight), holding send_id=%u",
+                         RNSD_OUR_DEST_MAX_PENDING, (unsigned)send_id);
+                    ourDestSendOutStatusBare(*c, send_id, RNSD_DEST_AUX_QUEUE_FULL);
                     break;
                 }
                 slot->used    = true;
@@ -1097,22 +1095,22 @@ static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
             break;
         }
         case RNSD_DEST_OUT_CANCEL: {
-            if (n < 3) { err("mailbox: OUT_CANCEL too short (%zu)", n); return; }
+            if (n < 3) { err("our-dest: OUT_CANCEL too short (%zu)", n); return; }
             uint16_t send_id = ((uint16_t)buf[1] << 8) | (uint16_t)buf[2];
-            mailbox_pending_t* p = mailboxPendingFind(*c, send_id);
+            our_dest_pending_t* p = ourDestPendingFind(*c, send_id);
             if (p) {
-                mailboxClearPendingSlot(*p);
-                mailboxSendOutResult(*c, send_id, RNSD_DEST_STATUS_CANCELLED, 0, 0);
+                ourDestClearPendingSlot(*p);
+                ourDestSendOutResult(*c, send_id, RNSD_DEST_STATUS_CANCELLED, 0, 0);
             } else {
                 /* Not parked — already terminal. Send a synthetic
                  * cancelled so the client's state machine resolves. */
-                mailboxSendOutResult(*c, send_id, RNSD_DEST_STATUS_CANCELLED, 0, 0);
+                ourDestSendOutResult(*c, send_id, RNSD_DEST_STATUS_CANCELLED, 0, 0);
             }
             break;
         }
         case RNSD_DEST_ANNOUNCE: {
             if (!c->listener_dest) {
-                warn("mailbox: ANNOUNCE on outbound-only conn (no listener)");
+                warn("our-dest: ANNOUNCE on outbound-only conn (no listener)");
                 break;
             }
             RNS::Bytes app_data;
@@ -1124,18 +1122,18 @@ static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
                      c->req.aspect,
                      formatAnnounceAppData(app_data).c_str());
             } catch (const std::exception& e) {
-                err("mailbox: announce threw: %s", e.what());
+                err("our-dest: announce threw: %s", e.what());
             }
             break;
         }
         case RNSD_DEST_LINK_LISTEN: {
             if (!c->listener_dest) {
-                warn("mailbox: LINK_LISTEN on outbound-only conn");
+                warn("our-dest: LINK_LISTEN on outbound-only conn");
                 break;
             }
-            if (n < 3) { err("mailbox: LINK_LISTEN too short (%zu)", n); break; }
+            if (n < 3) { err("our-dest: LINK_LISTEN too short (%zu)", n); break; }
             uint16_t port = ((uint16_t)buf[1] << 8) | (uint16_t)buf[2];
-            if (port == 0) { warn("mailbox: LINK_LISTEN port 0"); break; }
+            if (port == 0) { warn("our-dest: LINK_LISTEN port 0"); break; }
             c->link_listener_task = itsRemoteTask(handle);
             c->link_inbox_port    = port;
             try {
@@ -1143,29 +1141,29 @@ static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
                     onIncomingLinkEstablished);
                 c->listener_dest.accepts_links(true);
             } catch (const std::exception& e) {
-                err("mailbox: LINK_LISTEN wiring threw: %s", e.what());
+                err("our-dest: LINK_LISTEN wiring threw: %s", e.what());
                 break;
             }
-            info("mailbox conn %d: listening for inbound Links → port %u",
-                 (int)(c - s_mailbox_conns), (unsigned)port);
+            info("our-dest conn %d: listening for inbound Links → port %u",
+                 (int)(c - s_our_dests), (unsigned)port);
             break;
         }
         default:
-            warn("mailbox: unknown opcode 0x%02x", (unsigned)op);
+            warn("our-dest: unknown opcode 0x%02x", (unsigned)op);
             break;
     }
 }
 
 /* Periodic walker: retry pending sends as paths land. Called from the
  * rnsd main loop at 1 Hz. */
-static void mailboxTickPending(void)
+static void ourDestTickPending(void)
 {
     double now = RNS::Utilities::OS::time();
-    for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++) {
-        mailbox_conn_t& c = s_mailbox_conns[j];
+    for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++) {
+        our_dest_t& c = s_our_dests[j];
         if (!c.used) continue;
 
-        for (mailbox_pending_t& p : c.pending) {
+        for (our_dest_pending_t& p : c.pending) {
             if (!p.used) continue;
 
             RNS::Bytes dh(p.bytes.data(), 16);
@@ -1173,36 +1171,36 @@ static void mailboxTickPending(void)
             if (RNS::Transport::has_path(dh) && RNS::Identity::recall(dh)) {
                 uint16_t send_id = p.send_id;
                 RNS::Interface oif = RNS::Transport::next_hop_interface(dh);
-                info("mailbox: send_id=%u path found for %s via %s (hops=%u, after %u request%s)",
+                info("our-dest: send_id=%u path found for %s via %s (hops=%u, after %u request%s)",
                      (unsigned)send_id, dh.toHex().c_str(),
                      oif ? oif.toString().c_str() : "<none>",
                      (unsigned)RNS::Transport::hops_to(dh),
                      (unsigned)p.attempts,
                      p.attempts == 1 ? "" : "s");
                 std::vector<uint8_t> bytes = p.bytes;
-                mailboxClearPendingSlot(p);
-                mailboxTrySend(c, send_id, bytes.data(), bytes.size());
+                ourDestClearPendingSlot(p);
+                ourDestTrySend(c, send_id, bytes.data(), bytes.size());
                 continue;
             }
 
-            if (now - p.first_seen_at >= RNSD_MAILBOX_PATH_GIVEUP_S) {
+            if (now - p.first_seen_at >= RNSD_OUR_DEST_PATH_GIVEUP_S) {
                 uint16_t send_id = p.send_id;
-                info("mailbox: send_id=%u giving up path search for %s after %.0fs",
+                info("our-dest: send_id=%u giving up path search for %s after %.0fs",
                      (unsigned)send_id, dh.toHex().c_str(),
                      now - p.first_seen_at);
-                mailboxClearPendingSlot(p);
-                mailboxSendOutResult(c, send_id, RNSD_DEST_STATUS_FAILED, 0, 0);
+                ourDestClearPendingSlot(p);
+                ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_FAILED, 0, 0);
                 continue;
             }
 
-            if (now - p.last_request_path_at >= mailboxRetryDelay(p.attempts)) {
-                info("mailbox: send_id=%u retrying path request for %s (attempt %u)",
+            if (now - p.last_request_path_at >= ourDestRetryDelay(p.attempts)) {
+                info("our-dest: send_id=%u retrying path request for %s (attempt %u)",
                      (unsigned)p.send_id, dh.toHex().c_str(),
                      (unsigned)(p.attempts + 1));
                 try { RNS::Transport::request_path(dh); }
-                catch (const std::exception& e) { warn("mailbox: request_path threw: %s", e.what()); }
+                catch (const std::exception& e) { warn("our-dest: request_path threw: %s", e.what()); }
                 p.attempts++;
-                mailboxSendOutStatusRetry(c, p.send_id,
+                ourDestSendOutStatusRetry(c, p.send_id,
                                           (uint8_t)std::min(p.attempts, 255),
                                           RNSD_DEST_RETRY_REASON_PATH_TIMEOUT);
                 p.last_request_path_at = now;
@@ -1384,7 +1382,7 @@ static std::string appDataMsgPack(const RNS::Bytes& app_data) {
  *   - otherwise                                  → "(NB)=\"<printable>\""
  *
  * Used by both incoming announces (AnnounceDebugLogger) and outgoing
- * announces (mailbox ANNOUNCE / management dest) so they format the
+ * announces (our-dest ANNOUNCE / management dest) so they format the
  * same way. Returns a self-contained suffix; callers prepend whatever
  * destination/identity/hops context they have. */
 static std::string formatAnnounceAppData(const RNS::Bytes& app_data)
@@ -1551,9 +1549,8 @@ static void rnsdManagementDestUp(void)
         s_management_dest = RNS::Destination(*s_identity,
             RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE,
             "rnstransport", "remote.management");
-        /* Phase A of docs/plans/link.md §4.3: refuse Link requests until
-         * Phase G ports register_request_handler and we know how to
-         * service them. */
+        /* Refuse Link requests until we port register_request_handler
+         * and know how to service them. */
         s_management_dest.accepts_links(false);
         info("management dest up: %s",
              s_management_dest.hash().toHex().c_str());
@@ -1776,7 +1773,7 @@ static void publishStats(void)
 
 /* ─────────────── CLI ─────────────── */
 
-/* Defined in the Phase C block below, where s_link_conns lives. */
+/* Defined in the consumer-API block below, where s_link_conns lives. */
 static int rnsdLinkConnsUsed();
 
 /* One `rnsd memory` breakdown row, aligned, with bytes + % of task PSRAM.
@@ -1896,9 +1893,9 @@ static void cliRnsdMemory(void)
     {
         int ifc = 0, mbc = 0, lkc = rnsdLinkConnsUsed();
         for (int j = 0; j < RNSD_MAX_IFACES; j++)        if (s_ifaces[j].used)        ifc++;
-        for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++) if (s_mailbox_conns[j].used) mbc++;
-        cliPrintf("rnsd slots (used / max):  ifaces %d/%d  mailbox %d/%d  link %d/%d\n",
-                  ifc, RNSD_MAX_IFACES, mbc, RNSD_MAX_MAILBOX_CONNS, lkc, RNSD_MAX_LINK_CONNS);
+        for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++) if (s_our_dests[j].used) mbc++;
+        cliPrintf("rnsd slots (used / max):  ifaces %d/%d  our-dest %d/%d  link %d/%d\n",
+                  ifc, RNSD_MAX_IFACES, mbc, RNSD_MAX_OUR_DESTS, lkc, RNSD_MAX_LINK_CONNS);
     }
 
     cliPrintf("stats: pkts in %u out %u, dests added %u\n",
@@ -1922,10 +1919,10 @@ static void cliRnsd(const char* args)
         cliPrintf("rnsd persist [if-transport]      persist transport state\n");
         cliPrintf("rnsd reload                      reload / create identity\n");
         cliPrintf("rnsd memory                      heap usage breakdown\n");
-        cliPrintf("rnsd link <dest_hash> [aspect]   outbound Link probe (Phase B)\n");
+        cliPrintf("rnsd link <dest_hash> [aspect]   outbound Link probe\n");
         cliPrintf("rnsd link teardown               drop the active probe link\n");
         cliPrintf("rnsd links                       pending/active Link table sizes\n");
-        cliPrintf("rnsd clink <dest_hash> [aspect]  Phase C consumer-API link\n");
+        cliPrintf("rnsd clink <dest_hash> [aspect]  consumer-API link\n");
         cliPrintf("rnsd clink send <text> | close\n");
         cliPrintf("rnsd creq <dest_hash> <path>     request/response smoke (nomad)\n");
         cliPrintf("(see also: rnstatus, rnpath, rnprobe)\n");
@@ -1984,10 +1981,10 @@ static void cliRnsd(const char* args)
         const char* rest = args + 5;
         while (*rest == ' ') rest++;
         if (!*rest) {
-            cliPrintf("usage: rnsd clink <dest_hash> [aspect]   — Phase C outbound link\n");
+            cliPrintf("usage: rnsd clink <dest_hash> [aspect]   — outbound link\n");
             cliPrintf("rnsd clink send <text>\n");
             cliPrintf("rnsd clink close\n");
-            cliPrintf("rnsd clink listen <aspect>        — Phase D: host dest, accept inbound Links\n");
+            cliPrintf("rnsd clink listen <aspect>        — host dest, accept inbound Links\n");
             cliPrintf("rnsd clink listen off\n");
             cliPrintf("default aspect: lxmf.delivery; watch rnsd.links.* / log\n");
             return;
@@ -2000,7 +1997,7 @@ static void cliRnsd(const char* args)
         const char* rest = args + 4;
         while (*rest == ' ') rest++;
         if (!*rest) {
-            cliPrintf("usage: rnsd creq <dest_hash> <path> [aspect]  — Phase 0 request smoke\n");
+            cliPrintf("usage: rnsd creq <dest_hash> <path> [aspect]  — request smoke\n");
             cliPrintf("opens a Link + link.request(path), logs the response bytes\n");
             cliPrintf("default aspect: nomadnetwork.node\n");
             cliPrintf("e.g. rnsd creq <hash> /page/index.mu\n");
@@ -2347,7 +2344,7 @@ static void cliRnstatus(const char* args)
 #define RNPROBE_DEFAULT_SIZE     32
 #define RNPROBE_DEFAULT_TIMEOUT  15
 
-/* rnprobe is a client of RNSD_PORT_DEST. CLI task opens an ITS mailbox
+/* rnprobe is a client of RNSD_PORT_DEST. CLI task opens an ITS our-dest
  * connection with `identity_key=""` (rnsd uses its own identity) and the
  * target aspect, writes one OUT_PACKET (send_id=1, dest_hash || payload),
  * reads frames until a terminal OUT_RESULT lands, prints, disconnects. */
@@ -2767,17 +2764,6 @@ int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                       ref, on_recv, on_disconnect);
 }
 
-bool rnsdLinkTeardown(const char* tag)
-{
-    if (!tag || !*tag) { warn("rnsdLinkTeardown: tag required"); return false; }
-    uint8_t buf[1 + 24];
-    buf[0] = RNSD_LINK_AUX_TEARDOWN;
-    size_t tl = strnlen(tag, 23);
-    memcpy(buf + 1, tag, tl);
-    return itsSendAux("rnsd", RNSD_PORT_LINK, buf, 1 + tl,
-                      pdMS_TO_TICKS(500));
-}
-
 bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
                           uint32_t opaque_id)
 {
@@ -2856,7 +2842,7 @@ bool rnsdDestListenLinks(int dest_handle, uint16_t target_port)
         warn("rnsdDestListenLinks: bad args");
         return false;
     }
-    /* In-band frame on the existing RNSD_PORT_DEST handle (§7.1) — rnsd
+    /* In-band frame on the existing RNSD_PORT_DEST handle — rnsd
      * already knows the owning task via itsRemoteTask(handle), so the
      * frame only carries the inbox port. The act of sending it on a
      * handle you own proves you own the destination. */
@@ -2890,14 +2876,14 @@ static void onCmdRequestPath(const char* key, const char* val)
     storageUnset(key);
 }
 
-/* ─────────────── one-shot Link probe (Phase B §5.1.6) ───────────────
+/* ─────────────── one-shot Link probe ───────────────
  *
  * `rnsd link <hash> [aspect]` triggers an outbound Link establishment to
  * the named destination, with state transitions logged via info(). This
  * is the device-side counterpart to scripts/link-probe (which exercises
- * the inbound path). It deliberately skips the eventual rnsdLinkOpen()
- * consumer API (Phase C) — Phase B is just about getting establishment
- * to work end-to-end, so we hold one Link in a static slot and report.
+ * the inbound path). It deliberately skips the rnsdLinkOpen() consumer
+ * API — this is just about getting establishment to work end-to-end, so
+ * we hold one Link in a static slot and report.
  *
  * `rnsd link teardown` drops the active probe link (if any). Without
  * that, a stuck-in-PENDING link stays until mR's stale-time cull. */
@@ -2931,7 +2917,7 @@ static void onProbeLinkEstablished(RNS::Link& link)
          (unsigned)link.get_mtu(),
          link.rtt());
 
-    /* Phase B §5.1.6: send one test packet on establish so we exercise the
+    /* Send one test packet on establish so we exercise the
      * encrypted send path and (for an echo-style peer) get a reply on the
      * packet callback. RNS::Packet(link, payload).send() per upstream's
      * Link API — Link::send is not a member, that's the Packet ctor that
@@ -3022,7 +3008,7 @@ static void onCmdLinkOpen(const char* key, const char* val)
         return;
     }
 
-    /* Aspect format mirrors what mailbox does (rnsd.cpp ~line 538): split
+    /* Aspect format mirrors what our-dest does (rnsd.cpp ~line 538): split
      * at first dot → app_name + aspects. "rnstransport.probe" → app
      * "rnstransport" aspect "probe"; "lxmf.delivery" → "lxmf"/"delivery". */
     std::string app_name = aspect, aspects;
@@ -3069,24 +3055,24 @@ static void onCmdLinkOpen(const char* key, const char* val)
     }
 }
 
-/* ─────────────── Phase C: RNSD_PORT_LINK outbound consumer API ───────────────
+/* ─────────────── RNSD_PORT_LINK outbound consumer API ───────────────
  *
- * docs/plans/link.md §6. Consumers (lxmf in Phase E, CLI tools) call
- * rnsdLinkOpen() → itsConnect(RNSD_PORT_LINK) with an rnsd-private
- * rnsd_link_connect_t. The connect accepts immediately; the Link
- * establishes asynchronously on the rnsd task. Per-link progress is
- * published to the ephemeral rnsd.links.<tag>.* tree (browser-synced
- * for free via storage's empty-prefix subscriber). Slot↔Link is
- * resolved by shared-LinkData pointer identity, not wrapper address —
- * mR passes Link wrapper *copies* into callbacks; copies share the
- * shared_ptr<LinkData> and the public operator< compares _object.get().
- * See memory project_link_slot_mapping; refines §6.2 / decision #8.
+ * Consumers (lxmf, CLI tools) call rnsdLinkOpen() →
+ * itsConnect(RNSD_PORT_LINK) with an rnsd-private rnsd_link_connect_t.
+ * The connect accepts immediately; the Link establishes asynchronously
+ * on the rnsd task. Per-link progress is published to the ephemeral
+ * rnsd.links.<tag>.* tree (browser-synced for free via storage's
+ * empty-prefix subscriber). Slot↔Link is resolved by shared-LinkData
+ * pointer identity, not wrapper address — mR passes Link wrapper
+ * *copies* into callbacks; copies share the shared_ptr<LinkData> and the
+ * public operator< compares _object.get().
  *
- * §10a.1 in-session consumer reconnect (re-attach a live Link to a
- * returning consumer) is intentionally deferred: lxmf (Phase E) is the
- * first reconnecting consumer and the plan treats 10a as cross-cutting
- * C/D/E. Consumer disconnect here parks the Link for orphan_ttl then
- * tears it down — it never silently dies with the handle. */
+ * Link lifetime tracks the consumer's ITS handle 1:1: when the consumer
+ * disconnects (or its handle dies), the Link is torn down immediately —
+ * no parking, no orphan window. A consumer that wants a warm Link across
+ * idle periods keeps its handle open and reuses it (lxmf's conv-link
+ * pool, nomad's per-session link); the hold/idle policy lives in those
+ * consumers, not here. */
 
 enum link_state_t : uint8_t {
     LST_FREE = 0, LST_AWAITING_PATH, LST_ESTABLISHING,
@@ -3121,7 +3107,6 @@ struct link_conn_t {
     double               path_deadline; /* OS::time() a path must answer by */
     double               estab_deadline;/* OS::time() ACTIVE must arrive by */
     uint32_t             link_timeout_ms;/* consumer override; 0 = ref-impl budget */
-    double               orphan_at;     /* OS::time() consumer left; 0 = attached */
     double               dead_at;       /* OS::time() entered CLOSED/FAILED; 0 = n/a */
     bool                 pend_used;     /* one-packet pre-active outbox */
     std::vector<uint8_t> pend_bytes;
@@ -3136,10 +3121,10 @@ struct link_conn_t {
     RNS::PacketReceipt   tx_receipt{RNS::Type::NONE};
     double               tx_receipt_deadline;   /* 0 = none pending */
 
-    /* Phase F resource transfer (link.md §9). One in-flight resource
-     * per link in v1 (the §9.5 soak is sequential). consumer_task is
-     * where the rnsd_link_resource_done_t aux is delivered. */
-    TaskHandle_t         consumer_task; /* lxmf task for the §9.1 aux */
+    /* Resource transfer. One in-flight resource per link in v1
+     * (transfers are sequential). consumer_task is where the
+     * rnsd_link_resource_done_t aux is delivered. */
+    TaskHandle_t         consumer_task; /* lxmf task for the resource aux */
     RNS::Bytes           res_hash;      /* in-flight resource_hash; empty = idle */
     bool                 res_outbound;  /* true = we are sending it */
     uint32_t             res_opaque;    /* outbound: caller correlation id */
@@ -3153,7 +3138,7 @@ struct link_conn_t {
     uint32_t             pend_res_len;
     uint32_t             pend_res_opaque;
 
-    /* Request/response (nomad page fetch, nomad.md §1). One in-flight
+    /* Request/response (nomad page fetch). One in-flight
      * request per link (v1). req_mrid is µR's RequestReceipt request_id —
      * the response/failed callbacks have no userdata, so the slot is
      * resolved by matching it (linkFindByReqMrid), the same trick the
@@ -3310,7 +3295,7 @@ static void linkSetError(link_conn_t& c, const char* err_msg)
 }
 
 /* Resolve our local identity for the OUT destination. Mirrors the
- * mailbox path: identity_key or the rnsd default. */
+ * our-dest path: identity_key or the rnsd default. */
 static bool linkLoadIdentity(const std::string& identity_key, RNS::Identity& out)
 {
     const char* key = !identity_key.empty()
@@ -3386,7 +3371,6 @@ static void onLinkEstablishedCb(RNS::Link& link)
     if (!c) { warn("link: established cb, no slot"); return; }
 
     c->state         = LST_ACTIVE;
-    c->orphan_at     = 0;
     c->estab_deadline = 0;
     linkTouch(*c);
     std::string lid  = link.link_id().toHex();
@@ -3402,7 +3386,7 @@ static void onLinkEstablishedCb(RNS::Link& link)
     linkSetInt(*c, "tx_proven", 0);
     linkSetInt(*c, "proof_timeouts", 0);
     linkPublishState(*c);
-    /* Reverse index for inbound/link_id-only lookups (Phase D uses it). */
+    /* Reverse index for inbound/link_id-only lookups. */
     {
         char k[96];
         snprintf(k, sizeof(k), "rnsd.links.byid.%s", lid.c_str());
@@ -3477,7 +3461,7 @@ static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packe
     link_conn_t* c = linkFindByLink(packet.link());
     if (!c) { warn("link: inbound pkt, no slot"); return; }
     linkTouch(*c);
-    if (c->handle < 0) return;   /* consumer detached; drop (orphan window) */
+    if (c->handle < 0) return;   /* slot tearing down; drop in-flight packet */
     /* Packet-mode handle: one Link plaintext = one ITS packet, no type
      * byte. Drop on back-pressure (timeout 0) rather than stall rnsd. */
     size_t w = itsSend(c->handle, plaintext.data(), plaintext.size(), 0);
@@ -3491,7 +3475,7 @@ static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packe
     linkSetInt(*c, "last_inbound_s", (int)RNS::Utilities::OS::time());
 }
 
-/* ─────────────── Phase F: Resource transfer (link.md §9) ───────────────
+/* ─────────────── Resource transfer ───────────────
  *
  * The Link's resource callbacks are plain C function pointers with no
  * userdata; we resolve the owning slot the same way the packet path
@@ -3526,7 +3510,7 @@ static const char* lnkAuxOpName(uint8_t opcode)
     }
 }
 
-/* One small ITS aux frame to the consumer's resource-aux port (§9.1). */
+/* One small ITS aux frame to the consumer's resource-aux port. */
 static void resSendAux(link_conn_t& c, uint8_t opcode,
                        void* buf, uint32_t len, uint8_t flags)
 {
@@ -3671,7 +3655,7 @@ static void linkWireResource(RNS::Link& link)
     }
 }
 
-/* ─────────────── nomad: request / response (nomad.md §1) ───────────────
+/* ─────────────── nomad: request / response ───────────────
  *
  * Bridges µR's Link::request(path, data) to the byte-array consumer
  * world. The consumer (nomad task; the `creq` smoke task here) calls
@@ -3786,8 +3770,7 @@ static void linkStartRequest(link_conn_t& c, const std::string& path,
          * Bytes as an empty bin (0xc4 0x00), not msgpack nil. Real
          * NomadNet static-page handlers ignore the request-data element,
          * so a GET interops; if a desktop node is found to require nil for
-         * the data-less case, pack nil in Link::request — a documented
-         * Phase-0 HW follow-up (nomad.md §"What µR already gives us").
+         * the data-less case, pack nil in Link::request.
          * When data_packed, `data` is a complete msgpack object (form map)
          * spliced verbatim as the request's 3rd element. */
         RNS::Bytes data_b = data.empty()
@@ -3845,11 +3828,25 @@ static bool linkKickoff(link_conn_t& c)
         RNS::Destination out_dest(target, RNS::Type::Destination::OUT,
                                   RNS::Type::Destination::SINGLE,
                                   app_name.c_str(), aspects.c_str());
+        /* dest_hash is a one-way function of (identity, aspect) and the
+         * caller passed both — verify they agree. A mismatch means the
+         * aspect doesn't belong to the hash we recalled/path-requested, so
+         * the Link would address a different destination than intended.
+         * Fail terminally rather than silently dial the wrong endpoint. */
+        if (out_dest.hash() != c.dest_hash) {
+            warn("link[%s]: aspect '%s' mismatches dest_hash %s (aspect derives %s)",
+                 c.tag, c.aspect.c_str(), c.dest_hash.toHex().c_str(),
+                 out_dest.hash().toHex().c_str());
+            c.state = LST_FAILED;
+            linkSetError(c, "aspect_mismatch");
+            linkPublishState(c);
+            return true;   /* terminal — caller stops retrying */
+        }
         c.link = RNS::Link(out_dest);
         c.link.set_link_established_callback(onLinkEstablishedCb);
         c.link.set_link_closed_callback(onLinkClosedCb);
         c.link.set_packet_callback(onLinkPacketCb);
-        linkWireResource(c.link);                 /* Phase F */
+        linkWireResource(c.link);                 /* resource callbacks */
         c.state = LST_ESTABLISHING;
 
         /* Establishment timeout. A consumer-supplied value is THE timeout,
@@ -3887,7 +3884,7 @@ static bool linkKickoff(link_conn_t& c)
 static void linkFreeSlot(link_conn_t& c)
 {
     /* A request still outstanding when the link is reclaimed (establish
-     * failure, no-path, remote close, orphan-ttl teardown) will never get
+     * failure, no-path, remote close, consumer disconnect) will never get
      * a response — tell the consumer so it doesn't hang. Done before the
      * field resets below so req_task/port are still valid. After a normal
      * DONE the callbacks already cleared req_mrid, so this no-ops. */
@@ -3935,12 +3932,11 @@ static void linkFreeSlot(link_conn_t& c)
     c.state = LST_FREE;
 }
 
-/* 1 Hz from the rnsd loop (tickPhase 0), beside mailboxTickPending. */
+/* 1 Hz from the rnsd loop (tickPhase 0), beside ourDestTickPending. */
 static void linkTick(void)
 {
     if (!s_link_conns) return;
     double now = RNS::Utilities::OS::time();
-    int orphan_ttl = storageGetInt("s.rnsd.link.orphan_ttl_s", 600);
 
     for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++) {
         link_conn_t& c = s_link_conns[j];
@@ -4010,18 +4006,6 @@ static void linkTick(void)
             }
             break;
 
-        case LST_ACTIVE:
-            /* Consumer gone past the orphan budget → tear the Link down
-             * (§10a.1: consumer-handle close ≠ Link teardown; the
-             * orphan TTL is the backstop, not an immediate close). */
-            if (c.orphan_at != 0 && now - c.orphan_at >= orphan_ttl) {
-                info("link[%s]: orphan ttl elapsed, tearing down", c.tag);
-                try { if (c.link) c.link.teardown(); } catch (...) {}
-                c.state = LST_CLOSING;
-                linkPublishState(c);
-            }
-            break;
-
         case LST_CLOSED:
         case LST_FAILED:
             /* Grace so subscribers see the terminal state, then reclaim. */
@@ -4055,29 +4039,10 @@ static int onLinkConnect(int handle, const void* data, size_t len)
             err("link connect: duplicate tag '%s' (still active)", req.tag);
             return -1;
         }
-        /* Parked/orphaned slot: the consumer detached but the Link is kept warm
-         * for in-session reconnect (§10a.1). A same-tag reconnect lands here —
-         * NOT a duplicate. Reuse the warm Link if it goes to the SAME
-         * destination and the slot is clean (no pending request/resource);
-         * otherwise (Nomad switching nodes, or mid-flight state) tear it down
-         * and establish fresh. Without this, the reconnect fails and the slot
-         * stays orphaned for the full orphan_ttl, exhausting
-         * RNSD_MAX_LINK_CONNS within one browsing session. */
-        RNS::Bytes newDest(req.dest_hash, RNSD_DEST_HASH_LEN);
-        bool sameDest = (dup->dest_hash == newDest);
-        bool clean    = !dup->req_mrid.size() && !dup->pend_req_used &&
-                        !dup->pend_res_used && !dup->pend_used && !dup->res_outbound;
-        if (sameDest && clean && dup->state == LST_ACTIVE && (bool)dup->link) {
-            dup->handle        = handle;
-            dup->ref           = (int)(dup - s_link_conns);
-            dup->consumer_task = itsRemoteTask(handle);
-            dup->orphan_at     = 0;
-            dup->last_activity = RNS::Utilities::OS::time();
-            info("link[%s]: reusing warm parked Link (same dest reconnect)", dup->tag);
-            return dup->ref;
-        }
-        info("link[%s]: reclaiming parked slot (%s)", dup->tag,
-             sameDest ? "busy/mid-flight" : "different dest");
+        /* Handle gone but the slot is still mid-teardown (its 3 s terminal
+         * grace, or being freed this same tick). A same-tag reopen is
+         * legitimate — reclaim the slot and establish fresh. */
+        info("link[%s]: reclaiming closing slot for reopen", dup->tag);
         linkFreeSlot(*dup);
     }
     link_conn_t* c = linkAlloc();
@@ -4092,7 +4057,6 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     c->identity_key = req.identity_key;
     c->opened_at    = RNS::Utilities::OS::time();
     c->last_activity = c->opened_at;
-    c->orphan_at    = 0;
     c->dead_at      = 0;
     c->estab_deadline = 0;
     c->pend_used    = false;
@@ -4101,7 +4065,7 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     c->pend_res_buf = nullptr;
     c->pend_res_len = 0;
     c->pend_res_opaque = 0;
-    c->consumer_task = itsRemoteTask(handle);   /* Phase F resource aux target */
+    c->consumer_task = itsRemoteTask(handle);   /* resource aux target */
     c->res_hash      = RNS::Bytes();
     c->res_outbound  = false;
     c->res_opaque    = 0;
@@ -4192,41 +4156,29 @@ static void onLinkDisconnect(int ref)
     if (ref < 0 || ref >= RNSD_MAX_LINK_CONNS) return;
     link_conn_t& c = s_link_conns[ref];
     if (!c.used) return;
-    /* §10a.1: consumer handle close does NOT tear the Link down. Park
-     * it; linkTick tears down after s.rnsd.link.orphan_ttl_s if the
-     * consumer never comes back. Terminal slots just get reclaimed. */
+    /* ITS lifetime == Link lifetime: the consumer's handle is gone, so the
+     * Link goes with it. No parking — a consumer that wants the Link warm
+     * keeps its handle open. Null our handle first so linkFreeSlot won't
+     * re-disconnect it, tear the mR Link down, then free the slot + tag
+     * (immediately, so a same-tag reopen FIFO-after this sees it gone). */
     c.handle = -1;
-    if (c.state == LST_ACTIVE || c.state == LST_ESTABLISHING ||
-        c.state == LST_AWAITING_PATH) {
-        c.orphan_at = RNS::Utilities::OS::time();
-        info("link[%s]: consumer detached, parking (orphan ttl)", c.tag);
-    }
+    info("link[%s]: consumer detached, tearing down", c.tag);
+    try { if (c.link) c.link.teardown(); } catch (...) {}
+    c.link  = RNS::Link{RNS::Type::NONE};
+    c.state = LST_CLOSED;
+    linkPublishState(c);
+    linkFreeSlot(c);
 }
 
-/* Explicit consumer-initiated teardown (rnsdLinkTeardown → aux on
- * RNSD_PORT_LINK). Runs on the rnsd task (itsOnAux dispatches on the
- * registering task), where mR Link state must be touched. Distinct
- * from onLinkDisconnect's park-for-reconnect: this fully closes the
- * Link and frees the slot + tag immediately. */
+/* Out-of-band aux frames on RNSD_PORT_LINK (big resource sends, link
+ * requests). Runs on the rnsd task (itsOnAux dispatches on the registering
+ * task), where mR Link state must be touched. Link teardown is not an aux
+ * op — closing the consumer's ITS handle (itsDisconnect) tears the Link
+ * down via onLinkDisconnect. */
 static void onLinkAux(TaskHandle_t sender, const void* data, size_t len)
 {
     if (len < 1) return;
     uint8_t op = ((const uint8_t*)data)[0];
-
-    if (op == RNSD_LINK_AUX_TEARDOWN) {
-        char tag[24] = {};
-        size_t tl = len - 1; if (tl > sizeof(tag) - 1) tl = sizeof(tag) - 1;
-        memcpy(tag, (const uint8_t*)data + 1, tl);
-        link_conn_t* c = linkFindByTag(tag);
-        if (!c) { info("link[%s]: teardown — no such link", tag); return; }
-        info("link[%s]: explicit teardown", c->tag);
-        try { if (c->link) c->link.teardown(); } catch (...) {}
-        c->link  = RNS::Link{RNS::Type::NONE};
-        c->state = LST_CLOSED;
-        linkPublishState(*c);          /* subscribers observe the close … */
-        linkFreeSlot(*c);              /* … then slot + storage tree freed */
-        return;
-    }
 
     if (op == RNSD_LINK_AUX_SEND_RESOURCE) {
         if (len < sizeof(rnsd_link_send_resource_t)) {
@@ -4314,15 +4266,15 @@ static void onLinkAux(TaskHandle_t sender, const void* data, size_t len)
     }
 }
 
-/* ─────────────── Phase D: inbound Link → consumer forwarding ───────────────
+/* ─────────────── inbound Link → consumer forwarding ───────────────
  *
- * docs/plans/link.md §7. A consumer that has an RNSD_PORT_DEST handle
- * sends RNSD_DEST_LINK_LISTEN with an inbox port; rnsd flips
- * accepts_links(true) on that IN destination and sets *this* as its
- * Destination-level established callback. mR fires it (Link.cpp:539,
+ * A consumer that has an RNSD_PORT_DEST handle sends RNSD_DEST_LINK_LISTEN
+ * with an inbox port; rnsd flips accepts_links(true) on that IN
+ * destination and sets *this* as its Destination-level established
+ * callback. mR fires it (Link.cpp:539,
  * `_owner.callbacks()._link_established`) once an inbound Link reaches
  * ACTIVE. We slot it into the shared s_link_conns table (direction
- * "in"), reuse the Phase-C packet/closed thunks (sameLink resolves the
+ * "in"), reuse the outbound packet/closed thunks (sameLink resolves the
  * slot), and itsConnectByTaskHandle back to the registered consumer
  * with an rnsd_link_incoming_t describing the remote. Consumer→link
  * sends and consumer detach reuse onLinkRecv / onLinkDisconnect. */
@@ -4330,7 +4282,7 @@ static void onIncomingLinkEstablished(RNS::Link& link)
 {
     RNS::Bytes local = link.destination().hash();   /* our IN dest (set
                                                        by validate_request) */
-    mailbox_conn_t* mc = mailboxFindByDestHash(local);
+    our_dest_t* mc = ourDestFindByDestHash(local);
     if (!mc || !mc->link_listener_task || mc->link_inbox_port == 0) {
         warn("inlink: LR on %s with no listener — tearing down",
              local.toHex().c_str());
@@ -4357,7 +4309,6 @@ static void onIncomingLinkEstablished(RNS::Link& link)
     c->link         = link;          /* copy shares shared_ptr<LinkData> */
     c->opened_at    = RNS::Utilities::OS::time();
     c->last_activity = c->opened_at;
-    c->orphan_at    = 0;
     c->dead_at      = 0;
     c->estab_deadline = 0;
     c->pend_used    = false;
@@ -4369,7 +4320,7 @@ static void onIncomingLinkEstablished(RNS::Link& link)
 
     link.set_packet_callback(onLinkPacketCb);
     link.set_link_closed_callback(onLinkClosedCb);
-    linkWireResource(link);                       /* Phase F */
+    linkWireResource(link);                       /* resource callbacks */
     c->consumer_task = mc->link_listener_task;     /* resource aux target */
     c->res_hash      = RNS::Bytes();
     c->res_outbound  = false;
@@ -4425,18 +4376,18 @@ static void onIncomingLinkEstablished(RNS::Link& link)
          (unsigned)mc->link_inbox_port);
 }
 
-/* ─────────────── Phase C smoke: `clink` test consumer task ───────────────
+/* ─────────────── `clink` test consumer task ───────────────
  *
- * docs/plans/link.md §6.3 — "a trivial test consumer task on the device
- * can open a Link, send, receive, disconnect". This is a *real*
- * RNSD_PORT_LINK consumer (its own ITS-client task), distinct from the
- * Phase B `rnsd link` probe (which builds RNS::Link directly on the
- * rnsd task). Driven by `rnsd clink …` → `rnsd.cmd.clink` storage key.
+ * A trivial test consumer task on the device that can open a Link, send,
+ * receive, and disconnect. This is a *real* RNSD_PORT_LINK consumer (its
+ * own ITS-client task), distinct from the `rnsd link` probe (which builds
+ * RNS::Link directly on the rnsd task). Driven by `rnsd clink …` →
+ * `rnsd.cmd.clink` storage key.
  *
  *   rnsd clink <hash> [aspect]   open via rnsdLinkOpen() + queue a probe
  *                                packet (exercises the pre-active outbox)
  *   rnsd clink send <text>       send one Link packet
- *   rnsd clink close             itsDisconnect (Link parks per §10a.1)
+ *   rnsd clink close             itsDisconnect (tears the Link down)
  *
  * Inbound Link packets are logged. With an echo-style peer the probe
  * round-trips, proving establish + outbox flush + inbound forwarding. */
@@ -4463,7 +4414,7 @@ static void onClinkDisc(int /*handle*/)
     s_clink_handle = -1;
 }
 
-/* ---- Phase D test: host a destination + receive inbound Links ---- */
+/* ---- test: host a destination + receive inbound Links ---- */
 
 static void onClinkDestRecv(int handle, size_t /*n*/)
 {
@@ -4513,7 +4464,7 @@ static void onClinkInboxDisc(int /*handle*/)
     info("clink inbox: link forward closed");
 }
 
-/* ---- Phase 0 smoke: request/response (nomad page fetch, nomad.md) ---- */
+/* ---- smoke: request/response (nomad page fetch) ---- */
 
 /* Request response/failure handoff from rnsd (rnsd_link_resource_done_t
  * on CREQ_RESP_PORT). Logs the response bytes hex + ASCII so a page GET
@@ -4588,8 +4539,9 @@ static void onCmdCreq(const char* key, const char* val)
     catch (...) { warn("creq: bad hash hex"); return; }
     if (dh.size() != RNSD_DEST_HASH_LEN) { warn("creq: bad hash bytes"); return; }
 
+    /* itsDisconnect tears the prior Link down (onLinkDisconnect); it is
+     * FIFO-before the reopen below, which then sees the tag freed. */
     if (s_clink_handle >= 0) { itsDisconnect(s_clink_handle); s_clink_handle = -1; }
-    rnsdLinkTeardown(CLINK_TAG);   /* clear any parked/lingering prior link */
     int h = rnsdLinkOpen(dh.data(), aspect.c_str(), "", CLINK_TAG,
                          /*path_timeout_ms=*/0, /*link_timeout_ms=*/0, /*ref=*/0,
                          onClinkRecv, onClinkDisc);
@@ -4607,9 +4559,7 @@ static void onCmdClink(const char* key, const char* val)
     storageUnset(key);                    /* single-shot */
 
     if (cmd == "close") {
-        /* Full teardown (frees the "clink" tag for immediate reuse) —
-         * not bare itsDisconnect, which would only park per §10a.1. */
-        rnsdLinkTeardown(CLINK_TAG);
+        /* Closing the handle tears the Link down + frees the tag. */
         if (s_clink_handle >= 0) { itsDisconnect(s_clink_handle); s_clink_handle = -1; }
         info("clink: teardown requested");
         return;
@@ -4634,7 +4584,7 @@ static void onCmdClink(const char* key, const char* val)
         }
         /* Host an IN destination on the rnsd default identity, register
          * for inbound Links to CLINK_INBOX_PORT, then announce so a
-         * host-side peer can resolve + open a Link to it (Phase D). */
+         * host-side peer can resolve + open a Link to it. */
         int dh = rnsdDestOpen(arg.c_str(), "", /*SINGLE*/0, /*ref=*/1,
                               onClinkDestRecv, onClinkDestDisc);
         if (dh < 0) { warn("clink: rnsdDestOpen failed (%d)", dh); return; }
@@ -4665,15 +4615,16 @@ static void onCmdClink(const char* key, const char* val)
     catch (...) { warn("clink: bad hash hex"); return; }
     if (dh.size() != RNSD_DEST_HASH_LEN) { warn("clink: bad hash bytes"); return; }
 
+    /* itsDisconnect tears the prior Link down (onLinkDisconnect); it is
+     * FIFO-before the reopen below, which then sees the tag freed. */
     if (s_clink_handle >= 0) { itsDisconnect(s_clink_handle); s_clink_handle = -1; }
-    rnsdLinkTeardown(CLINK_TAG);   /* clear any parked/lingering prior link */
     int h = rnsdLinkOpen(dh.data(), aspect.c_str(), "", CLINK_TAG,
                          /*path_timeout_ms=*/0, /*link_timeout_ms=*/0, /*ref=*/0,
                          onClinkRecv, onClinkDisc);
     if (h < 0) { warn("clink: rnsdLinkOpen failed (%d)", h); return; }
     s_clink_handle = h;
     /* Queue a probe immediately — rnsd's one-packet pre-active outbox
-     * buffers it and flushes on establishment (§6.2). */
+     * buffers it and flushes on establishment. */
     static const char probe[] = "reticulous clink probe";
     itsSend(h, probe, sizeof(probe) - 1, 0);
     info("clink: opened → %s aspect=%s (probe queued)",
@@ -4693,7 +4644,7 @@ static void clinkTaskMain(void*)
     itsServerOnConnect(CLINK_INBOX_PORT,    onClinkInboxConnect);
     itsServerOnDisconnect(CLINK_INBOX_PORT, onClinkInboxDisc);
     itsServerOnRecv(CLINK_INBOX_PORT,       onClinkInboxRecv);
-    itsOnAux(CREQ_RESP_PORT,                onCreqResponse);   /* Phase 0 smoke */
+    itsOnAux(CREQ_RESP_PORT,                onCreqResponse);   /* request smoke */
     itsClientInit(4);
     storageSubscribeChanges("rnsd.cmd.clink", onCmdClink);
     storageSubscribeChanges("rnsd.cmd.creq",  onCmdCreq);
@@ -4701,7 +4652,7 @@ static void clinkTaskMain(void*)
     for (;;) {
         while (itsPoll(0)) {}
         itsPoll(pdMS_TO_TICKS(1000));
-        /* While hosting a Phase-D test dest, re-announce every 20 s so a
+        /* While hosting a test dest, re-announce every 20 s so a
          * host-side peer's path to it stays fresh across test runs. */
         if (s_clink_dest_handle >= 0) {
             TickType_t now = xTaskGetTickCount();
@@ -4723,31 +4674,31 @@ static void rnsdTaskMain(void*)
      * Interface / Destination / Identity have non-trivial ctors — placement-
      * new each slot. */
     s_ifaces = (iface_t*)heap_caps_malloc(RNSD_MAX_IFACES * sizeof(iface_t), MALLOC_CAP_SPIRAM);
-    s_mailbox_conns = (mailbox_conn_t*)heap_caps_malloc(
-        RNSD_MAX_MAILBOX_CONNS * sizeof(mailbox_conn_t), MALLOC_CAP_SPIRAM);
+    s_our_dests = (our_dest_t*)heap_caps_malloc(
+        RNSD_MAX_OUR_DESTS * sizeof(our_dest_t), MALLOC_CAP_SPIRAM);
     s_link_conns = (link_conn_t*)heap_caps_malloc(
         RNSD_MAX_LINK_CONNS * sizeof(link_conn_t), MALLOC_CAP_SPIRAM);
-    s_mailbox_receipts = (mailbox_receipt_t*)heap_caps_malloc(
-        RNSD_MAX_PENDING_RECEIPTS * sizeof(mailbox_receipt_t), MALLOC_CAP_SPIRAM);
-    if (!s_ifaces || !s_mailbox_conns || !s_link_conns || !s_mailbox_receipts) {
+    s_our_dest_receipts = (our_dest_receipt_t*)heap_caps_malloc(
+        RNSD_MAX_PENDING_RECEIPTS * sizeof(our_dest_receipt_t), MALLOC_CAP_SPIRAM);
+    if (!s_ifaces || !s_our_dests || !s_link_conns || !s_our_dest_receipts) {
         err("rnsd table PSRAM alloc failed"); killSelf();
     }
     for (int j = 0; j < RNSD_MAX_IFACES; j++)        new (&s_ifaces[j])        iface_t{};
-    for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++) new (&s_mailbox_conns[j]) mailbox_conn_t{};
+    for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++) new (&s_our_dests[j]) our_dest_t{};
     for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)    new (&s_link_conns[j])    link_conn_t{};
     for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++)
-        new (&s_mailbox_receipts[j]) mailbox_receipt_t{};
+        new (&s_our_dest_receipts[j]) our_dest_receipt_t{};
 
     /* Gate the entire rnsd ITS/Transport surface on a known-valid clock (or a
-     * bounded wait), BEFORE opening any ITS port. Standing the ports up first —
-     * as we used to — advertises a server that isn't pumping its inbox during
-     * the wait: clients' connects sit unacked, time out, and get abandoned, and
+     * bounded wait), BEFORE opening any ITS port. Standing the ports up first
+     * advertises a server that isn't pumping its inbox during the
+     * wait: clients' connects sit unacked, time out, and get abandoned, and
      * when we later drain the inbox we allocate slots/buffers for those dead
      * connects and permanently leak them (notably all RNSD_MAX_ANNOUNCE_SUBS
      * announce-sub slots, wedging lxmf/nomad discovery until reboot). With the
      * ports still closed, a connecting client fails its local pre-flight
      * (unopened port) and simply retries — no server-side state, nothing to
-     * leak. Every other mesh task (lxmf, the transports) already waits here
+     * leak. Every other mesh task (lxmf, the interfaces) already waits here
      * before its ITS work; this brings rnsd into line. Waiting also keeps
      * announces and path-table entries off the pre-sync 1970 epoch. An offline
      * node with no time source proceeds after the timeout. */
@@ -4760,7 +4711,7 @@ static void rnsdTaskMain(void*)
      * Read once here — takes effect on the next boot after toggling. */
     bool itsNoPool = storageGetInt("s.rnsd.its_no_pool", 0) != 0;
     if (!itsServerInit(0, 0, itsNoPool)) { err("itsServerInit failed"); killSelf(); return; }
-    /* rnsd is also an ITS *client*: Phase D back-connects inbound Links
+    /* rnsd is also an ITS *client*: inbound Links back-connect
      * to the registered consumer via itsConnectByTaskHandle. Without
      * this the connect fails and onIncomingLinkEstablished tears the
      * Link down (peer sees DESTINATION_CLOSED). Shares the itsServerInit
@@ -4770,29 +4721,29 @@ static void rnsdTaskMain(void*)
      * testnet can fill 2 KB before rnsd drains during the 1 Hz publish
      * block. 4 KB gives ~4× more headroom; PSRAM-allocated, ~64 KB total
      * across RNSD_MAX_IFACES=16 × 2 directions. */
-    if (!itsServerPortOpen(RNSD_PORT_TRANSPORT, ITS_PACKET,
+    if (!itsServerPortOpen(RNSD_PORT_IFACE, ITS_PACKET,
                            /*maxHandles=*/RNSD_MAX_IFACES,
                            /*toCap=*/4096, /*fromCap=*/4096,
                            /*depth=*/0, /*maxMsg=*/4096)) {
-        err("RNSD_PORT_TRANSPORT open failed");
+        err("RNSD_PORT_IFACE open failed");
         killSelf();
         return;
     }
-    itsServerOnConnect(RNSD_PORT_TRANSPORT, onTransportConnect);
-    itsServerOnDisconnect(RNSD_PORT_TRANSPORT, onTransportDisconnect);
-    itsServerOnRecv(RNSD_PORT_TRANSPORT, onTransportRecv);
+    itsServerOnConnect(RNSD_PORT_IFACE, onTransportConnect);
+    itsServerOnDisconnect(RNSD_PORT_IFACE, onTransportDisconnect);
+    itsServerOnRecv(RNSD_PORT_IFACE, onTransportRecv);
 
     if (!itsServerPortOpen(RNSD_PORT_DEST, ITS_PACKET,
-                           /*maxHandles=*/RNSD_MAX_MAILBOX_CONNS,
+                           /*maxHandles=*/RNSD_MAX_OUR_DESTS,
                            /*toCap=*/4096, /*fromCap=*/2048,
                            /*depth=*/0, /*maxMsg=*/4096)) {
         err("RNSD_PORT_DEST open failed");
         killSelf();
         return;
     }
-    itsServerOnConnect(RNSD_PORT_DEST,    onMailboxConnect);
-    itsServerOnDisconnect(RNSD_PORT_DEST, onMailboxDisconnect);
-    itsServerOnRecv(RNSD_PORT_DEST,       onMailboxRecv);
+    itsServerOnConnect(RNSD_PORT_DEST,    onOurDestConnect);
+    itsServerOnDisconnect(RNSD_PORT_DEST, onOurDestDisconnect);
+    itsServerOnRecv(RNSD_PORT_DEST,       onOurDestRecv);
 
     /* Announce fan-out — unidirectional rnsd → subscribers (toSize=0).
      * 4 KB per-connection outbound buffer comfortably holds a few queued
@@ -4809,7 +4760,7 @@ static void rnsdTaskMain(void*)
     itsServerOnDisconnect(RNSD_PORT_ANNOUNCES, onAnnouncesDisconnect);
     itsServerOnRecv(RNSD_PORT_ANNOUNCES,       onAnnouncesRecv);
 
-    /* RNSD_PORT_LINK — outbound Link consumer API (Phase C, §6.2).
+    /* RNSD_PORT_LINK — outbound Link consumer API.
      * Packet-mode: one Link plaintext per itsSend/itsRecv, no framing.
      * 4 KB/dir ≈ 9 in-flight Link packets — matches Resource cadence. */
     if (!itsServerPortOpen(RNSD_PORT_LINK, ITS_PACKET,
@@ -4870,16 +4821,16 @@ static void rnsdTaskMain(void*)
     NOW_AND_ON_CHANGE("s.rnsd.identity.cache_max", {
         RNS::Identity::known_destinations_maxsize(storageGetInt(key, 1000));
     });
-    /* Delivery-proof dial (see the mailbox-dest comment): applies to every
-     * already-open consumer destination, and mailboxOpen reads the same key
+    /* Delivery-proof dial (see the our-dest-dest comment): applies to every
+     * already-open consumer destination, and ourDestOpen reads the same key
      * for new ones. */
     NOW_AND_ON_CHANGE("s.rnsd.prove_incoming", {
         auto strat = storageGetInt(key, 1) ? RNS::Type::Destination::PROVE_ALL
                                            : RNS::Type::Destination::PROVE_NONE;
-        if (s_mailbox_conns)
-            for (int j = 0; j < RNSD_MAX_MAILBOX_CONNS; j++)
-                if (s_mailbox_conns[j].used && s_mailbox_conns[j].listener_dest)
-                    s_mailbox_conns[j].listener_dest.set_proof_strategy(strat);
+        if (s_our_dests)
+            for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++)
+                if (s_our_dests[j].used && s_our_dests[j].listener_dest)
+                    s_our_dests[j].listener_dest.set_proof_strategy(strat);
     });
     /* Path table: engages BasicHeapStore set_max_recs (uncapped until now —
      * only the 24h TTL pruned it). */
@@ -4953,10 +4904,10 @@ static void rnsdTaskMain(void*)
         /* Async-path-request endpoint for the rnsd.h API. Callers
          * write `rnsd.cmd.request_path = <32-hex>`; we process it on
          * this task (mR's Transport::request_path silently drops when
-         * called from any other task — see memory note). */
+         * called from any other task). */
         storageSubscribeChanges("rnsd.cmd.request_path", onCmdRequestPath);
 
-        /* Phase B §5.1.6: `rnsd link <hash> [aspect]` one-shot probe.
+        /* `rnsd link <hash> [aspect]` one-shot probe.
          * CLI writes to this key; we build the Link here on the rnsd task. */
         storageSubscribeChanges("rnsd.cmd.link.open", onCmdLinkOpen);
 
@@ -4986,13 +4937,13 @@ static void rnsdTaskMain(void*)
              * internal yield-every-8. Running Transport::jobs() *and*
              * publishPathTable() in the same tick can park the rnsd task
              * past tcp's 100 ms itsSend timeout on busy networks —
-             * RNSD_PORT_TRANSPORT recv drops follow. Stagger across two
+             * RNSD_PORT_IFACE recv drops follow. Stagger across two
              * ticks so each tick only carries one slow workload. */
             if (tickPhase == 0) {
                 try { RNS::Transport::jobs(); }
                 catch (const std::exception& e) { warn("Transport::jobs threw: %s", e.what()); }
-                mailboxTickPending();
-                mailboxReceiptTick();
+                ourDestTickPending();
+                ourDestReceiptTick();
                 linkTick();
 
                 /* Rnsd-hosted announces — debounce fire + periodic check.
@@ -5042,15 +4993,10 @@ void rnsdInit(void)
 
     /* One-time storage defaults gated on version. */
     if (storageGetInt("s.rnsd.version", 0) < RNSD_VERSION) {
-        storageDefault("s.rnsd.enable", 1);
-        storageDefault("s.rnsd.transport_enabled", 0);
-        storageDefault("s.rnsd.name", "");
-        storageDefault("s.rnsd.announce.interval", 1800);   /* 30 min */
         storageDefault("s.rnsd.remote_management", 1);      /* host rnstransport.remote.management */
         storageDefault("s.rnsd.respond_to_probes", 0);      /* host rnstransport.probe (PROVE_ALL) */
         storageDefault("s.rnsd.debug.only_local", 0);       /* demote announce-traffic dbg to verb */
-        storageDefault("s.rnsd.link.path_timeout_s", 30);   /* §6.2 — LR retry budget */
-        storageDefault("s.rnsd.link.orphan_ttl_s", 600);    /* §6.2 — keep orphaned Link 10 min */
+        storageDefault("s.rnsd.link.path_timeout_s", 30);   /* LR retry budget */
         /* `s.rnsd.path.max` / `s.rnsd.path.ttl` removed: mR's path table is
          * unbounded (BasicHeapStore), pruned only by PATHFINDER_E (24 h).
          * Re-add when we implement post-process pruning or interface-mode
@@ -5065,13 +5011,13 @@ void rnsdInit(void)
     cliRegisterCmd("rnpath",   cliRnpath);
     cliRegisterCmd("rnprobe",  cliRnprobe);
 
-    /* Cron line per §11.3 — no-op when transport disabled, hourly otherwise. */
+    /* Cron line — no-op when transport disabled, hourly otherwise. */
     cronDefault("0 * * * * N", "rnsd persist if-transport");
 
     /* PSRAM stack, core 0 alongside tcpip_thread, prio 2. */
     s_task = spawnTask(rnsdTaskMain, TAG, 12288, nullptr, 2, 0, STACK_PSRAM);
 
-    /* Phase C smoke consumer — its own ITS-client task, idle until
+    /* clink smoke consumer — its own ITS-client task, idle until
      * `rnsd clink …`. Core 1, prio 1, modest PSRAM stack. */
     spawnTask(clinkTaskMain, CLINK_TAG, 6144, nullptr, 1, 1, STACK_PSRAM);
 }
