@@ -157,8 +157,16 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.enable` | `1` | Master switch — is this node on the mesh at all. **Read once at boot**: when `0`, rnsd brings up no Transport/ports and never sets `rns.ready`, so interfaces and clients never start. **Changing it requires a reboot.** |
 | `s.rnsd.transport_enabled` | `0` | Act as a Reticulum transport node (forward for others). Live (no reboot). |
 | `s.rnsd.announce.interval` | `1800` | Seconds between periodic destination announces. |
+| `s.rnsd.announce.table_max` | `100` | Announce-table capacity cap (`Transport::announce_table_maxsize`). |
+| `s.rnsd.hashlist_max` | `100` | Packet-hashlist (dedup) capacity cap (`Transport::hashlist_maxsize`). |
 | `s.rnsd.path.max` | `100` | Path-table capacity cap (`Transport::path_table_maxsize`). |
+| `s.rnsd.path.request_tags_max` | `32` | Pending path-request tag cap (`Transport::max_pr_tags`). |
 | `s.rnsd.path.ttl` | `86400` | Path-entry age-out, seconds (`Transport::destination_timeout`). |
+| `s.rnsd.path.ttl_ap` | `21600` | Access-point path lifetime, seconds (`Transport::ap_path_time`). |
+| `s.rnsd.path.ttl_roaming` | `3600` | Roaming path lifetime, seconds (`Transport::roaming_path_time`). |
+| `s.rnsd.identity.cache_max` | `1000` | Known-destination (identity) cache capacity (`Identity::known_destinations_maxsize`). |
+| `s.rnsd.jobs_interval_ms` | `250` | Transport `jobs()` cadence, milliseconds (`Transport::job_interval`). |
+| `s.rnsd.cull_interval_s` | `60` | Table-cull cadence, seconds (`Transport::tables_cull_interval`). |
 | `s.rnsd.remote_management` | `1` | Host the `rnstransport.remote.management` destination. |
 | `s.rnsd.respond_to_probes` | `0` | Host `rnstransport.probe` and answer probes (PROVE_ALL). |
 | `s.rnsd.prove_incoming` | `1` | Emit delivery proofs for inbound packets we receive. |
@@ -248,8 +256,3 @@ UI lives in each interface straddle's own `browser/`.
   model, link/resource lifecycle, and maintainer pitfalls.
 - [esp-idf/components/microreticulum/README.md](esp-idf/components/microreticulum/README.md)
   — the pinned upstream commit (and why) + licensing.
-
-## Status
-
-Hardware-verified against upstream Reticulum / LXMF. `rnsd` is real, not
-scaffolding; the µR fork is ported and patched against the pinned commit.

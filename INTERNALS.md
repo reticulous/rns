@@ -84,9 +84,9 @@ Our deltas, by category:
   All multi-segment destinations (`lxmf.delivery`, `nomadnetwork.node`) are
   unaffected; the fix only changes app-name-only destinations, which were
   previously mis-hashed and matched nothing.
-- **Static identity-cache size 100 → 1000** (`RNS::Identity::known_destinations_maxsize(1000)`,
-  ~200 KiB PSRAM), set in `rnsdInit`. Prevents cache eviction before probes
-  conclude on a busy network.
+- **Tunable identity-cache size** — `RNS::Identity::known_destinations_maxsize` is
+  driven by `s.rnsd.identity.cache_max` (default `1000`, ~200 KiB PSRAM). The
+  generous default prevents cache eviction before probes conclude on a busy network.
 - **Log-demotion hook** — `RNS::Transport::demote_dbg(bool)` (wired from
   `s.rnsd.debug.only_local`) routes the high-volume DEBUGFs in `Transport::inbound`/
   `packet_filter`/`path_request` and `Identity::clean_known_destinations` through

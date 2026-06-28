@@ -8,7 +8,7 @@ Full license text: <https://www.apache.org/licenses/LICENSE-2.0>
 Copyright (c) 2026 by reticulous project contributors.
 
 The Apache-2.0 license applies to the original spangap glue in this repo
-(straddle scaffolding, `browser/`, `main/`, the RNSD_PORT_TRANSPORT ITS
+(straddle scaffolding, `browser/`, `main/`, the RNSD_PORT_IFACE ITS
 surface, README/INTERNALS, build files). The vendored sub-components under
 `esp-idf/components/` retain their own licenses as listed below.
 

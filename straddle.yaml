@@ -2,8 +2,8 @@
 #
 # Pure protocol logic: identity, destinations, path table, transport
 # state machine, links, resources. Zero networking/radio dependencies —
-# transport straddles (iface-tcp/-auto/-espnow/-lora) plug their
-# interfaces in via the RNSD_PORT_TRANSPORT ITS surface.
+# interface straddles (iface-tcp/-auto/-espnow/-lora) plug their
+# interfaces in via the RNSD_PORT_IFACE ITS surface.
 #
 # Vendors the µReticulum hard fork (esp-idf/components/microreticulum/)
 # and bzip2 1.0.8 (esp-idf/components/bzip2/) as nested sub-components.
@@ -39,9 +39,10 @@ kconfig:
   - CONFIG_MBEDTLS_HKDF_C=y
 # Auto-init: folded into the generated spangapInitStraddles() dispatcher. Runs
 # in the straddle band, after the platform band (so storage/LCD are up). The
-# transport straddles (tr-*) all `requires: reticulous/rns`, so the dependency-
-# topo order brings rnsd up — and its ITS port surface with it — before they
-# self-register their interfaces. No explicit ordering needed.
+# interface straddles (rns_tcp/rns_auto/rns_lora/rns_espnow, dirs iface-*) all
+# `requires: reticulous/rns`, so the dependency-topo order brings rnsd up — and
+# its ITS port surface with it — before they self-register their interfaces. No
+# explicit ordering needed.
 init:
   - call: rnsdInit
 
