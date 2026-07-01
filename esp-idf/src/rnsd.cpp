@@ -803,8 +803,9 @@ static void rnsdDbgMsgContent(const char* dir, const uint8_t* p, size_t n)
  * the target dest_hash. Returns:
  *   1  — sent: OUT_STATUS EGRESS_QUEUED + OUT_RESULT status=sent emitted
  *   0  — pending: REQUESTING_PATH emitted, send is parked
- *  -1  — terminal failure (recall/Destination/send threw): OUT_RESULT
- *        status=evicted emitted */
+ *  -1  — terminal failure: OUT_RESULT emitted. status=too_large when the
+ *        payload exceeds the single-packet encrypted MDU, else status=evicted
+ *        (recall/Destination/send threw) */
 static int ourDestTrySend(our_dest_t& c, uint16_t send_id,
                           const uint8_t* bytes, size_t n)
 {
@@ -860,6 +861,19 @@ static int ourDestTrySend(our_dest_t& c, uint16_t send_id,
          * packed` (n >= 16 already gated above); send `bytes + 16` as the
          * RNS Packet payload. */
         RNS::Bytes payload(bytes + 16, n - 16);
+        /* Pre-flight the single-packet ceiling so an oversized opportunistic
+         * payload reports honestly instead of throwing in Packet::pack() and
+         * surfacing as a spurious EVICTED. The encrypted-MDU bound is the
+         * plaintext limit for a SINGLE-destination encrypted packet; a wire
+         * past it must ride a Link/Resource, which the LXMF client selects.
+         * The client gates on the same bound, so this is a backstop for any
+         * future caller. */
+        if (payload.size() > RNS::Type::Packet::ENCRYPTED_MDU) {
+            err("our-dest: payload %zuB exceeds encrypted MDU %uB — needs a Link",
+                payload.size(), (unsigned)RNS::Type::Packet::ENCRYPTED_MDU);
+            ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_TOO_LARGE, 0, 0);
+            return -1;
+        }
         RNS::Packet pkt(out_dest, payload);
         uint8_t hops = (uint8_t)RNS::Transport::hops_to(dh);
         RNS::PacketReceipt receipt = pkt.send();
@@ -1536,6 +1550,12 @@ public:
                 verb("announce fanout: drop to handle=%d aspect=%s",
                      sub.handle, sub.aspect);
         }
+
+        /* Announces arrive in bursts and the per-sub aspect-hash match is
+         * crypto. This task shares core 0 (prio 2) with webrtc, which drives
+         * the browser transport — yield so a burst can't stall the datachannel
+         * and make the browser see us as gone. */
+        vTaskDelay(1);
     }
 };
 
@@ -2507,6 +2527,10 @@ static void cliRnprobe(const char* args)
                         break;
                     case RNSD_DEST_STATUS_FAILED:
                         cliPrintf("failed: no route to %s\n", short_hash.c_str());
+                        done = true;
+                        break;
+                    case RNSD_DEST_STATUS_TOO_LARGE:
+                        cliPrintf("too large: probe exceeds single-packet MDU\n");
                         done = true;
                         break;
                     default:

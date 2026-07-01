@@ -228,6 +228,9 @@ enum : uint8_t {
     RNSD_DEST_STATUS_FAILED        = 4,  /* gave up — no route found before deadline */
     RNSD_DEST_STATUS_PROOF_TIMEOUT = 5,  /* no delivery proof before the receipt
                                           * deadline (follows an earlier SENT) */
+    RNSD_DEST_STATUS_TOO_LARGE     = 6,  /* payload exceeds the single-packet
+                                          * encrypted MDU — caller must use a
+                                          * Link/Resource, not opportunistic */
 };
 
 /** OUT_STATUS.type — aux progress narration. */
