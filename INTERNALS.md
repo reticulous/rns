@@ -24,6 +24,12 @@ Our deltas, by category:
   carrying ~28 of our own fixes on top. `Link_stub.cpp` is gone. The entire
   rnsd link lifecycle (§5) and nomad's page fetch rest on this — it's the single
   largest thing we added to µR.
+- **`Channel` implemented.** The fork shipped `Channel` as an empty pimpl and
+  `Link::get_channel()` commented out. `Channel.{h,cpp}` now hold a real port of
+  upstream `RNS/Channel.py` — reliable, sequenced, windowed messaging that rides
+  *inside* a `Link` (§5.6). `Link::get_channel()` is live and `Link::receive`
+  routes `CONTEXT.CHANNEL` (0x0E) packets into it (`prove → decrypt →
+  _receive`). This is what the [rnsh](../rnsh) shell rides on.
 
 **Dependency / platform swaps**
 
@@ -101,9 +107,10 @@ Our deltas, by category:
   but the upstream callback-thread spawn is unported. rnsd drives all receipt
   *and* request timeouts itself by polling status from its 1 Hz tick, plus a
   wall-clock backstop.
-- **`Channel` is stubbed, not implemented.** `Link::get_channel()`,
-  `MessageBase`, and `Buffer` are placeholder/empty in the fork. Anything
-  needing Reticulum's Channel/Buffer layer (e.g. an rnsh-style shell) must
+- **`Buffer` is still stubbed.** `Channel` is now real (above, §5.6), but the
+  `Buffer` / `RawChannelReader`/`Writer` byte-stream layer over it (StreamData
+  chunking, bz2 compression) is not ported — rnsh frames its own bytes directly
+  on Channel messages instead. Anything needing the upstream `Buffer` API must
   implement it first.
 
 ### 1.2 The rnsd layer (all new on top of µR)
@@ -123,6 +130,9 @@ Our deltas, by category:
 - **Announce fan-out** with optional per-subscriber aspect filtering.
 - **Outbound + inbound Link lifecycle** (§5), including the pre-active outboxes
   and the establishment-timeout budget.
+- **Channel bridge** (§5.6) — outbound (`rnsdChannelOpen`) and inbound
+  (`rnsdDestListenChannels`) reliable-messaging over a hidden Link, exposed as a
+  packet-mode ITS handle where each message is delivered once, in order.
 - **Resource transfer** (shared-memory hand-off) and **request/response** (page
   fetch) bridges.
 - **Outbound delivery-proof tracking** (§5.4).
@@ -321,6 +331,76 @@ consumer-owned buffer) or `RNSD_LINK_REQUEST_FAILED`. One in-flight request per
 link; path+data are sent inline in the aux so must fit `ITS_MAX_MSG_DATA`
 (ample for a GET; large form uploads as a request-Resource are not yet
 implemented).
+
+## 5.6 Channel (reliable messaging inside a Link)
+
+A **Channel** rides inside a `Link` and turns it from a best-effort packet pipe
+into a stream of **reliable, in-order, deduplicated messages**. `Link` and
+`Resource` already exist; Channel fills the gap between them — continuous and
+bidirectional like a Link, but with automatic retries and sequencing like a
+Resource, and size-constrained to one packet per message. It is the substrate
+[rnsh](../rnsh) runs on.
+
+**The µR primitive** (`components/microreticulum/src/Channel.{h,cpp}`) is a
+device-native port of upstream `RNS/Channel.py`, kept **wire-identical**:
+
+- Each message is one `RNS::Packet(link, raw, context = CHANNEL /*0x0E*/)` whose
+  plaintext is a 6-byte big-endian envelope — `>HHH` = (msgtype, sequence,
+  length) — followed by the payload. `Channel::mdu()` is the Link MDU minus 6.
+- One internal msgtype (`0x0100`) carries opaque consumer bytes; callers frame
+  their own protocol inside the payload (rnsh does — §rnsh INTERNALS).
+- **Reliability rides the Link packet's delivery proof.** A sent envelope stays
+  in the TX ring until its `PacketReceipt` reads `DELIVERED`; an un-proven one is
+  retransmitted (`Packet::resend`) up to 5 times, after which the Link is torn
+  down. On receive, `Link::receive` proves the CHANNEL packet, decrypts it, and
+  hands the plaintext to `Channel::_receive`, which window/dup-checks the
+  sequence, emplaces into the RX ring, and delivers the contiguous run in order.
+- **Port adaptations from the Python original:** µR's `PacketReceipt` callbacks
+  are plain C function pointers with no userdata, so delivery/timeout are driven
+  by **polling** each envelope's receipt status from `Channel::poll()` (the same
+  idiom the link-receipt tracking in §5.4 uses) — no global receipt registry.
+  The delivered-message sink is a single `void*`-carrying callback (the rnsd
+  bridge sets it to its channel slot). The window is a small fixed size for now;
+  the adaptive RTT-based window growth from `Channel.py` is intentionally not
+  ported yet.
+- **Cycle break:** `LinkData` owns the `Channel`, and the `Channel` holds a
+  `Link` handle back — a `shared_ptr` cycle. `Link::link_closed()` shuts the
+  channel down and clears `LinkData::_channel` so the graph frees.
+
+**The rnsd bridge** (`RNSD_PORT_CHANNEL`, port 11) mirrors the Link bridge (§5)
+onto a separate `chan_conn_t` slot table (`s_chan_conns`, PSRAM), reusing the
+`link_state_t`/`lstName`/`sameLink`/`linkLoadIdentity` helpers. Each slot owns a
+**hidden** `RNS::Link` plus its `RNS::Channel`; the consumer only ever sees the
+channel.
+
+- **Outbound (`rnsdChannelOpen`)** — same immediate-accept, `awaiting_path →
+  establishing → active/failed` shape as an outbound Link, published to
+  `rnsd.chan.<tag>.state`. Establishment is **gated on `has_path() &&
+  recall()`**, not `recall()` alone: on a churning mesh a cached identity can
+  outlive its path-table entry, and a Link request with no next hop is silently
+  dropped (→ `establish_timeout`); `channelTick` keeps re-requesting the path
+  while awaiting. On `active` the slot calls `link.get_channel()`, registers the
+  receive callback, and flushes a bounded pre-active **outbox** (up to 16
+  messages — larger than the Link outbox because Channel is itself the
+  reliability layer).
+- **Inbound (`rnsdDestListenChannels`)** — the channel counterpart of
+  `rnsdDestListenLinks` (§5.3): an in-band `CHANNEL_LISTEN` frame sets the
+  destination's established callback to `onIncomingChannelEstablished`, which on
+  each accepted Link connects the consumer inbox **first** (so no delivered
+  message lands with a dead handle) and only then wires `get_channel()` + the
+  receive callback. Reuses the `rnsd_link_incoming_t` payload.
+- **Data path** — `onChannelRecv` sends consumer bytes as one Channel message
+  (buffering to the outbox when the window is full or the link is pre-active);
+  `onChannelMsgCb` forwards each delivered message to the consumer handle.
+  `channelPollAll()` drives `Channel::poll()` on every rnsd loop wake (proof
+  arrivals wake the loop), so delivery detection and window-freeing are prompt;
+  `channelTick()` runs the 1 Hz state machine (path/establishment timeouts,
+  3 s terminal-grace reclaim).
+- **State tree** — `rnsd.chan.<tag>.{state,direction,aspect,remote_hash,
+  link_id,mtu,rtt_ms,opened_s,activated_s,tx_msgs,rx_msgs,last_error}` plus the
+  reverse index `rnsd.chan.byid.<link_id>`. Closing the ITS handle tears the
+  Channel + hidden Link down and deletes the subtree — same 1:1 handle==channel
+  lifetime as Links (§5.2).
 
 ## 6. Boot barrier
 

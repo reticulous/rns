@@ -752,6 +752,11 @@ void Link::link_closed() {
 	}
 	if (_object->_channel) {
 		_object->_channel._shutdown();
+		// Release LinkData's ref to the Channel. The Channel object holds a
+		// Link handle (→ LinkData), so keeping it here would be a shared_ptr
+		// cycle that never frees. Any consumer that still holds a Channel
+		// handle keeps its own (now shut-down) copy alive until it drops it.
+		_object->_channel = Channel({Type::NONE});
 	}
 
 	_object->_prv.reset();
@@ -1030,12 +1035,14 @@ Get the ``Channel`` for this link.
 
 :return: ``Channel`` object
 """
-void Link::get_channel() {
-	assert(_object);
-	if _object->_channel is None:
-		_object->_channel = Channel(LinkChannelOutlet(self))
-	return _object->_channel
 */
+Channel Link::get_channel() {
+	assert(_object);
+	if (!_object->_channel) {
+		_object->_channel = Channel(*this);
+	}
+	return _object->_channel;
+}
 
 /*
 void Link::receive(const Packet& packet) {
@@ -1457,28 +1464,25 @@ void Link::receive(const Packet& packet) {
 					}
 					break;
 				}
-				default:
-					/* Resource/proof/channel/control contexts not yet
-					 * wired in this fork (Phase A only ports the Link
-					 * wire shape; Phase F+ wires the resource paths). */
-					break;
-/*z
 				case Type::Packet::CHANNEL:
 				{
-					//z if (!_object->_channel) {
-					if (true) {
-						DEBUG(f"Channel data received without open channel")
+					if (!_object->_channel) {
+						DEBUGF("Link %s: channel data received without open channel", toString().c_str());
 					}
 					else {
-						//z packet.prove();
-						//z plaintext = decrypt(packet.data());
-						//z if (plaintext) {
-						//z 	_object->_channel._receive(plaintext);
-						//z }
+						const_cast<Packet&>(packet).prove();
+						const Bytes plaintext = decrypt(packet.data());
+						if (plaintext) {
+							_object->_channel._receive(plaintext);
+						}
 					}
 					break;
 				}
-*/
+				default:
+					/* Other resource/proof/control contexts not yet
+					 * wired in this fork (Phase A only ports the Link
+					 * wire shape; Phase F+ wires the resource paths). */
+					break;
 				}
 			}
 			else if (packet.packet_type() == Type::Packet::PROOF) {

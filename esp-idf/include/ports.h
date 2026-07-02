@@ -59,6 +59,21 @@ constexpr uint16_t RNSD_PORT_ANNOUNCES = 6;
  *  There is no separate teardown frame and no parking. */
 constexpr uint16_t RNSD_PORT_LINK = 10;
 
+/** Generic Reticulum Channel → ITS connection (RNSD_PORT_CHANNEL).
+ *  Same shape as RNSD_PORT_LINK, but the bytes on the packet-mode ITS handle
+ *  are *reliable, in-order Channel messages* (each one delivered exactly once,
+ *  retried until the peer proves it) rather than best-effort Link packets. rnsd
+ *  opens the underlying Link, obtains its Channel (Link::get_channel()), and
+ *  bridges Channel messages to/from the handle. The Link itself is never
+ *  exposed — the consumer only ever sees the channel. Connect payload is the
+ *  rnsd-private rnsd_channel_connect_t (built by rnsdChannelOpen()).
+ *  Closing the handle tears the Channel + Link down. */
+constexpr uint16_t RNSD_PORT_CHANNEL = 11;
+/* The connect payload (rnsd_channel_connect_t) is rnsd-private — defined in
+ * rnsd.cpp alongside rnsd_link_connect_t; consumers go through rnsdChannelOpen().
+ * Inbound channels reuse rnsd_link_incoming_t as the per-channel connect
+ * payload. */
+
 enum : uint8_t {
     /* 0x01 was RNSD_LINK_AUX_TEARDOWN — removed; itsDisconnect tears down. */
     RNSD_LINK_AUX_SEND_RESOURCE = 0x02, /* payload: rnsd_link_send_resource_t —
@@ -195,6 +210,11 @@ enum : uint8_t {
     RNSD_DEST_OUT_STATUS = 0x05,   /* rnsd → app: send_id(2) | type(1) | tail */
     RNSD_DEST_ANNOUNCE   = 0x06,   /* app → rnsd: app_data bytes (may be empty) */
     RNSD_DEST_LINK_LISTEN = 0x07,  /* app → rnsd: link_inbox_port(2 BE) */
+    RNSD_DEST_CHANNEL_LISTEN = 0x08, /* app → rnsd: chan_inbox_port(2 BE) — like
+                                      * LINK_LISTEN but forwards a reliable
+                                      * Channel (inside the accepted inbound Link)
+                                      * to the consumer instead of raw link
+                                      * packets. Used by the rnsh server. */
 };
 
 /** Connect payload rnsd sends to the consumer's registered

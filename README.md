@@ -141,6 +141,25 @@ The link's lifetime tracks your ITS handle 1:1 — close the handle and the link
 tears down. A consumer that wants a warm link across idle gaps simply keeps the
 handle open (this is how lxmf pools per-peer links).
 
+### Reliable channels
+
+A **Link** is a best-effort packet pipe: an `itsSend` on a link handle is one
+Link packet, delivered at most once. When a consumer needs **reliable, in-order
+messages** instead, it opens a **Channel** — a sequenced, retried,
+deduplicated message stream that rides *inside* a Link (Reticulum's `Channel`,
+ported to the device). The Link is owned internally; the consumer only ever
+touches the channel, exactly as it would a link:
+
+- `rnsdChannelOpen(dest_hash, aspect, …)` — outbound. Same immediate-accept
+  lifecycle and `rnsd.chan.<tag>.state` as a link, but each `itsSend` is one
+  message rnsd retransmits until the peer proves it, and each `itsRecv` is one
+  message delivered exactly once, in send order.
+- `rnsdDestListenChannels(dest_handle, port)` — inbound. Like
+  `rnsdDestListenLinks`, but forwards a Channel per accepted inbound Link.
+
+A message must fit the channel MDU (Link MDU − 6). [rnsh](../rnsh) is built on
+this. See [INTERNALS.md §5.6](INTERNALS.md).
+
 `rnsd` is started for you: the build's generated init brings up the identity,
 µR `Reticulum` + `Transport`, the interface table, and the announce fan-out.
 If the `rns` straddle is in your build, `rnsd` is running — interfaces register
@@ -157,6 +176,7 @@ themselves at runtime, so it has zero compile-time knowledge of which exist.
 | 5 | `RNSD_PORT_DGRAM` | Datagram send. |
 | 6 | `RNSD_PORT_ANNOUNCES` | Announce fan-out to subscribers, with an optional aspect filter. |
 | 10 | `RNSD_PORT_LINK` | Outbound links (`rnsdLinkOpen`) + request/Resource aux. |
+| 11 | `RNSD_PORT_CHANNEL` | Outbound reliable channels (`rnsdChannelOpen`); inbound via `rnsdDestListenChannels`. |
 
 (`lxmf` reserves internal ports 100/101 for rnsd→lxmf inbound-link and Resource
 hand-offs; these are not client-facing.) Opcode tables for the framed ports
@@ -210,6 +230,8 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.stats.{packets_in,packets_out,bytes_in,bytes_out,ifaces_up}` | Traffic counters. |
 | `rnsd.links.<tag>.{state,direction,aspect,remote_hash,opened_s,last_error,…}` | Per-link state tree, keyed by the caller's `tag` — observable before the link_id exists. |
 | `rnsd.links.byid.<link_id>` | Reverse index: link_id → tag. |
+| `rnsd.chan.<tag>.{state,direction,aspect,remote_hash,link_id,mtu,rtt_ms,tx_msgs,rx_msgs,last_error,…}` | Per-channel state tree (`rnsdChannelOpen`), same shape as the link tree. |
+| `rnsd.chan.byid.<link_id>` | Reverse index: channel's hidden link_id → tag. |
 | `rnsd.dest.<idx>.{aspect,dest}` | Hosted-destination (our-dest) observability. |
 | `rnsd.ifaces.<name>.{up,mode,mtu,bitrate,rx_bytes,rx_packets,tx_bytes,tx_packets}` | Per-interface state and counters. |
 

@@ -188,6 +188,42 @@ int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                  void (*on_recv)(int handle, size_t bytes_avail),
                  void (*on_disconnect)(int handle));
 
+/** Open an outbound Reticulum **Channel** to a remote destination
+ *  (RNSD_PORT_CHANNEL). Identical call shape and lifecycle to rnsdLinkOpen(),
+ *  but the returned packet-mode ITS handle carries *reliable, in-order Channel
+ *  messages*: each itsSend is one message that rnsd retransmits until the peer
+ *  proves it, and each itsRecv is one message delivered exactly once in send
+ *  order. rnsd owns the underlying Link internally and never exposes it — the
+ *  consumer interacts only with the channel, exactly as it would a link today.
+ *
+ *  The connect accepts immediately; watch `rnsd.chan.<tag>.state` for the
+ *  transition to "active"/"failed". Messages sent before the channel is active
+ *  are buffered and flushed on establishment (bounded outbox; overflow sets
+ *  `rnsd.chan.<tag>.last_error`). A message must fit the channel MDU (Link MDU
+ *  minus 6) — oversize sends are rejected with `last_error`.
+ *
+ *  `tag`, `aspect`, `identity_key`, `path_timeout_ms`, `link_timeout_ms`, `ref`
+ *  and the callbacks all behave as in rnsdLinkOpen(). Returns the ITS handle
+ *  (>= 0) on accept, or negative on immediate failure. */
+int rnsdChannelOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+                    const char*   aspect,
+                    const char*   identity_key,
+                    const char*   tag,
+                    uint32_t      path_timeout_ms,
+                    uint32_t      link_timeout_ms,
+                    int           ref,
+                    void (*on_recv)(int handle, size_t bytes_avail),
+                    void (*on_disconnect)(int handle));
+
+/** Like rnsdDestListenLinks(), but forwards a reliable **Channel** (obtained
+ *  from the accepted inbound Link) to `target_port` instead of raw link
+ *  packets. On each accepted inbound Link, rnsd opens its Channel and connects
+ *  to (owning_task, target_port) with an `rnsd_link_incoming_t` payload; the
+ *  handle then carries Channel messages both ways. Used by the rnsh server to
+ *  accept incoming shell sessions. Returns true if the request was queued. */
+bool rnsdDestListenChannels(int      dest_handle,
+                            uint16_t target_port);
+
 /** Tell rnsd to forward incoming Reticulum Links for the destination
  *  behind `dest_handle` (obtained from rnsdDestOpen) to ITS port
  *  `target_port` on the *same task* that owns `dest_handle`. rnsd

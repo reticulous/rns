@@ -37,6 +37,7 @@
 #include "Reticulum.h"
 #include "Destination.h"
 #include "Link.h"
+#include "Channel.h"
 #include "Resource.h"
 #include "Persistence/DestinationEntry.h"
 #include "Utilities/OS.h"
@@ -204,6 +205,19 @@ typedef struct {
 } rnsd_link_connect_t;
 static_assert(sizeof(rnsd_link_connect_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_connect_t must fit ITS_MAX_MSG_DATA");
+
+/* RNSD_PORT_CHANNEL connect payload — rnsd-private (mirrors
+ * rnsd_link_connect_t; consumers go through rnsdChannelOpen() in rnsd.h). */
+typedef struct {
+    uint8_t  dest_hash[RNSD_DEST_HASH_LEN];  /* target destination hash */
+    char     aspect[32];                     /* "rnsh" */
+    char     identity_key[40];               /* our id privkey path; "" → default */
+    char     tag[24];                        /* caller tag, keys rnsd.chan.<tag>.* */
+    uint32_t path_timeout_ms;                /* 0 → s.rnsd.link.path_timeout_s */
+    uint32_t link_timeout_ms;                /* 0 → ref-impl outbound budget */
+} rnsd_channel_connect_t;
+static_assert(sizeof(rnsd_channel_connect_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_channel_connect_t must fit ITS_MAX_MSG_DATA");
 
 #define RNSD_MAX_OUR_DESTS    4
 /* Per-conn pending path-search slots. Each holds one parked OUT_PACKET (its
@@ -910,6 +924,10 @@ static int ourDestTrySend(our_dest_t& c, uint16_t send_id,
  * destination. Defined in the consumer-API block below (needs
  * s_link_conns etc.). */
 static void onIncomingLinkEstablished(RNS::Link& link);
+/* Inbound-Channel established callback — the channel counterpart of
+ * onIncomingLinkEstablished, set on destinations registered via
+ * RNSD_DEST_CHANNEL_LISTEN. Defined in the channel bridge block below. */
+static void onIncomingChannelEstablished(RNS::Link& link);
 
 static void onOurDestInbound(const RNS::Bytes& plaintext, const RNS::Packet& packet)
 {
@@ -1159,6 +1177,31 @@ static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
                 break;
             }
             info("our-dest conn %d: listening for inbound Links → port %u",
+                 (int)(c - s_our_dests), (unsigned)port);
+            break;
+        }
+        case RNSD_DEST_CHANNEL_LISTEN: {
+            if (!c->listener_dest) {
+                warn("our-dest: CHANNEL_LISTEN on outbound-only conn");
+                break;
+            }
+            if (n < 3) { err("our-dest: CHANNEL_LISTEN too short (%zu)", n); break; }
+            uint16_t port = ((uint16_t)buf[1] << 8) | (uint16_t)buf[2];
+            if (port == 0) { warn("our-dest: CHANNEL_LISTEN port 0"); break; }
+            c->link_listener_task = itsRemoteTask(handle);
+            c->link_inbox_port    = port;
+            try {
+                /* Reuse the same listener fields; the channel established
+                 * callback (vs the link one) is what makes inbound Links
+                 * forward as Channels. */
+                c->listener_dest.set_link_established_callback(
+                    onIncomingChannelEstablished);
+                c->listener_dest.accepts_links(true);
+            } catch (const std::exception& e) {
+                err("our-dest: CHANNEL_LISTEN wiring threw: %s", e.what());
+                break;
+            }
+            info("our-dest conn %d: listening for inbound Channels → port %u",
                  (int)(c - s_our_dests), (unsigned)port);
             break;
         }
@@ -2788,6 +2831,31 @@ int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                       ref, on_recv, on_disconnect);
 }
 
+int rnsdChannelOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+                    const char*   aspect,
+                    const char*   identity_key,
+                    const char*   tag,
+                    uint32_t      path_timeout_ms,
+                    uint32_t      link_timeout_ms,
+                    int           ref,
+                    void (*on_recv)(int, size_t),
+                    void (*on_disconnect)(int))
+{
+    if (!aspect || !*aspect) { warn("rnsdChannelOpen: aspect required"); return -1; }
+    if (!tag || !*tag)       { warn("rnsdChannelOpen: tag required");    return -1; }
+    rnsd_channel_connect_t req = {};
+    memcpy(req.dest_hash, dest_hash, RNSD_DEST_HASH_LEN);
+    safeStrncpy(req.aspect, aspect, sizeof(req.aspect));
+    safeStrncpy(req.tag, tag, sizeof(req.tag));
+    if (identity_key && *identity_key)
+        safeStrncpy(req.identity_key, identity_key, sizeof(req.identity_key));
+    req.path_timeout_ms = path_timeout_ms;
+    req.link_timeout_ms = link_timeout_ms;
+    return itsConnect("rnsd", RNSD_PORT_CHANNEL,
+                      &req, sizeof(req), pdMS_TO_TICKS(2000),
+                      ref, on_recv, on_disconnect);
+}
+
 bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
                           uint32_t opaque_id)
 {
@@ -2872,6 +2940,20 @@ bool rnsdDestListenLinks(int dest_handle, uint16_t target_port)
      * handle you own proves you own the destination. */
     uint8_t f[3] = {
         RNSD_DEST_LINK_LISTEN,
+        (uint8_t)(target_port >> 8),
+        (uint8_t)(target_port & 0xFF),
+    };
+    return itsSend(dest_handle, f, sizeof(f), pdMS_TO_TICKS(500)) == sizeof(f);
+}
+
+bool rnsdDestListenChannels(int dest_handle, uint16_t target_port)
+{
+    if (dest_handle < 0 || target_port == 0) {
+        warn("rnsdDestListenChannels: bad args");
+        return false;
+    }
+    uint8_t f[3] = {
+        RNSD_DEST_CHANNEL_LISTEN,
         (uint8_t)(target_port >> 8),
         (uint8_t)(target_port & 0xFF),
     };
@@ -4400,6 +4482,425 @@ static void onIncomingLinkEstablished(RNS::Link& link)
          (unsigned)mc->link_inbox_port);
 }
 
+/* ═══════════════ RNSD_PORT_CHANNEL — reliable Channel consumer API ═══════════
+ *
+ * Mirrors the RNSD_PORT_LINK block above, but each slot owns a hidden Link plus
+ * its Channel (Link::get_channel()). Consumer bytes are sent as reliable,
+ * in-order Channel messages, and delivered messages are forwarded back to the
+ * consumer's packet-mode handle. The Link is never exposed. Both the outbound
+ * (rnsdChannelOpen) and inbound (rnsdDestListenChannels →
+ * onIncomingChannelEstablished) paths share this one slot table — the same way
+ * the link block shares s_link_conns for its two directions. Reuses the
+ * link_state_t enum + lstName + sameLink + linkLoadIdentity helpers above. */
+
+#define RNSD_MAX_CHAN_CONNS   8
+#define RNSD_CHAN_MAX_OUTBOX  16   /* not-ready / pre-active buffered messages */
+
+struct chan_conn_t {
+    bool         used;
+    int          handle;
+    int          ref;
+    char         tag[24];
+    RNS::Bytes   dest_hash;
+    std::string  aspect;
+    std::string  identity_key;
+    uint8_t      direction;        /* 0 = out, 1 = in */
+    link_state_t state;
+    RNS::Link    link{RNS::Type::NONE};      /* hidden — never exposed */
+    RNS::Channel channel{RNS::Type::NONE};
+    double       opened_at;
+    double       last_activity;
+    double       path_deadline;
+    double       estab_deadline;
+    uint32_t     link_timeout_ms;
+    double       dead_at;
+    std::vector<std::vector<uint8_t>> outbox; /* messages awaiting a ready channel */
+};
+
+static chan_conn_t* s_chan_conns = nullptr;
+
+static chan_conn_t* chanFindByHandle(int handle) {
+    for (int j = 0; j < RNSD_MAX_CHAN_CONNS; j++)
+        if (s_chan_conns[j].used && s_chan_conns[j].handle == handle) return &s_chan_conns[j];
+    return nullptr;
+}
+static chan_conn_t* chanFindByLink(const RNS::Link& l) {
+    for (int j = 0; j < RNSD_MAX_CHAN_CONNS; j++)
+        if (s_chan_conns[j].used && sameLink(s_chan_conns[j].link, l)) return &s_chan_conns[j];
+    return nullptr;
+}
+static chan_conn_t* chanFindByTag(const char* tag) {
+    for (int j = 0; j < RNSD_MAX_CHAN_CONNS; j++)
+        if (s_chan_conns[j].used && strcmp(s_chan_conns[j].tag, tag) == 0) return &s_chan_conns[j];
+    return nullptr;
+}
+static void chanTouch(chan_conn_t& c) { c.last_activity = RNS::Utilities::OS::time(); }
+
+static void chanKey(const chan_conn_t& c, const char* field, char* out, size_t n) {
+    snprintf(out, n, "rnsd.chan.%s.%s", c.tag, field);
+}
+static void chanSetStr(const chan_conn_t& c, const char* field, const char* v) {
+    char k[96]; chanKey(c, field, k, sizeof(k)); storageSet(k, v);
+}
+static void chanSetInt(const chan_conn_t& c, const char* field, int v) {
+    char k[96]; chanKey(c, field, k, sizeof(k)); storageSet(k, v);
+}
+static void chanBumpInt(chan_conn_t& c, const char* field) {
+    char k[96]; chanKey(c, field, k, sizeof(k)); storageSet(k, storageGetInt(k, 0) + 1);
+}
+static void chanPublishState(chan_conn_t& c) { chanSetStr(c, "state", lstName(c.state)); }
+static void chanSetError(chan_conn_t& c, const char* m) { chanSetStr(c, "last_error", m); }
+
+static void chanFreeSlot(chan_conn_t& c) {
+    if (c.channel) c.channel.set_receive_callback(nullptr, nullptr);
+    if (c.link) { try { c.link.teardown(); } catch (...) {} }
+    c.channel = RNS::Channel{RNS::Type::NONE};
+    c.link    = RNS::Link{RNS::Type::NONE};
+    if (c.tag[0]) { char p[64]; snprintf(p, sizeof(p), "rnsd.chan.%s", c.tag); storageDeleteTree(p); }
+    if (c.handle >= 0) { itsDisconnect(c.handle); }
+    c.used = false; c.handle = -1; c.ref = -1; c.tag[0] = '\0';
+    c.dest_hash = RNS::Bytes(); c.aspect.clear(); c.identity_key.clear();
+    c.direction = 0; c.state = LST_FREE;
+    c.opened_at = c.last_activity = c.path_deadline = c.estab_deadline = c.dead_at = 0;
+    c.link_timeout_ms = 0;
+    c.outbox.clear();
+}
+
+static chan_conn_t* chanAlloc() {
+    for (int j = 0; j < RNSD_MAX_CHAN_CONNS; j++)
+        if (!s_chan_conns[j].used) return &s_chan_conns[j];
+    chan_conn_t* victim = nullptr;
+    for (int j = 0; j < RNSD_MAX_CHAN_CONNS; j++)
+        if (!victim || s_chan_conns[j].last_activity < victim->last_activity) victim = &s_chan_conns[j];
+    if (victim) {
+        warn("chan: table full — evicting longest-idle tag=%s", victim->tag);
+        chanFreeSlot(*victim);
+        return victim;
+    }
+    return nullptr;
+}
+
+/* Delivered Channel message → consumer handle. ctx is the chan_conn_t*; the
+ * message layer carries the opaque ctx so this needs no match-by-id. A short
+ * itsSend timeout absorbs transient consumer backpressure (the channel already
+ * proved+advanced this message, so a hard drop would break in-order delivery). */
+static void onChannelMsgCb(void* ctx, const RNS::Bytes& data) {
+    chan_conn_t* c = (chan_conn_t*)ctx;
+    if (!c || !c->used || c->handle < 0) return;
+    chanTouch(*c);
+    if (itsSend(c->handle, data.data(), data.size(), pdMS_TO_TICKS(50)) == 0) {
+        warn("chan[%s]: rx overflow (%zuB dropped)", c->tag, data.size());
+        chanSetError(*c, "rx_overflow");
+    } else {
+        chanBumpInt(*c, "rx_msgs");
+    }
+}
+
+/* Flush as many buffered messages as the channel window allows. */
+static void chanFlushOutbox(chan_conn_t& c) {
+    while (!c.outbox.empty() && c.channel && c.channel.is_ready_to_send()) {
+        std::vector<uint8_t>& m = c.outbox.front();
+        if (!c.channel.send(RNS::Bytes(m.data(), m.size()))) break;
+        c.outbox.erase(c.outbox.begin());
+        chanBumpInt(c, "tx_msgs");
+    }
+}
+
+static void onChanLinkEstablishedCb(RNS::Link& link) {
+    chan_conn_t* c = chanFindByLink(link);
+    if (!c) return;
+    c->state = LST_ACTIVE;
+    c->estab_deadline = 0;
+    chanTouch(*c);
+    c->channel = link.get_channel();
+    c->channel.set_receive_callback(onChannelMsgCb, c);
+    chanSetStr(*c, "link_id", link.link_id().toHex().c_str());
+    chanSetInt(*c, "mtu", (int)link.get_mtu());
+    chanSetInt(*c, "rtt_ms", (int)(link.rtt() * 1000.0));
+    chanSetInt(*c, "activated_s", (int)RNS::Utilities::OS::time());
+    chanSetStr(*c, "last_error", "");
+    chanPublishState(*c);
+    {
+        char k[96];
+        snprintf(k, sizeof(k), "rnsd.chan.byid.%s", link.link_id().toHex().c_str());
+        storageSet(k, c->tag);
+    }
+    info("chan[%s]: ACTIVE link_id=%s mtu=%u", c->tag,
+         link.link_id().toHex().c_str(), (unsigned)link.get_mtu());
+    chanFlushOutbox(*c);
+}
+
+static void onChanLinkClosedCb(RNS::Link& link) {
+    chan_conn_t* c = chanFindByLink(link);
+    if (!c) return;
+    c->state = LST_CLOSED;
+    c->dead_at = RNS::Utilities::OS::time();
+    switch (link.teardown_reason()) {
+        case RNS::Type::Link::TIMEOUT:            chanSetError(*c, "timeout"); break;
+        case RNS::Type::Link::DESTINATION_CLOSED: chanSetError(*c, "remote_closed"); break;
+        default: break;
+    }
+    chanPublishState(*c);
+    c->channel = RNS::Channel{RNS::Type::NONE};
+    c->link    = RNS::Link{RNS::Type::NONE};
+}
+
+/* Construct the OUT destination + hidden Link and wire the channel callbacks.
+ * Target identity must already be recallable. Mirrors linkKickoff. */
+static bool chanKickoff(chan_conn_t& c) {
+    RNS::Identity target = RNS::Identity::recall(c.dest_hash);
+    if (!target) return false;
+    RNS::Identity local{RNS::Type::NONE};
+    if (!linkLoadIdentity(c.identity_key, local)) {
+        c.state = LST_FAILED; chanSetError(c, "no_identity"); chanPublishState(c); return true;
+    }
+    std::string app_name = c.aspect, aspects;
+    auto dot = c.aspect.find('.');
+    if (dot != std::string::npos) { app_name = c.aspect.substr(0, dot); aspects = c.aspect.substr(dot + 1); }
+    try {
+        RNS::Destination out_dest(target, RNS::Type::Destination::OUT,
+                                  RNS::Type::Destination::SINGLE,
+                                  app_name.c_str(), aspects.c_str());
+        if (out_dest.hash() != c.dest_hash) {
+            warn("chan[%s]: aspect '%s' mismatches dest_hash %s", c.tag,
+                 c.aspect.c_str(), c.dest_hash.toHex().c_str());
+            c.state = LST_FAILED; chanSetError(c, "aspect_mismatch"); chanPublishState(c); return true;
+        }
+        c.link = RNS::Link(out_dest);
+        c.link.set_link_established_callback(onChanLinkEstablishedCb);
+        c.link.set_link_closed_callback(onChanLinkClosedCb);
+        /* No packet callback: the Channel consumes CHANNEL-context packets via
+         * Link::receive; plain link packets are unused on this path. */
+        c.state = LST_ESTABLISHING;
+        double estab;
+        if (c.link_timeout_ms != 0) {
+            estab = (double)c.link_timeout_ms / 1000.0;
+        } else {
+            int hops = (int)RNS::Transport::hops_to(c.dest_hash);
+            estab = c.link.establishment_timeout()
+                  + (double)RNS::Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP * (double)std::max(1, hops);
+        }
+        c.link.establishment_timeout(estab);
+        c.estab_deadline = RNS::Utilities::OS::time() + estab;
+        chanPublishState(c);
+        info("chan[%s]: kickoff → %s aspect=%s estab=%.1fs", c.tag,
+             c.dest_hash.toHex().c_str(), c.aspect.c_str(), estab);
+    } catch (const std::exception& e) {
+        warn("chan[%s]: kickoff threw: %s", c.tag, e.what());
+        c.state = LST_FAILED; chanSetError(c, "ctor_threw"); chanPublishState(c);
+    }
+    return true;
+}
+
+static int onChannelConnect(int handle, const void* data, size_t len) {
+    if (len != sizeof(rnsd_channel_connect_t)) {
+        err("chan connect: bad payload len %zu (want %zu)", len, sizeof(rnsd_channel_connect_t));
+        return -1;
+    }
+    const rnsd_channel_connect_t* req = (const rnsd_channel_connect_t*)data;
+    char tag[24]; safeStrncpy(tag, req->tag, sizeof(tag));
+    if (tag[0] == '\0') { err("chan connect: empty tag"); return -1; }
+    if (chan_conn_t* dup = chanFindByTag(tag)) {
+        if (dup->handle >= 0) { err("chan connect: duplicate tag '%s'", tag); return -1; }
+        chanFreeSlot(*dup);   /* stale mid-teardown slot — reclaim */
+    }
+    chan_conn_t* c = chanAlloc();
+    if (!c) { err("chan connect: no slots"); return -1; }
+    c->used = true; c->handle = handle; c->ref = (int)(c - s_chan_conns);
+    safeStrncpy(c->tag, tag, sizeof(c->tag));
+    c->dest_hash.assign(req->dest_hash, RNSD_DEST_HASH_LEN);
+    { char a[32]; safeStrncpy(a, req->aspect, sizeof(a)); c->aspect = a; }
+    { char k[40]; safeStrncpy(k, req->identity_key, sizeof(k)); c->identity_key = k; }
+    c->direction = 0;
+    c->opened_at = c->last_activity = RNS::Utilities::OS::time();
+    c->dead_at = 0; c->estab_deadline = 0;
+    c->link_timeout_ms = req->link_timeout_ms;
+    c->outbox.clear();
+    int path_to_s = req->path_timeout_ms ? (int)(req->path_timeout_ms / 1000)
+                                         : storageGetInt("s.rnsd.link.path_timeout_s", 30);
+    c->path_deadline = c->opened_at + path_to_s;
+
+    chanSetStr(*c, "direction", "out");
+    chanSetStr(*c, "aspect", c->aspect.c_str());
+    chanSetStr(*c, "remote_hash", c->dest_hash.toHex().c_str());
+    chanSetInt(*c, "opened_s", (int)c->opened_at);
+    chanSetStr(*c, "last_error", "");
+
+    /* Require BOTH a path and a recallable identity before establishing — a
+     * cached identity alone (recall() true) does not mean the path table still
+     * has a route (it churns, esp. on a busy public mesh), and an LR with no
+     * next hop is silently dropped → establish_timeout. Otherwise wait for the
+     * path and (re-)request it from channelTick. */
+    if (RNS::Transport::has_path(c->dest_hash) && RNS::Identity::recall(c->dest_hash)) {
+        c->state = LST_ESTABLISHING; chanPublishState(*c); chanKickoff(*c);
+    } else {
+        c->state = LST_AWAITING_PATH; chanPublishState(*c);
+        try { RNS::Transport::request_path(c->dest_hash); }
+        catch (const std::exception& e) { warn("chan[%s]: request_path threw: %s", c->tag, e.what()); }
+    }
+    return c->ref;
+}
+
+static void onChannelRecv(int handle, size_t /*avail*/) {
+    chan_conn_t* c = chanFindByHandle(handle);
+    if (!c) return;
+    PSRAM_BSS static uint8_t buf[2048];
+    size_t n = itsRecv(handle, buf, sizeof(buf), 0);
+    if (n == 0) return;
+    chanTouch(*c);
+    if (c->state == LST_ACTIVE && c->channel) {
+        uint16_t mdu = c->channel.mdu();
+        if (mdu != 0 && n > mdu) {
+            warn("chan[%s]: send %zuB exceeds channel MDU %u", c->tag, n, (unsigned)mdu);
+            chanSetError(*c, "oversize");
+            return;
+        }
+        if (c->outbox.empty() && c->channel.is_ready_to_send() &&
+            c->channel.send(RNS::Bytes(buf, n))) {
+            chanBumpInt(*c, "tx_msgs");
+            return;
+        }
+    }
+    /* Not active yet, window full, or already draining an outbox: buffer in
+     * order (bounded). */
+    if (c->outbox.size() < RNSD_CHAN_MAX_OUTBOX) {
+        c->outbox.emplace_back(buf, buf + n);
+    } else {
+        warn("chan[%s]: outbox full (%d) — dropping send", c->tag, RNSD_CHAN_MAX_OUTBOX);
+        chanSetError(*c, "send_queue_full");
+    }
+}
+
+static void onChannelDisconnect(int ref) {
+    if (ref < 0 || ref >= RNSD_MAX_CHAN_CONNS) return;
+    chan_conn_t& c = s_chan_conns[ref];
+    if (!c.used) return;
+    c.handle = -1;   /* consumer gone — don't itsDisconnect it back */
+    info("chan[%s]: consumer detached", c.tag);
+    chanFreeSlot(c);
+}
+
+/* Inbound Channel: an accepted inbound Link on a CHANNEL_LISTEN destination.
+ * Mirrors onIncomingLinkEstablished, but obtains the Channel and forwards
+ * reliable messages. Connect the consumer inbox FIRST, then wire the channel
+ * receive callback, so no delivered message can land with handle < 0 (a plain
+ * link packet arriving before get_channel() is just re-proven by the sender's
+ * Channel retransmit). */
+static void onIncomingChannelEstablished(RNS::Link& link) {
+    RNS::Bytes local = link.destination().hash();
+    our_dest_t* mc = ourDestFindByDestHash(local);
+    if (!mc || !mc->link_listener_task || mc->link_inbox_port == 0) {
+        warn("inchan: LR on %s with no listener — tearing down", local.toHex().c_str());
+        try { link.teardown(); } catch (...) {}
+        return;
+    }
+    chan_conn_t* c = chanAlloc();
+    if (!c) { warn("inchan: no slots — tearing down"); try { link.teardown(); } catch (...) {} return; }
+
+    std::string lid = link.link_id().toHex();
+    std::string tag = "cin." + lid.substr(0, 8);
+    c->used = true; c->handle = -1; c->ref = (int)(c - s_chan_conns);
+    safeStrncpy(c->tag, tag.c_str(), sizeof(c->tag));
+    c->dest_hash = local; c->aspect = mc->req.aspect; c->identity_key.clear();
+    c->direction = 1; c->state = LST_ACTIVE;
+    c->link = link;
+    c->opened_at = c->last_activity = RNS::Utilities::OS::time();
+    c->dead_at = 0; c->estab_deadline = 0;
+    c->outbox.clear();
+    link.set_link_closed_callback(onChanLinkClosedCb);
+
+    RNS::Bytes rid;
+    { const RNS::Identity& ri = link.get_remote_identity(); if (ri) rid = ri.hash(); }
+
+    chanSetStr(*c, "direction", "in");
+    chanSetStr(*c, "aspect", c->aspect.c_str());
+    chanSetStr(*c, "local_hash", local.toHex().c_str());
+    if (rid) chanSetStr(*c, "remote_identity", rid.toHex().c_str());
+    chanSetStr(*c, "link_id", lid.c_str());
+    chanSetInt(*c, "mtu", (int)link.get_mtu());
+    chanSetInt(*c, "opened_s", (int)c->opened_at);
+    chanSetInt(*c, "activated_s", (int)c->opened_at);
+    chanSetStr(*c, "last_error", "");
+    chanPublishState(*c);
+    { char k[96]; snprintf(k, sizeof(k), "rnsd.chan.byid.%s", lid.c_str()); storageSet(k, c->tag); }
+
+    rnsd_link_incoming_t pl = {};
+    safeStrncpy(pl.tag, c->tag, sizeof(pl.tag));
+    if (link.link_id().size() >= 16) memcpy(pl.link_id, link.link_id().data(), 16);
+    if (rid.size() >= 16) memcpy(pl.remote_identity_hash, rid.data(), 16);
+    if (local.size() >= 16) memcpy(pl.local_dest_hash, local.data(), 16);
+    pl.mtu = link.get_mtu();
+
+    int h = itsConnectByTaskHandle(mc->link_listener_task, mc->link_inbox_port,
+                                   &pl, sizeof(pl), pdMS_TO_TICKS(2000),
+                                   c->ref, onChannelRecv, onChannelDisconnect);
+    if (h < 0) {
+        warn("inchan[%s]: consumer unreachable (%d), tearing down", c->tag, h);
+        chanSetError(*c, "consumer_unreachable");
+        try { link.teardown(); } catch (...) {}
+        c->link = RNS::Link{RNS::Type::NONE};
+        c->state = LST_FAILED; c->dead_at = RNS::Utilities::OS::time();
+        return;
+    }
+    c->handle = h;
+    /* Now that the consumer handle is live, wire the channel so delivered
+     * messages have somewhere to go. */
+    c->channel = link.get_channel();
+    c->channel.set_receive_callback(onChannelMsgCb, c);
+    info("inchan[%s]: ACTIVE link_id=%s mtu=%u → consumer port %u",
+         c->tag, lid.c_str(), (unsigned)link.get_mtu(), (unsigned)mc->link_inbox_port);
+}
+
+/* Poll every active channel's reliability engine + flush outboxes. Called every
+ * rnsd loop iteration (proof arrival wakes the loop via ITS, so delivery
+ * detection is prompt). */
+static void channelPollAll() {
+    if (!s_chan_conns) return;
+    for (int j = 0; j < RNSD_MAX_CHAN_CONNS; j++) {
+        chan_conn_t& c = s_chan_conns[j];
+        if (!c.used || c.state != LST_ACTIVE || !c.channel) continue;
+        c.channel.poll();
+        if (c.channel) chanFlushOutbox(c);   /* poll() may have torn the link down */
+    }
+}
+
+/* 1 Hz state machine: path-wait / establishment timeouts + terminal reclaim.
+ * Mirrors linkTick. */
+static void channelTick() {
+    if (!s_chan_conns) return;
+    double now = RNS::Utilities::OS::time();
+    for (int j = 0; j < RNSD_MAX_CHAN_CONNS; j++) {
+        chan_conn_t& c = s_chan_conns[j];
+        if (!c.used) continue;
+        switch (c.state) {
+            case LST_AWAITING_PATH:
+                if (RNS::Transport::has_path(c.dest_hash) && RNS::Identity::recall(c.dest_hash)) {
+                    chanKickoff(c);
+                } else if (now >= c.path_deadline) {
+                    c.state = LST_FAILED; chanSetError(c, "no_path"); chanPublishState(c); c.dead_at = now;
+                } else {
+                    /* Keep asking until the path resolves or the deadline hits —
+                     * on a churning public mesh a single request often races an
+                     * eviction. */
+                    try { RNS::Transport::request_path(c.dest_hash); } catch (...) {}
+                }
+                break;
+            case LST_ESTABLISHING:
+                if (now >= c.estab_deadline) {
+                    if (c.link) { try { c.link.teardown(); } catch (...) {} }
+                    c.state = LST_FAILED; chanSetError(c, "establish_timeout"); chanPublishState(c); c.dead_at = now;
+                }
+                break;
+            case LST_CLOSED:
+            case LST_FAILED:
+                if (c.dead_at == 0) c.dead_at = now;
+                else if (now - c.dead_at >= 3.0) chanFreeSlot(c);
+                break;
+            default: break;
+        }
+    }
+}
+
 /* ─────────────── `clink` test consumer task ───────────────
  *
  * A trivial test consumer task on the device that can open a Link, send,
@@ -4704,12 +5205,15 @@ static void rnsdTaskMain(void*)
         RNSD_MAX_LINK_CONNS * sizeof(link_conn_t), MALLOC_CAP_SPIRAM);
     s_our_dest_receipts = (our_dest_receipt_t*)heap_caps_malloc(
         RNSD_MAX_PENDING_RECEIPTS * sizeof(our_dest_receipt_t), MALLOC_CAP_SPIRAM);
-    if (!s_ifaces || !s_our_dests || !s_link_conns || !s_our_dest_receipts) {
+    s_chan_conns = (chan_conn_t*)heap_caps_malloc(
+        RNSD_MAX_CHAN_CONNS * sizeof(chan_conn_t), MALLOC_CAP_SPIRAM);
+    if (!s_ifaces || !s_our_dests || !s_link_conns || !s_our_dest_receipts || !s_chan_conns) {
         err("rnsd table PSRAM alloc failed"); killSelf();
     }
     for (int j = 0; j < RNSD_MAX_IFACES; j++)        new (&s_ifaces[j])        iface_t{};
     for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++) new (&s_our_dests[j]) our_dest_t{};
     for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)    new (&s_link_conns[j])    link_conn_t{};
+    for (int j = 0; j < RNSD_MAX_CHAN_CONNS; j++)    new (&s_chan_conns[j])    chan_conn_t{};
     for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++)
         new (&s_our_dest_receipts[j]) our_dest_receipt_t{};
 
@@ -4754,7 +5258,7 @@ static void rnsdTaskMain(void*)
      * this the connect fails and onIncomingLinkEstablished tears the
      * Link down (peer sees DESTINATION_CLOSED). Shares the itsServerInit
      * inbox. RNSD_MAX_LINK_CONNS inbound forwards + headroom. */
-    itsClientInit(RNSD_MAX_LINK_CONNS + 4);
+    itsClientInit(RNSD_MAX_LINK_CONNS + RNSD_MAX_CHAN_CONNS + 4);
     /* 4 KB per direction per handle — bursty announce traffic on a busy
      * testnet can fill 2 KB before rnsd drains during the 1 Hz publish
      * block. 4 KB gives ~4× more headroom; PSRAM-allocated, ~64 KB total
@@ -4813,6 +5317,20 @@ static void rnsdTaskMain(void*)
     itsServerOnDisconnect(RNSD_PORT_LINK, onLinkDisconnect);
     itsServerOnRecv(RNSD_PORT_LINK,       onLinkRecv);
     itsOnAux(RNSD_PORT_LINK,              onLinkAux);   /* explicit teardown */
+
+    /* RNSD_PORT_CHANNEL — reliable Channel consumer API. Packet-mode: one
+     * Channel message per itsSend/itsRecv. Same buffering as RNSD_PORT_LINK. */
+    if (!itsServerPortOpen(RNSD_PORT_CHANNEL, ITS_PACKET,
+                           /*maxHandles=*/RNSD_MAX_CHAN_CONNS,
+                           /*toCap=*/4096, /*fromCap=*/4096,
+                           /*depth=*/0, /*maxMsg=*/4096)) {
+        err("RNSD_PORT_CHANNEL open failed");
+        killSelf();
+        return;
+    }
+    itsServerOnConnect(RNSD_PORT_CHANNEL,    onChannelConnect);
+    itsServerOnDisconnect(RNSD_PORT_CHANNEL, onChannelDisconnect);
+    itsServerOnRecv(RNSD_PORT_CHANNEL,       onChannelRecv);
 
     loadOrCreateIdentity();
     storageSet("rnsd.up", 1);
@@ -4974,6 +5492,10 @@ static void rnsdTaskMain(void*)
     for (;;) {
         itsPoll(nextDeadline());
 
+        /* Drive Channel reliability every wake — proof arrivals wake itsPoll,
+         * so delivery detection and window-freeing are prompt. */
+        channelPollAll();
+
         TickType_t now = xTaskGetTickCount();
         if (now - s_lastPublishTick >= pdMS_TO_TICKS(1000)) {
             /* The 1 Hz block is unyieldy except for publishPathTable's
@@ -5006,6 +5528,7 @@ static void rnsdTaskMain(void*)
                 ourDestTickPending();
                 ourDestReceiptTick();
                 linkTick();
+                channelTick();
 
                 /* Rnsd-hosted announces — debounce fire + periodic check.
                  * Each sendX() is a no-op when its destination is down,
