@@ -4967,6 +4967,10 @@ static void rnsdTaskMain(void*)
     s_lastPublishTick = xTaskGetTickCount();
     int tickPhase = 0;
 
+    /* Load-shedding state for the Transport::jobs() sweep (see below). */
+    uint32_t jobsPrevPktsIn = s_stats.packets_in;
+    int      jobsDeferred   = 0;
+
     for (;;) {
         itsPoll(nextDeadline());
 
@@ -4979,8 +4983,26 @@ static void rnsdTaskMain(void*)
              * RNSD_PORT_IFACE recv drops follow. Stagger across two
              * ticks so each tick only carries one slow workload. */
             if (tickPhase == 0) {
-                try { RNS::Transport::jobs(); }
-                catch (const std::exception& e) { warn("Transport::jobs threw: %s", e.what()); }
+                /* Load-shed the sweep. Transport::jobs() is unyieldy and its
+                 * cost scales with the path table; running it parks the task
+                 * past the ifaces' 100 ms itsSend timeout, dropping
+                 * RNSD_PORT_IFACE recv. During an inbound burst (e.g. a
+                 * resource pull) the sweep has little essential work, so skip
+                 * it for up to _DEFER_MAX consecutive sweep-ticks whenever the
+                 * packets received since the last sweep exceed _DEFER_PKTS. The
+                 * cap guarantees link keepalives / path retries / resource
+                 * timeouts still run within a few seconds; the housekeeping
+                 * calls below stay on every tick. */
+                uint32_t din = s_stats.packets_in - jobsPrevPktsIn;
+                jobsPrevPktsIn = s_stats.packets_in;
+                if (din >= (uint32_t)CONFIG_SPANGAP_RNSD_JOBS_DEFER_PKTS &&
+                    jobsDeferred < CONFIG_SPANGAP_RNSD_JOBS_DEFER_MAX) {
+                    jobsDeferred++;
+                } else {
+                    jobsDeferred = 0;
+                    try { RNS::Transport::jobs(); }
+                    catch (const std::exception& e) { warn("Transport::jobs threw: %s", e.what()); }
+                }
                 ourDestTickPending();
                 ourDestReceiptTick();
                 linkTick();

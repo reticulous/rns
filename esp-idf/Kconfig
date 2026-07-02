@@ -1,0 +1,34 @@
+menu "spangap: reticulum (rnsd)"
+
+config SPANGAP_RNSD_JOBS_DEFER_PKTS
+    int "Defer Transport::jobs() above this inbound-packet burst"
+    range 0 1024
+    default 8
+    help
+        The rnsd task runs Transport::jobs() — an unyieldy sweep of the path,
+        link and receipt tables — on a ~2 s cadence. The sweep can park the
+        task past the interfaces' 100 ms itsSend timeout, dropping inbound
+        packets at RNSD_PORT_IFACE (visible as "ITS send dropped" warnings).
+
+        When the number of packets received since the last sweep is at least
+        this value, rnsd treats the task as busy (e.g. servicing a resource
+        transfer) and defers the sweep to a later tick — up to
+        SPANGAP_RNSD_JOBS_DEFER_MAX consecutive times. During such a burst the
+        sweep has little essential work, so deferring it keeps the inbox
+        draining and cuts the drops.
+
+        Set to 0 to defer whenever any inbound traffic arrived since the last
+        sweep. Raise it to make deferral kick in only under heavier load.
+
+config SPANGAP_RNSD_JOBS_DEFER_MAX
+    int "Max consecutive Transport::jobs() deferrals"
+    range 0 32
+    default 3
+    help
+        Upper bound on how many sweep-ticks in a row the jobs() sweep may be
+        deferred under sustained load. Once this many deferrals accumulate the
+        sweep runs regardless of load, so link keepalives, path-request
+        retries and resource timeouts still fire within roughly
+        (this + 1) x 2 s. Set to 0 to disable deferral entirely (always sweep).
+
+endmenu

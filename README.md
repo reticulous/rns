@@ -87,6 +87,25 @@ optionally IFAC credentials for an access-coded network. After that the handle
 that interface, every `itsRecv` is one inbound packet arriving. Disconnecting
 deregisters the interface.
 
+Each `RNSD_PORT_IFACE` connection is a bounded ITS packet link: an interface's
+`itsSend` into rnsd (and rnsd's back out) blocks only up to 100 ms, then drops
+the packet and logs `ITS send dropped`. Two things cause the inbox to back up
+past that window under load, and each has a knob:
+
+- **The rnsd task is single-threaded** and runs `Transport::jobs()` — an
+  unyieldy sweep whose cost grows with the path table — on a ~2 s cadence.
+  While it sweeps, nothing drains the inbox, so a burst of inbound packets
+  (e.g. a resource transfer) overflows the window. rnsd load-sheds this: when
+  at least `CONFIG_SPANGAP_RNSD_JOBS_DEFER_PKTS` packets (default 8) arrived
+  since the last sweep, it defers the sweep for up to
+  `CONFIG_SPANGAP_RNSD_JOBS_DEFER_MAX` consecutive sweep-ticks (default 3) so
+  the inbox keeps draining; the cap keeps keepalives/retries/timeouts firing
+  within a few seconds. Set `_MAX` to 0 to always sweep.
+- **The far interface is slower than rnsd produces** — LoRa airtime in
+  particular. That backpressure is physical; the deferral above does not help
+  it. Raise the `RNSD_PORT_IFACE` `fromCap`/`toCap` to absorb larger bursts,
+  or rate-limit the source.
+
 ### How lxmf and nomad talk to it
 
 Consumers never construct destinations or links; they call the wrappers in
