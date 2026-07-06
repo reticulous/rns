@@ -536,3 +536,60 @@ fixint / fixstr+str8/16/32 / fixarray+array16/32 / fixmap+map16/32 / nil). It is
 **diagnostic only** — purely for legible logs; nothing parses announce semantics
 from it (LXMF's own `parseLxmfAnnounce` does the real decoding). This is the only
 written record of the app_data dialects, hence its place here.
+
+## 12. Testing
+
+Because µR's wire is kept byte-identical to upstream RNS, the fastest way to
+exercise Links, Channels, and rnsh end-to-end is against a **host-side reference
+node running stock `rns` from PyPI** — no second device required.
+
+**In-tree peer scripts.** `hw-tdeck/tests/peers/echo_peer.py` (+
+`peer-config.template`) is the canonical peer shape: bring up `RNS.Reticulum`,
+host a `Destination(identity, IN, SINGLE, app_name, *aspects)`, call
+`set_proof_strategy(PROVE_ALL)` and `set_link_established_callback(...)`, then
+announce on a tight cadence at startup (every 1 s for a ~10 s warm-up, backing
+off to 30 s) so a freshly attached client sees an announce within ~1 s. It also
+prints a `READY <dest_hash_hex>` sentinel on stdout so a fixture can synchronise
+instead of racing on a sleep. That variant listens on a `TCPServerInterface` for
+the LAN/loopback pytest path; `nomad_peer.py` is a NomadNet-node counterpart.
+
+**Testnet rendezvous (no second device).** The T-Deck joins the *public*
+Reticulum testnet — `show s.tcp.peers` lists outbound `TCPClientInterface` dials
+to `rns.radical.computer:4242`, `rns.birdsnet.com.br:4242`,
+`193.26.158.230:4965`, etc. The container has internet, so a host RNS node that
+dials the **same** testnet TCP node shares the mesh with the device; both end up
+≤ 2 hops apart and that node's cache already holds the device's announce, so
+path requests resolve fast. `hw-tdeck/scripts/lxmf-stamp-test` is the worked
+example (an LXMF node dialing the testnet directly to interop against a device
+already on it — no bridge). Recipe for a bare RNS node:
+
+- `python3 -m venv <dir> && <dir>/bin/pip install rns` (RNS 1.3.5; PyPI is
+  reachable from the container).
+- Write a config whose `[interfaces]` has a `TCPClientInterface` with
+  `target_host = rns.radical.computer` / `target_port = 4242` — the same node
+  the device dials.
+- Drive it with the `echo_peer.py` pattern above (host the destination, prove
+  all, announce, set the link-established callback).
+
+**Channel interop.** To speak the device's Channel wire from stock RNS, register
+a `MessageBase` subclass with `MSGTYPE = 0x0100` and raw `pack`/`unpack` — µR's
+`Channel::MSGTYPE_RAW` (§5.6) is byte-identical to upstream, one 6-byte
+`>HHH` (msgtype, sequence, length) envelope per message.
+
+**Gotchas.**
+
+- **Direct device ↔ container TCP does NOT work.** The container is on the
+  docker bridge (172.17.0.2) and the device is on WiFi; there is no route
+  between them. You *must* rendezvous through a shared public testnet node — the
+  device's own outbound dials give you a common relay for free.
+- **`recall()` succeeding ≠ `has_path()` true.** On the busy testnet the bounded
+  100-entry path table (§8) churns, so a cached identity can outlive its path
+  entry. Gate any outbound link/channel establishment on `has_path() && recall()`
+  and re-`request_path()` while waiting — otherwise the link request has no next
+  hop and is silently dropped, surfacing only as an `establish_timeout`. This is
+  exactly why the device side gates §5.6 the same way.
+- **`spangap cli "<cmd>"` is transient-flaky.** Occasional SSH banner timeout /
+  "closed by remote host"; retry 2–3×. It also forwards piped stdin into a nested
+  interactive command as long as stdin stays open, which is a feature — e.g.
+  `( sleep 9; printf 'x\r'; sleep 10 ) | spangap cli "rnsh <dest>"` drives an
+  interactive `rnsh` session over the loopback CLI.
