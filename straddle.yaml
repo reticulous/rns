@@ -37,14 +37,14 @@ kconfig:
   # mbedTLS HKDF — used by µR's Cryptography/HKDF.cpp (key derivation for
   # Fernet, IFAC, Identity prove/verify). Off by default in IDF.
   - CONFIG_MBEDTLS_HKDF_C=y
-# Auto-init: folded into the generated spangapInitStraddles() dispatcher. Runs
-# in the straddle band, after the platform band (so storage/LCD are up). The
-# interface straddles (rns_tcp/rns_auto/rns_lora/rns_espnow, dirs iface-*) all
+# Boot-registered Service: RnsdService::onInit() runs in the straddle band,
+# after the platform band (so storage/LCD are up). The interface straddles
+# (rns_tcp/rns_auto/rns_lora/rns_espnow, dirs iface-*) all
 # `requires: reticulous/rns`, so the dependency-topo order brings rnsd up — and
 # its ITS port surface with it — before they self-register their interfaces. No
 # explicit ordering needed.
-init:
-  - call: rnsdInit
+services:
+  - { class: RnsdService, header: rnsd.h }
 
 # Browser-side UI registration (parallel to init: above) — auto-wired into
 # the buildable SPA via straddles.gen.ts; no web-interface edit needed.

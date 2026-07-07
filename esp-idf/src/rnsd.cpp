@@ -5585,7 +5585,7 @@ static void rnsdTaskMain(void*)
     }
 }
 
-void rnsdInit(void)
+void RnsdService::onInit()
 {
     /* The iface / packet-connection tables are allocated in rnsdTaskMain (task
      * context) so heap tracking attributes them to rnsd, not the main task. */

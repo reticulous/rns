@@ -25,6 +25,8 @@
  */
 #pragma once
 
+#include "service.h"
+
 #include <cstdint>
 #include <cstddef>
 
@@ -41,7 +43,10 @@ constexpr size_t RNSD_HASH_LEN       = 32;   /* SHA-256 */
 
 /** Bring up the rnsd task. Called from app_main between spangapInit()
  *  and spangapPostAppInit(). */
-void rnsdInit(void);
+class RnsdService : public Service {
+public:
+    void onInit() override;
+};
 
 /* ──────────────── pure crypto (caller-task safe) ──────────────── */
 
