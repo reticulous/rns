@@ -80,6 +80,7 @@ context) describing the local change. Summary:
 | `src/Utilities/OS.h` | File-I/O methods no-op'd per Reticulous component plan §10.5 (`read_file`/`write_file`/`open_file`/etc. return empty / `false` / `0`). `register_filesystem()` left functional in case anything wants to attach a real backing store later. |
 | `src/Utilities/Persistence.{h,cpp}` | ArduinoJson dependency removed entirely. Upstream's globals (`JsonDocument _document`, `Bytes _buffer`) gone. `.cpp` retained as compilation placeholder pending the cJSON-based rewrite. |
 | `src/Persistence/DestinationEntry.cpp` | `WARNINGF` log demoted on the path-table hot path (`decode()` runs on every `_new_path_table.get(...)` — hundreds of times per second when Transport iterates paths during Link maintenance). |
+| `src/Resource.{h,cpp}`, `src/ResourceData.h` | Resource transfer engine implemented; the algorithm ancestry is `ratspeak/microReticulum` (© ratspeak, Apache-2.0), adapted to this fork's APIs and corrected to upstream Reticulum's proof/hash wire format where the two diverge. Upstream's attermann-shaped `Resource`/`ResourceData`/`ResourceAdvertisement` API surface is preserved. In-file attribution carried in `Resource.h`. |
 
 ---
 

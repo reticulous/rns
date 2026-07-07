@@ -30,13 +30,26 @@ Our deltas, by category:
   *inside* a `Link` (§5.6). `Link::get_channel()` is live and `Link::receive`
   routes `CONTEXT.CHANNEL` (0x0E) packets into it (`prove → decrypt →
   _receive`). This is what the [rnsh](../rnsh) shell rides on.
+- **IFAC enforcement in `Transport.cpp`.** The fork had no Interface Access
+  Code support; `ifac_salt`/`derive_ifac` (HKDF from netname+netkey, size
+  clamped 1–64), outbound masking/signing, and inbound verify-by-recompute
+  (unmask, recompute the signature over the reconstructed raw packet, drop on
+  mismatch — an open interface likewise drops any packet with the IFAC flag
+  set) are ours, byte-compatible with upstream Reticulum. **Pitfall:** the
+  verify-by-recompute scheme depends on Ed25519 signing being deterministic
+  (RFC 8032). Substituting a randomized signer silently drops 100% of inbound
+  IFAC traffic.
 
 **Dependency / platform swaps**
 
 - **Crypto rewritten** against mbedTLS plus foreign primitives vendored under
   `src/donna/`: ed25519-donna (sign/verify/key-derivation, with SHA-512 via
   mbedTLS and RNG via `esp_fill_random`) and x25519 (ECDH, the same MIT
-  implementation [wg](../wg) uses). `Hashes`, `HKDF`, `Fernet`, `Token`,
+  implementation [wg](../wg) uses). The donna route is a performance
+  requirement, not a convenience: mbedTLS's Curve25519 scalar multiplication
+  takes ~100 ms on the ESP32-S3, versus under 10 ms for the software donna
+  implementation — and X25519 ECDH runs per opportunistic packet outside an
+  established Link. `Hashes`, `HKDF`, `Fernet`, `Token`,
   `X25519`, `Ed25519` are rewritten; `AES`/`HMAC`/`Random`/`PKCS7` are
   header-only; `CBC` was dropped.
 - **MsgPack shim** — `src/MsgPack.h` is a hand-rolled msgpack encoder/decoder
@@ -515,6 +528,19 @@ The consuming buildable straddle picks these up via the
 `staging/components/*/components/` glob in its top-level `CMakeLists.txt`.
 `CMakeLists.txt` in the microreticulum component is the source of truth for which
 µR files are in the build.
+
+### 10.1 Ecosystem licensing constraints
+
+Not everything in the Reticulum ecosystem is portable here:
+
+- **LXST** (the Reticulum voice/telephony stack) is CC BY-NC-ND 4.0 —
+  non-commercial *and* no derivatives, a hard blocker for porting any of it.
+- **leviculum** (Rust port) is AGPL-3.0-or-later; a C++ transcription of it
+  would still be a derivative work carrying the same obligations.
+- **ratdeck** (T-Deck firmware on the same µR fork) is AGPL-3.0 — read it for
+  ideas, never copy code. Its sibling `ratspeak/microReticulum` library is
+  Apache-2.0 and is fine as an algorithm reference (see the component's
+  NOTICE.md).
 
 ## 11. Announce app_data formatting (diagnostics)
 
