@@ -3968,6 +3968,10 @@ static bool linkKickoff(link_conn_t& c)
             estab_src = "supplied";
         } else {
             int hops = (int)RNS::Transport::hops_to(c.dest_hash);
+            /* Defensive: kickoff is gated on has_path(), so hops is < PATHFINDER_M
+             * here — but never let the "no path" hop sentinel (128) inflate the
+             * budget to ~13 min if this is reached another way. */
+            if (hops >= (int)RNS::Type::Transport::PATHFINDER_M) hops = 1;
             estab = c.link.establishment_timeout()
                   + (double)RNS::Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP
                     * (double)std::max(1, hops);
@@ -4084,7 +4088,7 @@ static void linkTick(void)
 
         switch (c.state) {
         case LST_AWAITING_PATH:
-            if (RNS::Identity::recall(c.dest_hash)) {
+            if (RNS::Transport::has_path(c.dest_hash) && RNS::Identity::recall(c.dest_hash)) {
                 RNS::Interface oif = RNS::Transport::next_hop_interface(c.dest_hash);
                 info("link[%s]: path found for %s via %s (hops=%u)",
                      c.tag, c.dest_hash.toHex().c_str(),
@@ -4201,14 +4205,22 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     linkSetInt(*c, "opened_s", (int)c->opened_at);
     linkSetStr(*c, "last_error", "");
 
-    if (RNS::Identity::recall(c->dest_hash)) {
+    /* Require BOTH a path and a recallable identity before establishing (mirrors
+     * chanConnect): a cached identity alone (recall() true) does not mean the
+     * path table still has a route — an announced-but-now-unreachable node still
+     * recalls an identity but has no next hop, so the link request is silently
+     * dropped and the establish just retransmits into the void for the whole
+     * estab_timeout (base + 6 s × hops, ~774 s at the no-path hop sentinel 128).
+     * That 13-minute flood is what wedged the device. Otherwise wait for the
+     * path; if none lands by path_deadline the tick fails it fast with "no_path". */
+    if (RNS::Transport::has_path(c->dest_hash) && RNS::Identity::recall(c->dest_hash)) {
         c->state = LST_ESTABLISHING;
         linkPublishState(*c);
         linkKickoff(*c);
     } else {
         c->state = LST_AWAITING_PATH;
         linkPublishState(*c);
-        info("link[%s]: no identity for %s, requesting path",
+        info("link[%s]: no path for %s, requesting path",
              c->tag, c->dest_hash.toHex().c_str());
         try { RNS::Transport::request_path(c->dest_hash); }
         catch (const std::exception& e) {
@@ -4677,6 +4689,10 @@ static bool chanKickoff(chan_conn_t& c) {
             estab = (double)c.link_timeout_ms / 1000.0;
         } else {
             int hops = (int)RNS::Transport::hops_to(c.dest_hash);
+            /* Defensive: kickoff is gated on has_path(), so hops is < PATHFINDER_M
+             * here — but never let the "no path" hop sentinel (128) inflate the
+             * budget to ~13 min if this is reached another way (mirrors linkKickoff). */
+            if (hops >= (int)RNS::Type::Transport::PATHFINDER_M) hops = 1;
             estab = c.link.establishment_timeout()
                   + (double)RNS::Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP * (double)std::max(1, hops);
         }
