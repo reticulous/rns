@@ -390,10 +390,38 @@ DestinationEntry empty_destination_entry;
 
 						_pending_links.erase(link);
 					}
+					/* Spangap: same establishment-timeout reaping for outbound (initiator)
+					 * Links that were never proved — without the watchdog they never reach
+					 * CLOSED, so the loop above never cleans them up. */
+					else if ((link.status() == Type::Link::PENDING || link.status() == Type::Link::HANDSHAKE) &&
+					         link.establishment_timeout() > 0 &&
+					         OS::time() >= link.request_time() + link.establishment_timeout()) {
+						WARNINGF("Reaping half-open outbound link %s (status=%d): establishment timed out after %.1fs",
+							link.link_id().toHex().c_str(), (int)link.status(), link.establishment_timeout());
+						const_cast<Link&>(link).teardown();
+						_pending_links.erase(link);
+					}
 				}
 				std::set<Link> active_links(_active_links);
 				for (auto& link : active_links) {
 					if (link.status() == Type::Link::CLOSED) {
+						_active_links.erase(link);
+					}
+					/* Spangap: reap a half-open link. Recipient Links enter _active_links
+					 * at HANDSHAKE (register_link) and only reach ACTIVE when the
+					 * initiator's RTT packet arrives and fires the establishment callback
+					 * that wires the packet callback. With the per-link watchdog disabled,
+					 * such a Link would otherwise live here forever and Link::receive would
+					 * keep decrypting-and-dropping (now un-proved) its data. Enforce the
+					 * establishment timeout the watchdog used to: teardown() sends a
+					 * LINKCLOSE for a HANDSHAKE link so the initiator drops its side and the
+					 * next send re-establishes cleanly. */
+					else if ((link.status() == Type::Link::PENDING || link.status() == Type::Link::HANDSHAKE) &&
+					         link.establishment_timeout() > 0 &&
+					         OS::time() >= link.request_time() + link.establishment_timeout()) {
+						WARNINGF("Reaping half-open link %s (status=%d): establishment timed out after %.1fs",
+							link.link_id().toHex().c_str(), (int)link.status(), link.establishment_timeout());
+						const_cast<Link&>(link).teardown();
 						_active_links.erase(link);
 					}
 				}

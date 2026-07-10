@@ -269,6 +269,17 @@ struct our_dest_t {
 
 static our_dest_t* s_our_dests = nullptr;
 
+/* Delivery-proof dial (s.rnsd.prove_incoming), cached from the live-mirror in
+ * rnsdTaskMain. Consumer destinations are PROVE_NONE at the RNS layer; the
+ * delivery proof is emitted on successful hand-off to the consumer task
+ * (onOurDestInbound / onLinkPacketCb), mirroring upstream LXMF which calls
+ * packet.prove() inside its delivery callback rather than auto-proving on
+ * receipt. This couples "delivered" to "actually handed to the app", so a
+ * black-holed message (unwired link callback, dropped ITS send) is NEVER
+ * acked — the sender retries instead of seeing a phantom checkmark. This flag
+ * gates whether that hand-off prove happens at all. */
+static bool s_prove_incoming = true;
+
 /* Path-request retry cadence: exponential backoff, not a fixed interval.
  * A parked send fires its first request immediately; ourDestRetryDelay()
  * gives the gap before each *subsequent* request, indexed by how many
@@ -953,8 +964,17 @@ static void onOurDestInbound(const RNS::Bytes& plaintext, const RNS::Packet& pac
     f[0] = RNSD_DEST_IN_PACKET;
     memcpy(f + 1,      packet.destination().hash().data(), 16);
     memcpy(f + 1 + 16, plaintext.data(), plaintext.size());
-    if (itsSend(c->handle, f, 1 + 16 + plaintext.size(), pdMS_TO_TICKS(100)) == 0)
-        warn("our-dest inbound: ITS send dropped (%zu B)", plaintext.size());
+    if (itsSend(c->handle, f, 1 + 16 + plaintext.size(), pdMS_TO_TICKS(100)) == 0) {
+        /* Hand-off failed: do NOT prove. The sender keeps its receipt and
+         * retries rather than settling DELIVERED on a message we dropped. */
+        warn("our-dest inbound: ITS send dropped (%zu B) — NOT proved, sender will retry",
+             plaintext.size());
+    }
+    else if (s_prove_incoming) {
+        /* Delivered to the consumer task → emit the delivery proof now,
+         * exactly where upstream LXMF proves (inside delivery_packet). */
+        const_cast<RNS::Packet&>(packet).prove();
+    }
 }
 
 static int onOurDestConnect(int handle, const void* data, size_t len)
@@ -1021,18 +1041,19 @@ static int onOurDestConnect(int handle, const void* data, size_t len)
          * attached. */
         d.accepts_links(false);
         d.set_packet_callback(onOurDestInbound);
-        /* Delivery proofs are an operator dial: s.rnsd.prove_incoming
-         * (default ON, like upstream LXMF's delivery destinations — senders
-         * of opportunistic / direct packets keep a PacketReceipt and settle
-         * DELIVERED on our proof; without it every peer's send to us "times
-         * out" on their side and they retry / fall back to propagation, even
-         * though we displayed the message). OFF = mR's PROVE_NONE: receive
-         * silently, at the cost of senders treating us as undeliverable.
-         * Live-mirrored onto open destinations by the NOW_AND_ON_CHANGE sub
-         * in rnsdTaskMain; per-peer granularity (PROVE_APP) is a later dial. */
-        d.set_proof_strategy(storageGetInt("s.rnsd.prove_incoming", 1)
-                                 ? RNS::Type::Destination::PROVE_ALL
-                                 : RNS::Type::Destination::PROVE_NONE);
+        /* Consumer destinations never auto-prove at the RNS layer. Upstream
+         * LXMF leaves its delivery destination at PROVE_NONE and calls
+         * packet.prove() itself, as the first line of its delivery callback —
+         * so a proof is emitted only once the packet has reached the app. We
+         * mirror that across the rnsd/consumer task split: the hand-off
+         * callbacks (onOurDestInbound for opportunistic, onLinkPacketCb for
+         * Links) prove ONLY after the ITS send to the consumer succeeds. A
+         * message that never reaches the consumer (unwired half-open link,
+         * dropped ITS send) is therefore never acked, and the sender retries
+         * instead of settling DELIVERED on a black-holed message. Whether the
+         * hand-off prove happens at all is the s.rnsd.prove_incoming dial,
+         * cached in s_prove_incoming (live-mirrored in rnsdTaskMain). */
+        d.set_proof_strategy(RNS::Type::Destination::PROVE_NONE);
         slot->listener_identity = id;
         slot->listener_dest     = d;
         slot->listener_hash     = d.hash();
@@ -3567,14 +3588,29 @@ static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packe
     link_conn_t* c = linkFindByLink(packet.link());
     if (!c) { warn("link: inbound pkt, no slot"); return; }
     linkTouch(*c);
-    if (c->handle < 0) return;   /* slot tearing down; drop in-flight packet */
+    if (c->handle < 0) {
+        /* Slot tearing down / consumer connect not yet completed: drop the
+         * in-flight packet AND do not prove it. Silence here used to phantom-
+         * ack a message the consumer never saw. */
+        warn("link[%s]: inbound pkt but consumer handle gone (%zuB) — dropped, NOT proved",
+             c->tag, plaintext.size());
+        return;
+    }
     /* Packet-mode handle: one Link plaintext = one ITS packet, no type
      * byte. Drop on back-pressure (timeout 0) rather than stall rnsd. */
     size_t w = itsSend(c->handle, plaintext.data(), plaintext.size(), 0);
     if (w == 0) {
         linkSetError(*c, "rx_overflow");
+        warn("link[%s]: inbound pkt dropped, consumer rx overflow (%zuB) — NOT proved",
+             c->tag, plaintext.size());
         return;
     }
+    /* Delivered to the consumer task → emit the delivery proof now, mirroring
+     * upstream LXMF (which proves inside its delivery callback). A failed
+     * hand-off above returns without proving, so a black-holed message is
+     * never acked and the sender retries. Gated on the operator dial. */
+    if (s_prove_incoming)
+        const_cast<RNS::Packet&>(packet).prove();
     char k[96];
     linkKey(*c, "rx_packets", k, sizeof(k));
     storageSet(k, storageGetInt(k, 0) + 1);
@@ -5394,16 +5430,13 @@ static void rnsdTaskMain(void*)
     NOW_AND_ON_CHANGE("s.rnsd.identity.cache_max", {
         RNS::Identity::known_destinations_maxsize(storageGetInt(key, 1000));
     });
-    /* Delivery-proof dial (see the our-dest-dest comment): applies to every
-     * already-open consumer destination, and ourDestOpen reads the same key
-     * for new ones. */
+    /* Delivery-proof dial (see the our-dest-dest comment). Consumer dests stay
+     * PROVE_NONE at the RNS layer; this only toggles whether the hand-off
+     * callbacks (onOurDestInbound / onLinkPacketCb) prove after delivering a
+     * packet to the consumer task. So it's a single cached flag, not a
+     * per-destination proof strategy. */
     NOW_AND_ON_CHANGE("s.rnsd.prove_incoming", {
-        auto strat = storageGetInt(key, 1) ? RNS::Type::Destination::PROVE_ALL
-                                           : RNS::Type::Destination::PROVE_NONE;
-        if (s_our_dests)
-            for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++)
-                if (s_our_dests[j].used && s_our_dests[j].listener_dest)
-                    s_our_dests[j].listener_dest.set_proof_strategy(strat);
+        s_prove_incoming = storageGetInt(key, 1) != 0;
     });
     /* Path table: engages BasicHeapStore set_max_recs (uncapped until now —
      * only the 24h TTL pruned it). */

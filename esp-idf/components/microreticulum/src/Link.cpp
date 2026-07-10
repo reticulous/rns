@@ -1093,6 +1093,19 @@ void Link::receive(const Packet& packet) {
 								ERRORF("Error while executing packet callback from %s. The contained exception was: %s", toString().c_str(), e.what());
 							}
 						}
+						else {
+							/* Spangap diagnostic: an inbound DATA packet decrypted on this
+							 * link but there is no packet callback to hand it to, so it is
+							 * silently dropped. This is the fingerprint of a half-open link
+							 * (a recipient Link that entered _active_links at HANDSHAKE but
+							 * whose establishment callback never fired to wire the callback).
+							 * With consumer dests at PROVE_NONE it is now also NOT proved, so
+							 * the sender retries instead of seeing a phantom "delivered" —
+							 * but log it loudly so the condition is never invisible again. */
+							WARNINGF("Link %s: inbound DATA (%u B) with no packet callback wired "
+							         "— dropped (status=%d). Half-open/unestablished link?",
+								toString().c_str(), (unsigned)plaintext.size(), (int)_object->_status);
+						}
 						
 						if (_object->_destination.proof_strategy() == Type::Destination::PROVE_ALL) {
 							const_cast<Packet&>(packet).prove();
