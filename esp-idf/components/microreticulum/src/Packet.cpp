@@ -492,6 +492,7 @@ PacketReceipt Packet::send() {
 
 	if (Transport::outbound(*this)) {
 		TRACE("Packet::send: successfully sent packet!!!");
+		_object->_sent = true;
 		//p return self.receipt
 		return _object->_receipt;
 	}

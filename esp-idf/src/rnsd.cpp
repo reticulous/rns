@@ -1169,11 +1169,17 @@ static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
             RNS::Bytes app_data;
             if (n > 1) app_data.assign(buf + 1, n - 1);
             try {
-                c->listener_dest.announce(app_data, /*path_response=*/false);
-                info("announced %s aspect=%s app_data %s",
-                     c->listener_hash.toHex().c_str(),
-                     c->req.aspect,
-                     formatAnnounceAppData(app_data).c_str());
+                RNS::Packet ap = c->listener_dest.announce(app_data, /*path_response=*/false);
+                if (ap && ap.sent()) {
+                    info("announced %s aspect=%s app_data %s",
+                         c->listener_hash.toHex().c_str(),
+                         c->req.aspect,
+                         formatAnnounceAppData(app_data).c_str());
+                } else {
+                    warn("announce for %s aspect=%s did NOT transmit — no ready OUT interface; nothing on air",
+                         c->listener_hash.toHex().c_str(),
+                         c->req.aspect);
+                }
             } catch (const std::exception& e) {
                 err("our-dest: announce threw: %s", e.what());
             }

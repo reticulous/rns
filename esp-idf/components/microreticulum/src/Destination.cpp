@@ -336,7 +336,12 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 		if (send) {
 			TRACE("Destination::announce: sending announce packet...");
 			announce_packet.send();
-			return {Type::NONE};
+			/* Return the sent packet (not NONE) so callers can tell whether it
+			 * actually went out: Packet::send() sets _sent only when an
+			 * interface accepted it, and clears it when none could. Without
+			 * this, an announce that reached no OUT interface is indistinguish-
+			 * able from a delivered one and gets logged as success. */
+			return announce_packet;
 		}
 		else {
 			return announce_packet;
