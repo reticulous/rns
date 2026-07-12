@@ -350,6 +350,13 @@ DestinationEntry empty_destination_entry;
 
 	std::vector<Packet> outgoing;
 	std::set<Bytes> path_requests;
+	/* Spangap: half-open links reaped below must be torn down AFTER
+	 * _jobs_running is cleared. teardown() sends a LINKCLOSE via
+	 * Transport::outbound(), which spins on `while (_jobs_running)`; calling it
+	 * inline here would self-deadlock jobs() (the spin can never observe
+	 * _jobs_running == false because jobs() is what clears it). Collect and
+	 * defer, matching the outgoing/path_requests pattern. */
+	std::vector<Link> reap_links;
 	int count;
 	_jobs_running = true;
 
@@ -398,7 +405,7 @@ DestinationEntry empty_destination_entry;
 					         OS::time() >= link.request_time() + link.establishment_timeout()) {
 						WARNINGF("Reaping half-open outbound link %s (status=%d): establishment timed out after %.1fs",
 							link.link_id().toHex().c_str(), (int)link.status(), link.establishment_timeout());
-						const_cast<Link&>(link).teardown();
+						reap_links.push_back(link);
 						_pending_links.erase(link);
 					}
 				}
@@ -421,7 +428,7 @@ DestinationEntry empty_destination_entry;
 					         OS::time() >= link.request_time() + link.establishment_timeout()) {
 						WARNINGF("Reaping half-open link %s (status=%d): establishment timed out after %.1fs",
 							link.link_id().toHex().c_str(), (int)link.status(), link.establishment_timeout());
-						const_cast<Link&>(link).teardown();
+						reap_links.push_back(link);
 						_active_links.erase(link);
 					}
 				}
@@ -813,6 +820,13 @@ DestinationEntry empty_destination_entry;
 	}
 
 	_jobs_running = false;
+
+	// Spangap: tear down reaped half-open links now that _jobs_running is
+	// cleared. teardown() -> LINKCLOSE -> Transport::outbound() spins on
+	// _jobs_running, so this MUST run after the assignment above.
+	for (auto& link : reap_links) {
+		link.teardown();
+	}
 
 	// CBA send announce retransmission packets
 	for (auto& packet : outgoing) {
