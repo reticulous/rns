@@ -543,6 +543,9 @@ void Link::update_mdu() {
 
 void Link::rtt_packet(const Packet& packet) {
 	assert(_object);
+	DEBUGF("Link %s: processing LRRTT to activate recipient link (status=%d, owner_link_established=%s)",
+		toString().c_str(), (int)_object->_status,
+		(_object->_owner.callbacks()._link_established != nullptr) ? "set" : "NULL");
 	try {
 		double measured_rtt = OS::time() - _object->_request_time;
 		const Bytes plaintext(decrypt(packet.data()));
@@ -1094,17 +1097,57 @@ void Link::receive(const Packet& packet) {
 							}
 						}
 						else {
-							/* Spangap diagnostic: an inbound DATA packet decrypted on this
-							 * link but there is no packet callback to hand it to, so it is
-							 * silently dropped. This is the fingerprint of a half-open link
-							 * (a recipient Link that entered _active_links at HANDSHAKE but
-							 * whose establishment callback never fired to wire the callback).
-							 * With consumer dests at PROVE_NONE it is now also NOT proved, so
-							 * the sender retries instead of seeing a phantom "delivered" —
-							 * but log it loudly so the condition is never invisible again. */
-							WARNINGF("Link %s: inbound DATA (%u B) with no packet callback wired "
-							         "— dropped (status=%d). Half-open/unestablished link?",
-								toString().c_str(), (unsigned)plaintext.size(), (int)_object->_status);
+							/* Spangap: an inbound DATA packet decrypted on this link but no
+							 * packet callback is wired yet. On a recipient (non-initiator) link
+							 * this is the half-open fingerprint: we validated the link request
+							 * and derived keys (HANDSHAKE) but never processed the initiator's
+							 * LRRTT, so the owner establishment callback (which wires the packet
+							 * callback) never fired. Over half-duplex LoRa the LRRTT — sent by
+							 * the initiator immediately after our LRPROOF — is easily missed
+							 * while our radio is still turning around. The initiator already
+							 * considers the link ACTIVE and is sending us application data.
+							 *
+							 * The LRRTT carries only the measured RTT (telemetry), nothing we
+							 * must receive to function, so recover by promoting the link
+							 * ourselves on this first authentic inbound packet — mirroring what
+							 * rtt_packet() would have done, with a locally-estimated RTT — then
+							 * deliver the packet instead of dropping it. That the packet
+							 * decrypted with the handshake-derived key proves it is genuinely
+							 * from our peer, so this cannot be spoofed into activating a link. */
+							if (!_object->_initiator && _object->_status != Type::Link::CLOSED
+							    && !_object->_callbacks._packet) {
+								DEBUGF("Link %s: no LRRTT seen; activating recipient link on first inbound DATA (status=%d)",
+									toString().c_str(), (int)_object->_status);
+								_object->_rtt = OS::time() - _object->_request_time;
+								_object->_status = Type::Link::ACTIVE;
+								_object->_activated_at = OS::time();
+								if (_object->_rtt > 0 && _object->_establishment_cost > 0) {
+									_object->_establishment_rate = _object->_establishment_cost / _object->_rtt;
+								}
+								try {
+									if (_object->_owner.callbacks()._link_established != nullptr) {
+										_object->_owner.callbacks()._link_established(*this);
+									}
+								}
+								catch (const std::exception& e) {
+									ERRORF("Error in link establishment callback while activating %s on inbound DATA: %s", toString().c_str(), e.what());
+								}
+							}
+							/* If establishment wired a callback (and did not tear us down),
+							 * deliver this first packet rather than losing it. */
+							if (_object->_status != Type::Link::CLOSED && _object->_callbacks._packet) {
+								try {
+									_object->_callbacks._packet(plaintext, packet);
+								}
+								catch (const std::exception& e) {
+									ERRORF("Error while executing packet callback from %s. The contained exception was: %s", toString().c_str(), e.what());
+								}
+							}
+							else {
+								WARNINGF("Link %s: inbound DATA (%u B) with no packet callback wired "
+								         "— dropped (status=%d). Half-open/unestablished link?",
+									toString().c_str(), (unsigned)plaintext.size(), (int)_object->_status);
+							}
 						}
 						
 						if (_object->_destination.proof_strategy() == Type::Destination::PROVE_ALL) {
@@ -1206,6 +1249,9 @@ void Link::receive(const Packet& packet) {
 				}
 				case Type::Packet::LRRTT:
 				{
+					DEBUGF("Link %s: LRRTT packet received (initiator=%d, status=%d) — %s",
+						toString().c_str(), (int)_object->_initiator, (int)_object->_status,
+						_object->_initiator ? "ignored (we are initiator)" : "activating recipient link");
 					if (!_object->_initiator) {
 						rtt_packet(packet);
 					}
