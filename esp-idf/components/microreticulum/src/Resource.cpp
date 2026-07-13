@@ -976,6 +976,31 @@ size_t Resource::num_parts() const {
 	return _object ? _object->_total_parts : 0;
 }
 
+// Spangap fork: RESOURCE_REQ packet-hash dedupe (backport of upstream
+// attermann/microReticulum 032c751 req_hashlist). Upstream keeps the list
+// unbounded; over half-duplex LoRa a request can be retransmitted many
+// times across a long transfer, so bound it to the most recent
+// REQ_HASHLIST_MAX hashes — a retransmit always arrives within a few RTTs
+// of the original, so an evicted-then-replayed request only costs a
+// redundant part resend (the pre-fork behaviour), never a correctness bug.
+static const size_t REQ_HASHLIST_MAX = 64;
+
+bool Resource::has_request_hash(const Bytes& packet_hash) const {
+	assert(_object);
+	for (const auto& seen : _object->_req_hashlist) {
+		if (seen == packet_hash) return true;
+	}
+	return false;
+}
+
+void Resource::note_request_hash(const Bytes& packet_hash) {
+	assert(_object);
+	if (_object->_req_hashlist.size() >= REQ_HASHLIST_MAX) {
+		_object->_req_hashlist.erase(_object->_req_hashlist.begin());
+	}
+	_object->_req_hashlist.push_back(packet_hash);
+}
+
 /*
 :returns: The current progress of the resource transfer as a *float* between 0.0 and 1.0.
 */

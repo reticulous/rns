@@ -1457,10 +1457,16 @@ void Link::receive(const Packet& packet) {
 							}
 							for (auto& resource : _object->_outgoing_resources) {
 								if (resource_hash == resource.hash()) {
-									// v1: no req_hashlist dedup / retransmit window —
-									// send every requested part once (limitation).
+									// Spangap fork: dedupe retransmitted requests
+									// by outer packet hash (backport of upstream
+									// 032c751 req_hashlist) — a repeated REQ, common
+									// over half-duplex LoRa, no longer resends the
+									// whole part window.
 									Resource r = resource;
-									r.request(plaintext);
+									if (!r.has_request_hash(packet.packet_hash())) {
+										r.note_request_hash(packet.packet_hash());
+										r.request(plaintext);
+									}
 									break;
 								}
 							}

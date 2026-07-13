@@ -99,6 +99,15 @@ namespace RNS {
 		std::vector<uint8_t> _part_sent;
 		size_t   _sent_parts = 0;
 
+		// Spangap fork: outbound RESOURCE_REQ packet-hash dedupe (backport of
+		// upstream attermann/microReticulum 032c751 `_req_hashlist`). Records
+		// the outer packet hashes of the RESOURCE_REQs we've already answered
+		// so a retransmitted request — common over half-duplex LoRa — doesn't
+		// resend the whole part window. Upstream keeps this unbounded; we cap
+		// it (Resource::note_request_hash) since only recent retransmits ever
+		// need deduping.
+		std::vector<Bytes> _req_hashlist;
+
 	friend class Resource;
 	friend class ResourceAdvertisement;
 	};

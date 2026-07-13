@@ -141,6 +141,12 @@ namespace RNS {
 		bool is_response() const;
 		size_t num_parts() const;
 
+		// Spangap fork: per-resource RESOURCE_REQ packet-hash dedupe, used by
+		// the Link dispatcher to drop retransmitted requests before they
+		// resend the part window (backport of upstream 032c751 req_hashlist).
+		bool has_request_hash(const Bytes& packet_hash) const;
+		void note_request_hash(const Bytes& packet_hash);
+
 		// Outbound: validate an inbound RESOURCE_PRF; conclude on match.
 		void validate_proof(const Bytes& proof_data);
 		void cancel();
