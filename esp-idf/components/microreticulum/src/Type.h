@@ -482,6 +482,15 @@ namespace RNS { namespace Type {
 		static const uint32_t AP_PATH_TIME      = 60*60*6;   // Path expiration of 6 hours for Access Point paths
 		static const uint32_t ROAMING_PATH_TIME = 60*60*1;    // Path expiration of 1 hour for Roaming paths
 
+		// Spangap: minimum seconds between last-used stamps on a path entry
+		// (outbound use tracking; coarse is fine — only cap-eviction ordering
+		// and TTL sliding read it, and it saves a store write per packet)
+		static const uint8_t PATH_LAST_USED_GRANULARITY = 60;
+		// Spangap: outbound use older than this counts as never used for
+		// cap-eviction ordering, so a route last talked to months ago can't
+		// outrank fresh announces
+		static const uint32_t PATH_LAST_USED_STALE = 60*60*48;
+
 		static const uint16_t LOCAL_CLIENT_CACHE_MAXSIZE = 512;
 	}
 

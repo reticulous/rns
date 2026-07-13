@@ -37,6 +37,12 @@ using namespace RNS::Persistence;
 //TRACEF("Writing %lu byte timestamp: %f", sizeof(entry._timestamp), entry._timestamp);
 	write(&entry._timestamp, sizeof(entry._timestamp));
 
+	// last_used — must stay at OFFSET_LAST_USED: Transport patches it in
+	// place on the raw record. Field added by this fork; incompatible with
+	// records persisted by earlier builds, which only matters under
+	// RNS_PERSIST_PATHS (not defined in this project — the store is RAM-only).
+	write(&entry._last_used, sizeof(entry._last_used));
+
 	// hops
 //TRACEF("Writing %lu byte hops: %u", sizeof(entry._hops), entry._hops);
 	write(&entry._hops, sizeof(entry._hops));
@@ -95,6 +101,9 @@ using namespace RNS::Persistence;
 	// timestamp
 	if(!read(&entry._timestamp, sizeof(entry._timestamp))) return false;
 //TRACEF("Read %lu byte timestamp: %f", sizeof(entry._timestamp), entry._timestamp);
+
+	// last_used
+	if(!read(&entry._last_used, sizeof(entry._last_used))) return false;
 
 	// hops
 	if(!read(&entry._hops, sizeof(entry._hops))) return false;

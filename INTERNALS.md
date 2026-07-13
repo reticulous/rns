@@ -95,6 +95,28 @@ Our deltas, by category:
   exists and verifies against the peer's link signing key, so the call is wired
   up. Without it a packet sent over a Link could never conclude its receipt
   (`DELIVERED`), which the per-link proof counters depend on.
+- `Transport.cpp`/`Persistence/DestinationEntry.{h,cpp}` — **use-aware path
+  eviction.** The path-table cap (`s.rnsd.path.max`, default 100) was enforced
+  by `BasicHeapStore`'s `max_recs`, which evicts the lexicographically
+  *smallest key* — on a busy mesh, destinations with low hashes were evicted
+  within seconds of every announce, including peers in active use, so every
+  link open re-sent a path request. `DestinationEntry` now carries a
+  `_last_used` double (stamped on outbound use in `Transport::outbound`, at
+  most once per `PATH_LAST_USED_GRANULARITY` = 60 s) and the cap is enforced
+  by a rewritten `cull_path_table()` at the announce-insert site, evicting
+  ascending by `(_last_used, _timestamp)` — never-used paths first, then
+  least-recently-used; use older than `PATH_LAST_USED_STALE` (48 h) counts as
+  never used, so a route last talked to months ago competes on announce age
+  instead of outranking fresh announces. `_timestamp` stays the announce time. The stamp is
+  patched into the encoded record at a fixed offset (`OFFSET_LAST_USED`)
+  rather than decode/re-encode, which would bump the cached announce packet's
+  hop count each round trip; the re-put also slides the store-level TTL so an
+  in-use path doesn't age out at `s.rnsd.path.ttl` while traffic flows.
+  Announce refreshes carry the previous `_last_used` over. Along the way:
+  the periodic path cull in `Transport::jobs()` was commented out (it iterated
+  the legacy `_path_table`, never populated in the microStore build — pure
+  no-op), and `expire_path()` — which zeroed a timestamp on a decoded copy,
+  another silent no-op — now removes the entry directly.
 - `Destination.cpp` — **empty aspect adds no separator.** `expand_name` appended
   `"." + aspects` unconditionally, so an app-name-only destination (e.g. rnsh's
   `"rnsh"`, passed as app_name `rnsh` + empty aspects) expanded to `"rnsh."` —

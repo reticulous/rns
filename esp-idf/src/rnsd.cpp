@@ -5444,8 +5444,10 @@ static void rnsdTaskMain(void*)
     NOW_AND_ON_CHANGE("s.rnsd.prove_incoming", {
         s_prove_incoming = storageGetInt(key, 1) != 0;
     });
-    /* Path table: engages BasicHeapStore set_max_recs (uncapped until now —
-     * only the 24h TTL pruned it). */
+    /* Path table cap. Enforced by Transport::cull_path_table() at the
+     * announce-insert site, evicting never-used-outbound paths first (oldest
+     * announce first), then least-recently-used — NOT by the store's own
+     * set_max_recs, whose eviction is by key order and use-blind. */
     NOW_AND_ON_CHANGE("s.rnsd.path.max", {
         RNS::Transport::path_table_maxsize(storageGetInt(key, 100));
     });

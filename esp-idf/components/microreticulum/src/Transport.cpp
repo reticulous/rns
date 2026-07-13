@@ -27,6 +27,8 @@
 #include "Utilities/Persistence.h"
 
 #include <algorithm>
+#include <tuple>
+#include <cstring>
 #include <unistd.h>
 #include <time.h>
 
@@ -686,8 +688,17 @@ DestinationEntry empty_destination_entry;
 					ERRORF("jobs: failed to cull link table: %s", e.what());
 				}
 
-				// CBA TODO perform path expiry in microStore!!!
-				// Cull the path table
+				/* Spangap: periodic path-table cull removed — it iterated the
+				 * legacy in-memory _path_table, which is never populated in
+				 * the microStore build (the announce handler puts straight
+				 * into _new_path_table), so it was a no-op. Age expiry lives
+				 * in the store itself (per-record TTL, checked on get() and
+				 * swept on put()); cap eviction is cull_path_table(), called
+				 * use-aware from the announce-insert site. The old
+				 * vanished-interface check is covered at decode time: a stale
+				 * interface hash yields a null receiving_interface, which
+				 * call sites handle.
+				 *
 				if (_demote_dbg) VERBOSE("Culling path table..."); else DEBUG("Culling path table...");
 				try {
 					std::vector<Bytes> stale_paths;
@@ -722,6 +733,7 @@ DestinationEntry empty_destination_entry;
 				catch (const std::exception& e) {
 					ERRORF("jobs: failed to cull path table: %s", e.what());
 				}
+				*/
 
 				// Cull the pending discovery path requests table
 				try {
@@ -994,7 +1006,10 @@ static const Bytes& ifac_salt() {
 				new_raw << packet.raw().mid(2);
 				transmit(outbound_interface, new_raw);
 				//_path_table[packet.destination_hash][0] = time.time()
-				destination_entry._timestamp = OS::time();
+				/* Upstream refreshes the path timestamp here; destination_entry
+				 * is a decoded copy so that write never stuck. We keep
+				 * _timestamp as the announce time and stamp _last_used on the
+				 * stored record below instead. */
 				sent = true;
 			}
 		}
@@ -1026,7 +1041,8 @@ static const Bytes& ifac_salt() {
 				new_raw << packet.raw().mid(2);
 				transmit(outbound_interface, new_raw);
 				//Transport.destination_table[packet.destination_hash][0] = time.time()
-				destination_entry._timestamp = OS::time();
+				/* See the transport case above: _last_used is stamped on the
+				 * stored record below instead. */
 				sent = true;
 			}
 		}
@@ -1038,6 +1054,33 @@ static const Bytes& ifac_salt() {
 			TRACE("Transport::outbound: Sending packet over directly connected interface...");
 			transmit(outbound_interface, packet.raw());
 			sent = true;
+		}
+
+		/* Spangap: record outbound use on the stored path entry so
+		 * cull_path_table() evicts announce-only paths before ones we
+		 * actively send to. Patched at its fixed offset in the raw record: a
+		 * decode/re-encode round trip is heavier and would bump the cached
+		 * announce packet's hop count each time (decode() increments hops to
+		 * mirror receiving it again). The re-put also refreshes the store
+		 * timestamp, so the TTL window slides while a path is in use;
+		 * _timestamp inside the record stays the announce time. */
+		if (sent && (outbound_time - destination_entry._last_used) >= Type::Transport::PATH_LAST_USED_GRANULARITY) {
+			uint32_t ttl;
+			if (outbound_interface && outbound_interface.mode() == Type::Interface::MODE_ACCESS_POINT) {
+				ttl = _ap_path_time;
+			}
+			else if (outbound_interface && outbound_interface.mode() == Type::Interface::MODE_ROAMING) {
+				ttl = _roaming_path_time;
+			}
+			else {
+				ttl = _destination_timeout;
+			}
+			std::vector<uint8_t> raw_entry;
+			if (_path_store.get(packet.destination_hash().collection(), raw_entry)
+			    && raw_entry.size() >= DestinationEntry::OFFSET_LAST_USED + sizeof(double)) {
+				memcpy(&raw_entry[DestinationEntry::OFFSET_LAST_USED], &outbound_time, sizeof(double));
+				_path_store.put(packet.destination_hash().collection(), raw_entry, ttl);
+			}
 		}
 	}
 	// If we don't have a known path for the destination, we'll
@@ -2423,9 +2466,23 @@ static const Bytes& ifac_salt() {
 							else {
 								ttl = _destination_timeout;
 							}
+							/* Spangap: carry outbound-use recency across announce
+							 * refreshes — the fresh entry defaults _last_used to
+							 * 0, which would turn an in-use path back into
+							 * eviction bait for cull_path_table(). */
+							{
+								std::vector<uint8_t> prev_raw;
+								if (_path_store.get(packet.destination_hash().collection(), prev_raw)
+								    && prev_raw.size() >= DestinationEntry::OFFSET_LAST_USED + sizeof(double)) {
+									memcpy(&destination_table_entry._last_used, &prev_raw[DestinationEntry::OFFSET_LAST_USED], sizeof(double));
+								}
+							}
 							if (_new_path_table.put(packet.destination_hash().collection(), destination_table_entry, ttl)) {
 								TRACEF("Added destination %s to path table!", packet.destination_hash().toHex().c_str());
 								++_destinations_added;
+								/* Spangap: cap enforcement lives here (use-aware),
+								 * not in the store's set_max_recs eviction. */
+								cull_path_table();
 							}
 							else {
 								ERRORF("Failed to add destination %s to path table!", packet.destination_hash().toHex().c_str());
@@ -3278,18 +3335,15 @@ Deregisters an announce handler.
 }
 
 /*static*/ bool Transport::expire_path(const Bytes& destination_hash) {
-	// CBA microStore
-	//auto& destination_entry = get_path(destination_hash);
-	DestinationEntry destination_entry;
-	_new_path_table.get(destination_hash, destination_entry);
-	if (destination_entry) {
-		destination_entry._timestamp = 0;
-		_tables_last_culled = 0;
-		return true;
-	}
-	else {
+	/* Spangap: upstream zeroes the entry timestamp and lets the next jobs()
+	 * cull sweep it. Here get() returns a decoded copy, so the zeroed
+	 * timestamp was never written back and this was a no-op (the jobs() path
+	 * cull it relied on iterated the never-populated legacy table anyway,
+	 * and is now commented out). Drop the entry directly instead. */
+	if (!_new_path_table.exists(destination_hash)) {
 		return false;
 	}
+	return remove_path(destination_hash);
 }
 
 /*p
@@ -4391,61 +4445,57 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 	return {Type::NONE};
 }
 
+/* Spangap: rewritten against the live microStore-backed table (_path_store /
+ * _new_path_table); the legacy in-memory _path_table this used to iterate is
+ * never populated in the microStore build. Eviction ordering is use-aware:
+ * sorted ascending by (_last_used, _timestamp), so paths never used for
+ * outbound go first (oldest announce first), then least-recently-used. Both
+ * doubles are peeked at their fixed offsets in the raw record — a full decode
+ * per entry would unpack the cached announce packet each time.
+ * Note for persist-enabled builds (RNS_USE_FS + RNS_PERSIST_PATHS, not defined
+ * in this project): the old code also unlinked the cached announce packet file
+ * of each evicted entry; that cleanup would need to be reinstated here. */
 /*static*/ void Transport::cull_path_table() {
 	TRACE("Transport::cull_path_table()");
-	if (_path_table.size() > _path_table_maxsize) {
+	if (_new_path_table.size() > _path_table_maxsize) {
 		try {
-			// Build lightweight (timestamp, key) index to avoid copying full DestinationEntry
-			// objects (which contain nested std::set<Bytes>) — prevents OOM on heap-constrained
-			// devices when the table hits max capacity.
-			std::vector<std::pair<double, Bytes>> sorted_keys;
-			sorted_keys.reserve(_path_table.size());
-			for (const auto& [key, entry] : _path_table) {
-				sorted_keys.emplace_back(entry._timestamp, key);
+			std::vector<std::tuple<double, double, std::vector<uint8_t>>> sorted_keys;
+			sorted_keys.reserve(_new_path_table.size());
+			double stale_before = OS::time() - Type::Transport::PATH_LAST_USED_STALE;
+			for (auto iter = _path_store.begin(); iter != _path_store.end(); ++iter) {
+				const auto& record = *iter;
+				double last_used = 0.0;
+				double timestamp = 0.0;
+				if (record.value.size() >= DestinationEntry::OFFSET_LAST_USED + sizeof(double)) {
+					memcpy(&timestamp, &record.value[DestinationEntry::OFFSET_TIMESTAMP], sizeof(double));
+					memcpy(&last_used, &record.value[DestinationEntry::OFFSET_LAST_USED], sizeof(double));
+				}
+				// Outbound use older than PATH_LAST_USED_STALE counts as never
+				// used, so it competes on announce age with the round-1 pool
+				// instead of outranking fresh announce-only paths.
+				if (last_used < stale_before) {
+					last_used = 0.0;
+				}
+				sorted_keys.emplace_back(last_used, timestamp, record.key);
 			}
-			// Sort ascending by timestamp so oldest entries are removed first
 			std::sort(sorted_keys.begin(), sorted_keys.end());
 
 			uint16_t count = 0;
-			for (const auto& [timestamp, destination_hash] : sorted_keys) {
-				TRACEF("Transport::cull_path_table: Removing destination %s from path table", destination_hash.toHex().c_str());
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-				// CBA microStore
-				//auto& destination_entry = get_path(destination_hash);
-				DestinationEntry destination_entry;
-				_new_path_table.get(destination_hash, destination_entry);
-				if (destination_entry) {
-					// Remove cached packet file associated with this destination
-					char packet_cache_path[Type::Reticulum::FILEPATH_MAXSIZE];
-					snprintf(packet_cache_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/%s", Reticulum::_cachepath, destination_entry.announce_packet_hash().toHex().c_str());
-					if (OS::file_exists(packet_cache_path)) {
-						OS::remove_file(packet_cache_path);
-					}
-				}
-#endif
-				if (_path_table.erase(destination_hash) < 1) {
-					WARNINGF("Failed to remove destination %s from path table", destination_hash.toHex().c_str());
-				}
-				++count;
-				if (_path_table.size() <= _path_table_maxsize) {
+			for (const auto& [last_used, timestamp, destination_hash] : sorted_keys) {
+				if (_new_path_table.size() <= _path_table_maxsize) {
 					break;
 				}
+				TRACEF("Transport::cull_path_table: Removing destination %s from path table", Bytes(destination_hash.data(), destination_hash.size()).toHex().c_str());
+				_path_store.remove(destination_hash);
+				++count;
 			}
 			DBGF_DEMOTE("Removed %d path(s) from path table", count);
 		}
-		catch (const std::bad_alloc& e) {
-			ERROR("cull_path_table: bad_alloc - out of memory building sort index, falling back to single erase");
-			// Fallback: std::min_element does no heap allocation — erase one oldest entry
-			auto oldest = std::min_element(
-				_path_table.begin(), _path_table.end(),
-				[](const std::pair<const Bytes, DestinationEntry>& a,
-			   const std::pair<const Bytes, DestinationEntry>& b) {
-				return a.second._timestamp < b.second._timestamp;
-			}
-			);
-			if (oldest != _path_table.end()) {
-				_path_table.erase(oldest);
-			}
+		catch (const std::bad_alloc&) {
+			/* Building the sort index copies each record's value; under OOM
+			 * we just leave the table over cap until memory recovers — the
+			 * next announce insert retries. */
+			ERROR("cull_path_table: bad_alloc - out of memory building sort index, leaving table over cap");
 		}
 		catch (const std::exception& e) {
 			ERRORF("cull_path_table: exception: %s", e.what());

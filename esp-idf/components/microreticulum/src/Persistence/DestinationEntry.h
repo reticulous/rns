@@ -59,7 +59,19 @@ public:
 	inline RNS::Bytes receiving_interface_hash() const { if (_receiving_interface) return _receiving_interface.get_hash(); return {RNS::Type::NONE}; }
 	inline RNS::Bytes announce_packet_hash() const { if (_announce_packet) return _announce_packet.get_hash(); return {RNS::Type::NONE}; }
 public:
+	// Fixed offsets into the Codec<DestinationEntry> encoding. Transport peeks
+	// (cull_path_table eviction ordering) and patches (outbound last-used
+	// stamping) these two doubles on the raw record, avoiding a full
+	// decode/re-encode round trip — which would also bump the cached announce
+	// packet's hop count, since decode() increments hops to mirror receiving
+	// the packet again.
+	static constexpr size_t OFFSET_TIMESTAMP = 0;
+	static constexpr size_t OFFSET_LAST_USED = sizeof(double);
+public:
 	double _timestamp = 0;
+	// Last outbound use of this path via Transport; 0 = never used. Kept
+	// separate from _timestamp, which stays the announce time.
+	double _last_used = 0;
 	RNS::Bytes _received_from;
 	uint8_t _hops = 0;
 	double _expires = 0;
