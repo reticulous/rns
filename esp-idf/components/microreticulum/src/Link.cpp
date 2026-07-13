@@ -68,6 +68,15 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 		_object->_initiator = true;
 		_object->_expected_hops = Transport::hops_to(_object->_destination.hash());
 		_object->_establishment_timeout = Reticulum::get_instance().get_first_hop_timeout(destination.hash());
+		/* Spangap fork: per-hop establishment-timeout grace on the initiator
+		 * side (backport of upstream attermann/microReticulum 032c751,
+		 * commit 35bb40e by @ronandi). Without it a multi-hop link can time
+		 * out mid-establishment: get_first_hop_timeout() budgets only the
+		 * first hop. The recipient side already applied this grace (below,
+		 * using packet.hops()); reuse _expected_hops rather than a second
+		 * hops_to() call. */
+		_object->_establishment_timeout += Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP
+			* std::max((uint8_t)1, _object->_expected_hops);
 		_object->_prv     = Cryptography::X25519PrivateKey::generate();
 		_object->_sig_prv = Cryptography::Ed25519PrivateKey::generate();
 	}
