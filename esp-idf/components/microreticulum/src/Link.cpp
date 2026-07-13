@@ -756,11 +756,22 @@ void Link::teardown_packet(const Packet& packet) {
 
 void Link::link_closed() {
 	assert(_object);
-	for (auto& resource : _object->_incoming_resources) {
-		const_cast<Resource&>(resource).cancel();
+	// Spangap fork: snapshot the resource sets before cancelling (backport of
+	// upstream attermann/microReticulum 032c751). Resource::cancel() fires the
+	// _concluded callback, which may erase from _incoming_resources /
+	// _outgoing_resources (directly, or now that cancel() on an outbound
+	// resource also sends RESOURCE_ICL and concludes) — mutating the set we
+	// are iterating would dangle the iterator. Iterate mutable copies (each
+	// shares the underlying ResourceData), so the const_cast is also gone.
+	std::vector<Resource> incoming(_object->_incoming_resources.begin(),
+	                               _object->_incoming_resources.end());
+	for (auto& resource : incoming) {
+		resource.cancel();
 	}
-	for (auto& resource : _object->_outgoing_resources) {
-		const_cast<Resource&>(resource).cancel();
+	std::vector<Resource> outgoing(_object->_outgoing_resources.begin(),
+	                               _object->_outgoing_resources.end());
+	for (auto& resource : outgoing) {
+		resource.cancel();
 	}
 	if (_object->_channel) {
 		_object->_channel._shutdown();
@@ -1486,10 +1497,14 @@ void Link::receive(const Packet& packet) {
 					const Bytes plaintext = decrypt(packet.data());
 					if (plaintext && plaintext.size() >= (size_t)(Type::Identity::HASHLENGTH/8)) {
 						const Bytes resource_hash = plaintext.left(Type::Identity::HASHLENGTH/8);
-						for (auto& resource : _object->_incoming_resources) {
+						// Spangap fork: iterate a snapshot (backport of upstream
+						// 032c751) — hashmap_update_packet can re-request and, on a
+						// future change, conclude; a copy keeps us off the live set.
+						std::vector<Resource> incoming(_object->_incoming_resources.begin(),
+						                               _object->_incoming_resources.end());
+						for (auto& resource : incoming) {
 							if (resource_hash == resource.hash()) {
-								Resource r = resource;
-								r.hashmap_update_packet(plaintext);
+								resource.hashmap_update_packet(plaintext);
 								break;
 							}
 						}
@@ -1541,19 +1556,25 @@ void Link::receive(const Packet& packet) {
 				case Type::Packet::RESOURCE:
 				{
 					try {
+						// Spangap fork: snapshot before receive_part (backport of
+						// upstream 032c751). receive_part()/assemble() can conclude
+						// and fire the consumer's callback, which may erase from
+						// _incoming_resources mid-iteration — iterating a copy keeps
+						// the referent we read into `completed` alive past any erase.
 						Resource completed{Type::NONE};
-						for (auto& resource : _object->_incoming_resources) {
-							Resource r = resource;
-							if (r.receive_part(packet.data())) {
-								const Type::Resource::status st = r.status();
+						std::vector<Resource> incoming(_object->_incoming_resources.begin(),
+						                               _object->_incoming_resources.end());
+						for (auto& resource : incoming) {
+							if (resource.receive_part(packet.data())) {
+								const Type::Resource::status st = resource.status();
 								if (st == Type::Resource::COMPLETE ||
 								    st == Type::Resource::CORRUPT  ||
 								    st == Type::Resource::FAILED) {
-									if (r.is_request()) {
-										request_resource_concluded(r);
+									if (resource.is_request()) {
+										request_resource_concluded(resource);
 									}
-									else if (r.is_response()) {
-										response_resource_concluded(r);
+									else if (resource.is_response()) {
+										response_resource_concluded(resource);
 									}
 									// App resources: the engine already invoked
 									// the consumer's resource_concluded callback.
@@ -1596,13 +1617,19 @@ void Link::receive(const Packet& packet) {
 			else if (packet.packet_type() == Type::Packet::PROOF) {
 				if (packet.context() == Type::Packet::RESOURCE_PRF) {
 					try {
+						// Spangap fork: snapshot before validate_proof (backport of
+						// upstream 032c751). validate_proof() concludes and fires
+						// the consumer's callback, which may erase from
+						// _outgoing_resources mid-iteration — iterate a copy so the
+						// referent we read into `proven` survives the erase.
 						Bytes resource_hash = packet.data().left(Type::Identity::HASHLENGTH/8);
 						Resource proven{Type::NONE};
-						for (const auto& resource : _object->_outgoing_resources) {
+						std::vector<Resource> outgoing(_object->_outgoing_resources.begin(),
+						                               _object->_outgoing_resources.end());
+						for (auto& resource : outgoing) {
 							if (resource_hash == resource.hash()) {
-								Resource r = resource;
-								r.validate_proof(packet.data());
-								if (r.status() == Type::Resource::COMPLETE) {
+								resource.validate_proof(packet.data());
+								if (resource.status() == Type::Resource::COMPLETE) {
 									proven = resource;
 								}
 								break;
