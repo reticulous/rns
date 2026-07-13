@@ -87,7 +87,24 @@ enum : uint8_t {
                                          * page-fetch / request-response
                                          * primitive. Sent via
                                          * rnsdLinkRequest(). */
+    RNSD_LINK_AUX_IDENTIFY     = 0x04,  /* payload: rnsd_link_identify_t —
+                                         * identify to the remote peer on an
+                                         * ACTIVE outbound Link, signing with
+                                         * the identity the link was opened
+                                         * with (rnsdLinkOpen identity_key).
+                                         * Sent via rnsdLinkIdentify(). */
 };
+
+/** Link-identify request (RNSD_PORT_LINK aux). Sent by rnsdLinkIdentify().
+ *  Initiator-only (µR Link::identify is a no-op on inbound links); the
+ *  peer sees rnsd.links.<tag>.remote_identity / .remote_dest flip on its
+ *  side once the LINKIDENTIFY validates. */
+typedef struct {
+    uint8_t  op;            /* RNSD_LINK_AUX_IDENTIFY */
+    char     tag[24];       /* outbound link tag (rnsdLinkOpen) */
+} rnsd_link_identify_t;
+static_assert(sizeof(rnsd_link_identify_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_link_identify_t must fit ITS_MAX_MSG_DATA");
 
 /** Request/response issue (RNSD_PORT_LINK aux). Sent by
  *  rnsdLinkRequest(): bridges a consumer byte-array request to µR's

@@ -221,8 +221,14 @@ the framing details:
   never stalls rnsd.
 - **`RNSD_PORT_LINK` (10)** — connect (`rnsd_link_connect_t`, built by
   `rnsdLinkOpen`) opens an outbound link; the handle is the packet-mode data
-  path. Out-of-band aux frames carry `SEND_RESOURCE` (0x02) and `REQUEST` (0x03).
-  Opcode `0x01` was a teardown frame, now removed — see §5.
+  path. Out-of-band aux frames carry `SEND_RESOURCE` (0x02), `REQUEST` (0x03)
+  and `IDENTIFY` (0x04, `rnsdLinkIdentify` — sign a `LINKIDENTIFY` to the peer
+  with the identity the link was opened with; initiator-side, ACTIVE links
+  only, no deferral). Opcode `0x01` was a teardown frame, now removed — see §5.
+  On the *hosting* side, a validated inbound `LINKIDENTIFY` publishes
+  `rnsd.links.<tag>.remote_identity` (identity hash) and `.remote_dest` (the
+  peer's destination hash derived on the link's own aspect) — consumers poll
+  these to treat an identified inbound link as a reply backchannel (lxmf does).
 
 Consumer connect payloads are rnsd-private structs; callers use the `rnsd.h`
 wrappers and never build them by hand. Every framed struct `static_assert`s

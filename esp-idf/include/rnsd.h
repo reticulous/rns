@@ -278,6 +278,19 @@ bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
  *  wrapper over free() — a symmetry hook in case the allocator changes. */
 void rnsdResourceRelease(void* buf);
 
+/** Identify to the remote peer on the ACTIVE outbound Link `tag`, signing
+ *  with the identity the link was opened with (rnsdLinkOpen identity_key;
+ *  "" → rnsd's default). Upstream LXMF calls this "backchannel
+ *  identification": after a delivery, the recipient learns which identity
+ *  is on the link and can reuse it for reverse traffic instead of
+ *  establishing its own Link back. Initiator-side links only (µR's
+ *  Link::identify is a no-op otherwise); idempotence is the caller's job —
+ *  each call sends one LINKIDENTIFY packet. On the receiving node, a
+ *  validated LINKIDENTIFY publishes rnsd.links.<tag>.remote_identity
+ *  (identity hash) and .remote_dest (the peer's destination hash on this
+ *  link's aspect). Returns true if the aux was queued to rnsd. */
+bool rnsdLinkIdentify(const char* tag);
+
 /* ──────────────── request / response (nomad page fetch) ────────────────
  *
  * Reticulum's request/response layer rides an established Link: the

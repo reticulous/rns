@@ -2955,6 +2955,16 @@ void rnsdResourceRelease(void* buf)
     if (buf) free(buf);
 }
 
+bool rnsdLinkIdentify(const char* tag)
+{
+    if (!tag || !*tag) { warn("rnsdLinkIdentify: bad args"); return false; }
+    rnsd_link_identify_t p = {};
+    p.op = RNSD_LINK_AUX_IDENTIFY;
+    safeStrncpy(p.tag, tag, sizeof(p.tag));
+    return itsSendAux("rnsd", RNSD_PORT_LINK, &p, sizeof(p),
+                      pdMS_TO_TICKS(1000));
+}
+
 bool rnsdDestListenLinks(int dest_handle, uint16_t target_port)
 {
     if (dest_handle < 0 || target_port == 0) {
@@ -3585,6 +3595,31 @@ static void onLinkClosedCb(RNS::Link& link)
      * after a short grace window by linkTick so subscribers observe
      * the "closed" transition first. */
     c->link = RNS::Link{RNS::Type::NONE};
+}
+
+/* A peer identified on a link we host (µR validated the LINKIDENTIFY
+ * signature before firing this). Publish who: `remote_identity` is the
+ * identity hash, `remote_dest` the peer's destination hash on this
+ * link's own aspect — i.e. for a link into lxmf.delivery, the peer's
+ * lxmf.delivery hash. remote_dest is what makes the link usable as a
+ * *backchannel*: the consumer can match it against the peer it is
+ * about to send to and ride this link instead of opening its own. */
+static void onLinkRemoteIdentifiedCb(const RNS::Link& link,
+                                     const RNS::Identity& identity)
+{
+    link_conn_t* c = linkFindByLink(link);
+    if (!c) { warn("link: remote identified, no slot"); return; }
+    linkSetStr(*c, "remote_identity", identity.hash().toHex().c_str());
+    try {
+        RNS::Bytes rdest = RNS::Destination::hash_from_name_and_identity(
+            c->aspect.c_str(), identity);
+        linkSetStr(*c, "remote_dest", rdest.toHex().c_str());
+        info("link[%s]: peer identified as %s (dest %s on %s)",
+             c->tag, identity.hash().toHex().c_str(),
+             rdest.toHex().c_str(), c->aspect.c_str());
+    } catch (const std::exception& e) {
+        warn("link[%s]: remote_dest derivation threw: %s", c->tag, e.what());
+    }
 }
 
 static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packet)
@@ -4377,6 +4412,45 @@ static void onLinkAux(TaskHandle_t sender, const void* data, size_t len)
         return;
     }
 
+    if (op == RNSD_LINK_AUX_IDENTIFY) {
+        if (len < sizeof(rnsd_link_identify_t)) {
+            warn("link: short IDENTIFY aux %zu", len);
+            return;
+        }
+        rnsd_link_identify_t req;
+        memcpy(&req, data, sizeof(req));
+        req.tag[sizeof(req.tag) - 1] = '\0';
+        link_conn_t* c = linkFindByTag(req.tag);
+        if (!c) { warn("link[%s]: IDENTIFY for unknown link", req.tag); return; }
+        if (!c->link || c->state != LST_ACTIVE) {
+            /* No deferral: the consumer identifies after a *delivered*
+             * settle, so the link is active in every non-racy case. A
+             * teardown race just loses the identify — the peer then opens
+             * its own reply link, which is the pre-identify behaviour. */
+            warn("link[%s]: IDENTIFY on non-active link (%s)",
+                 c->tag, lstName(c->state));
+            return;
+        }
+        const char* key = !c->identity_key.empty() ? c->identity_key.c_str()
+                                                   : "secrets.rnsd.identity";
+        RNS::Identity ident(RNS::Type::NONE);
+        if (!loadIdentityFromStorage(key, ident)) {
+            warn("link[%s]: IDENTIFY identity load failed (%s)", c->tag, key);
+            return;
+        }
+        try {
+            /* µR guards initiator + ACTIVE internally; on an inbound link
+             * this is a silent no-op, matching upstream semantics. */
+            c->link.identify(ident);
+            linkSetInt(*c, "identified_s", (int)RNS::Utilities::OS::time());
+            info("link[%s]: identified to peer as %s",
+                 c->tag, ident.hash().toHex().c_str());
+        } catch (const std::exception& e) {
+            warn("link[%s]: identify threw: %s", c->tag, e.what());
+        }
+        return;
+    }
+
     if (op == RNSD_LINK_AUX_REQUEST) {
         if (len < sizeof(rnsd_link_request_t)) {
             warn("link: short REQUEST aux %zu", len);
@@ -4480,6 +4554,10 @@ static void onIncomingLinkEstablished(RNS::Link& link)
 
     link.set_packet_callback(onLinkPacketCb);
     link.set_link_closed_callback(onLinkClosedCb);
+    /* Peers backchannel-identify *after* their first delivery (upstream
+     * LXMRouter), so the identity nearly always lands post-accept —
+     * publish it from the callback when it does. */
+    link.set_remote_identified_callback(onLinkRemoteIdentifiedCb);
     linkWireResource(link);                       /* resource callbacks */
     c->consumer_task = mc->link_listener_task;     /* resource aux target */
     c->res_hash      = RNS::Bytes();
@@ -4495,7 +4573,18 @@ static void onIncomingLinkEstablished(RNS::Link& link)
     linkSetStr(*c, "direction", "in");
     linkSetStr(*c, "aspect", c->aspect.c_str());
     linkSetStr(*c, "local_hash", local.toHex().c_str());
-    if (rid) linkSetStr(*c, "remote_identity", rid.toHex().c_str());
+    if (rid) {
+        linkSetStr(*c, "remote_identity", rid.toHex().c_str());
+        /* Identified before accept (rare) — publish remote_dest here since
+         * the identified callback already fired without a slot to land in. */
+        try {
+            RNS::Bytes rdest = RNS::Destination::hash_from_name_and_identity(
+                c->aspect.c_str(), link.get_remote_identity());
+            linkSetStr(*c, "remote_dest", rdest.toHex().c_str());
+        } catch (const std::exception& e) {
+            warn("inlink[%s]: remote_dest derivation threw: %s", c->tag, e.what());
+        }
+    }
     linkSetStr(*c, "link_id", lid.c_str());
     linkSetInt(*c, "mtu", (int)link.get_mtu());
     linkSetInt(*c, "opened_s", (int)c->opened_at);
