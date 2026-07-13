@@ -95,6 +95,21 @@ Our deltas, by category:
   exists and verifies against the peer's link signing key, so the call is wired
   up. Without it a packet sent over a Link could never conclude its receipt
   (`DELIVERED`), which the per-link proof counters depend on.
+- `Link.cpp`/`Transport.cpp` — **links follow the peer across interfaces.**
+  `Link::receive` treated a link packet arriving on an interface other than
+  `_attached_interface` as hostile ("Someone might be trying to manipulate your
+  communication!") and refused to process it — but peers flip interfaces
+  mid-link legitimately: a TCP reconnect yields a new iface impl (same name,
+  different ptr), and a multi-path peer's traffic can start arriving via a
+  different hop. Link payloads authenticate under the link token, so the packet
+  is now processed regardless; the pin is *moved* only when the packet proves
+  knowledge of the link key via a successful trial token decrypt (keepalives,
+  resource parts and proofs are not token-encrypted — they are handled but never
+  move the pin, so a replayed link_id cannot steer our traffic). On the outbound
+  side, `Transport::outbound` now pins link traffic to the link's attached
+  interface (upstream checks `destination.attached_interface`; this port keeps
+  the pin on the Link), compared **by name** so a reconnect's new impl keeps
+  carrying the link; a not-yet-pinned link broadcasts as before.
 - `Transport.cpp`/`Persistence/DestinationEntry.{h,cpp}` — **use-aware path
   eviction.** The path-table cap (`s.rnsd.path.max`, default 100) was enforced
   by `BasicHeapStore`'s `max_recs`, which evicts the lexicographically

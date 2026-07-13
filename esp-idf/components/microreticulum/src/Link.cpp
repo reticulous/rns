@@ -1056,18 +1056,41 @@ void Link::receive(const Packet& packet) {
 	_object->_watchdog_lock = true;
 	if (_object->_status != Type::Link::CLOSED && !(_object->_initiator && packet.context() == Type::Packet::KEEPALIVE && packet.data() == "\xFF")) {
 		if (packet.receiving_interface() != _object->_attached_interface) {
-			/* Spangap diagnostic: name AND object-identity (impl ptr) of both
-			 * interfaces, plus the packet type/context. Lets us tell apart a
-			 * second TCP iface object (same name, different ptr — a reconnect)
-			 * from a different iface (LoRa) from an unset interface (<none>). */
-			ERRORF("Link-associated packet received on unexpected interface %s [%p] instead of %s [%p] (type=%d ctx=%d)! Someone might be trying to manipulate your communication!",
-				packet.receiving_interface() ? packet.receiving_interface().toString().c_str() : "<none>",
-				(const void*)packet.receiving_interface().get(),
-				_object->_attached_interface ? _object->_attached_interface.toString().c_str() : "<none>",
-				(const void*)_object->_attached_interface.get(),
-				(int)packet.packet_type(), (int)packet.context());
+			/* Partners flip interfaces mid-link: a TCP reconnect yields a new
+			 * iface impl (same name, different ptr), and a multi-path peer's
+			 * traffic may start arriving via a different hop entirely. Neither
+			 * is hostile — link payloads authenticate under the link token —
+			 * so process the packet instead of dropping it. Outbound link
+			 * traffic is pinned to _attached_interface (Transport::outbound),
+			 * so follow the peer by re-pinning — but only when the packet
+			 * proves knowledge of the link key via a successful token decrypt.
+			 * Keepalives, resource parts and proofs are not token-encrypted:
+			 * they are handled below but never move the pin, so an observer
+			 * replaying the on-air link_id cannot steer our traffic. The trial
+			 * decrypt duplicates the one in the context handler, but only for
+			 * the rare packet that arrives on a non-pinned interface. */
+			bool repin = false;
+			if (packet.packet_type() == Type::Packet::DATA
+			    && packet.context() != Type::Packet::KEEPALIVE
+			    && packet.context() != Type::Packet::RESOURCE) {
+				repin = (bool)decrypt(packet.data());
+			}
+			if (repin) {
+				INFOF("Link %s: peer now reaches us via %s (was %s) — re-pinning",
+					toString().c_str(),
+					packet.receiving_interface() ? packet.receiving_interface().toString().c_str() : "<none>",
+					_object->_attached_interface ? _object->_attached_interface.toString().c_str() : "<none>");
+				_object->_attached_interface = packet.receiving_interface();
+			}
+			else {
+				DEBUGF("Link %s: packet on non-pinned interface %s (pinned %s, type=%d ctx=%d) — handled without re-pin",
+					toString().c_str(),
+					packet.receiving_interface() ? packet.receiving_interface().toString().c_str() : "<none>",
+					_object->_attached_interface ? _object->_attached_interface.toString().c_str() : "<none>",
+					(int)packet.packet_type(), (int)packet.context());
+			}
 		}
-		else {
+		{
 			_object->_last_inbound = OS::time();
 			if (packet.context() != Type::Packet::KEEPALIVE) {
 				_object->_last_data = _object->_last_inbound;
@@ -1781,6 +1804,11 @@ double Link::rtt() const {
 const Destination& Link::destination() const {
 	assert(_object);
 	return _object->_destination;
+}
+
+const Interface& Link::attached_interface() const {
+	assert(_object);
+	return _object->_attached_interface;
 }
 
 // CBA LINK
