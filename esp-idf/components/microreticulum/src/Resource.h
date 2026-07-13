@@ -144,6 +144,12 @@ namespace RNS {
 		// Outbound: validate an inbound RESOURCE_PRF; conclude on match.
 		void validate_proof(const Bytes& proof_data);
 		void cancel();
+
+		// Poll-driven port of upstream Resource.__watchdog_job: advertisement
+		// retries, receiver part-request retries with window adaptation, and
+		// sender/proof timeouts. Called periodically from Transport::jobs via
+		// Link::resource_watchdogs() (this port has no per-resource threads).
+		void watchdog(double now);
 		float get_progress() const;
 		void set_concluded_callback(Callbacks::concluded callback);
 		void set_progress_callback(Callbacks::progress callback);
@@ -172,6 +178,11 @@ namespace RNS {
 		// ([_requested, _requested+_window)) and advance _requested.
 		// Drives the windowed pull until every part is received.
 		void _request_window();
+
+		// Inbound: recompute the expected in-flight rate (upstream
+		// update_eifr) from the measured request→data rate, falling back to
+		// establishment_cost/rtt before any rate sample exists.
+		void _update_eifr();
 
 	protected:
 		std::shared_ptr<ResourceData> _object;

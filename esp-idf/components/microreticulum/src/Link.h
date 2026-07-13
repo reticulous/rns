@@ -244,6 +244,10 @@ namespace RNS {
 		void register_outgoing_resource(const Resource& resource);
 		void register_incoming_resource(const Resource& resource);
 		bool has_incoming_resource(const Resource& resource);
+		// Poll the retransmission watchdog of every in-flight resource on
+		// this link and sweep out concluded ones. Sends packets on retry, so
+		// callers must not hold the Transport jobs lock.
+		void resource_watchdogs();
 		void cancel_outgoing_resource(const Resource& resource);
 		void cancel_incoming_resource(const Resource& resource);
 		bool ready_for_new_resource();

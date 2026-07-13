@@ -185,7 +185,16 @@ void Resource::_init_outbound(const Bytes& plaintext, bool advertise,
 	}
 	d._hashmap = hashmap;
 	d._total_parts = d._parts.size();
+	d._part_sent.assign(d._parts.size(), 0);
+	d._sent_parts = 0;
 	d._status = Type::Resource::ADVERTISED;
+
+	// Watchdog parameters (upstream Resource.__init__ / __advertise_job).
+	d._timeout_factor = d._link.traffic_timeout_factor();
+	if (d._timeout <= 0.0) {
+		d._timeout = d._link.rtt() * d._timeout_factor;
+	}
+	d._retries_left = Type::Resource::MAX_ADV_RETRIES;
 
 	d._link.register_outgoing_resource(*this);
 	if (advertise) {
@@ -254,6 +263,14 @@ void Resource::advertise() {
 	const Bytes packed = adv.pack();
 	Packet adv_packet(d._link, packed, Type::Packet::DATA, Type::Packet::RESOURCE_ADV);
 	adv_packet.send();
+
+	// Stamp watchdog state (upstream __advertise_job / the adv retry path
+	// both refresh these). retries_left is set by the caller: _init_outbound
+	// starts it at MAX_ADV_RETRIES, watchdog() decrements before re-calling.
+	d._adv_sent = OS::time();
+	d._last_activity = d._adv_sent;
+	d._rtt = 0.0;
+	d._status = Type::Resource::ADVERTISED;
 }
 
 Resource Resource::accept(const Packet& advertisement_packet,
@@ -321,6 +338,16 @@ Resource Resource::accept(const Packet& advertisement_packet,
 	d._parts.assign(d._total_parts, Bytes());
 	d._status = Type::Resource::TRANSFERRING;
 
+	// Watchdog / adaptive-window parameters (upstream Resource.accept).
+	d._last_activity = d._started_at;
+	d._retries_left = Type::Resource::MAX_RETRIES;
+	d._timeout_factor = link.traffic_timeout_factor();
+	d._part_timeout_factor = Type::Resource::PART_TIMEOUT_FACTOR;
+	d._window_max = Type::Resource::WINDOW_MAX_SLOW;
+	d._window_min = Type::Resource::WINDOW_MIN;
+	d._window_flexibility = Type::Resource::WINDOW_FLEXIBILITY;
+	d._req_resp = -1.0;
+
 	link.register_incoming_resource(resource);
 
 	INFOF("Resource::accept t=%u d=%u n=%u advhashes=%zu/%zu window=%zu",
@@ -348,12 +375,14 @@ void Resource::_request_window() {
 	Bytes requested;
 	size_t i = 0;
 	long pn = d._consec + 1;
+	d._outstanding_parts = 0;
 	for (size_t s = 0; s < (size_t)d._window; ++s) {
 		if (pn < 0 || (size_t)pn >= d._total_parts) break;
 		if (d._parts[(size_t)pn].size() == 0) {
 			if (d._hash_known[(size_t)pn]) {
 				requested.append(d._map_hashes[(size_t)pn].data(),
 				                 Type::Resource::MAPHASH_LEN);
+				++d._outstanding_parts;
 				++i;
 			} else {
 				flag = Type::Resource::HASHMAP_IS_EXHAUSTED;
@@ -383,6 +412,15 @@ void Resource::_request_window() {
 	Packet req_packet(d._link, req, Type::Packet::DATA,
 	                  Type::Packet::RESOURCE_REQ);
 	req_packet.send();
+
+	// Request round-trip bookkeeping (upstream request_next). The payload
+	// size stands in for upstream's len(request_packet.raw) — header/crypto
+	// overhead is a few dozen bytes and only skews the rate estimate.
+	d._last_activity = OS::time();
+	d._req_sent = d._last_activity;
+	d._req_sent_bytes = req.size();
+	d._rtt_rxd_bytes_at_part_req = d._rtt_rxd_bytes;
+	d._req_resp = -1.0;
 	INFOF("Resource::request_next consec=%ld want=%zu exhausted=%d "
 	      "known=%zu/%zu", d._consec, i,
 	      (int)(flag == Type::Resource::HASHMAP_IS_EXHAUSTED),
@@ -397,6 +435,7 @@ void Resource::hashmap_update_packet(const Bytes& plaintext) {
 	ResourceData& d = *_object;
 	if (d._status == Type::Resource::FAILED) return;
 	if (plaintext.size() <= 32) return;
+	d._last_activity = OS::time();
 
 	const uint8_t* p = plaintext.data() + 32;
 	size_t n = plaintext.size() - 32;
@@ -440,6 +479,40 @@ bool Resource::receive_part(const Bytes& part_data) {
 	ResourceData& d = *_object;
 	if (d._outbound) return false;
 
+	const double now = OS::time();
+	d._last_activity = now;
+	d._retries_left = Type::Resource::MAX_RETRIES;
+
+	// First part after a request: take an rtt sample and derive the
+	// request→response rate (upstream receive_part's req_resp block).
+	if (d._req_resp < 0.0) {
+		d._req_resp = now;
+		const double rtt_sample = d._req_resp - d._req_sent;
+		d._part_timeout_factor = Type::Resource::PART_TIMEOUT_FACTOR_AFTER_RTT;
+		if (d._rtt <= 0.0) {
+			d._rtt = d._link.rtt();
+		}
+		else if (rtt_sample < d._rtt) {
+			d._rtt = std::max(d._rtt - d._rtt * 0.05, rtt_sample);
+		}
+		else if (rtt_sample > d._rtt) {
+			d._rtt = std::min(d._rtt + d._rtt * 0.05, rtt_sample);
+		}
+		if (rtt_sample > 0.0) {
+			// part_data.size() stands in for len(packet.raw); see the
+			// matching note in _request_window().
+			const double req_resp_cost = (double)(part_data.size() + d._req_sent_bytes);
+			d._req_resp_rtt_rate = req_resp_cost / rtt_sample;
+			if (d._req_resp_rtt_rate > Type::Resource::RATE_FAST &&
+			    d._fast_rate_rounds < Type::Resource::FAST_RATE_THRESHOLD) {
+				++d._fast_rate_rounds;
+				if (d._fast_rate_rounds == Type::Resource::FAST_RATE_THRESHOLD) {
+					d._window_max = Type::Resource::WINDOW_MAX_FAST;
+				}
+			}
+		}
+	}
+
 	uint8_t mh[Type::Resource::MAPHASH_LEN];
 	rns_map_hash(part_data.data(), part_data.size(), d._random_hash,
 	             Type::Resource::RANDOM_HASH_SIZE, mh);
@@ -451,6 +524,8 @@ bool Resource::receive_part(const Bytes& part_data) {
 		                Type::Resource::MAPHASH_LEN) == 0) {
 			d._parts[i] = part_data;
 			++d._received;
+			d._rtt_rxd_bytes += part_data.size();
+			if (d._outstanding_parts > 0) --d._outstanding_parts;
 			accepted = true;
 			break;
 		}
@@ -468,10 +543,46 @@ bool Resource::receive_part(const Bytes& part_data) {
 
 	if (d._callbacks._progress) d._callbacks._progress(*this);
 
-	// Pull the next batch (or trigger a hashmap-update when the known
-	// hashmap is exhausted) until every part is in.
-	if (d._received < d._total_parts && !d._waiting_hmu)
+	// Request the next window only when the current one has drained
+	// (upstream receive_part: `elif self.outstanding_parts == 0`). Asking
+	// again while parts are still in flight makes the sender resend them.
+	if (d._received < d._total_parts && !d._waiting_hmu &&
+	    d._outstanding_parts == 0) {
+		// Window adaptation: grow toward window_max; track the achieved
+		// request→data rate to escalate window_max (fast links) or cap it
+		// (very slow links).
+		if (d._window < d._window_max) {
+			++d._window;
+			if ((d._window - d._window_min) > (d._window_flexibility - 1)) {
+				++d._window_min;
+			}
+		}
+		if (d._req_sent > 0.0) {
+			const double round_rtt = now - d._req_sent;
+			const size_t transferred = d._rtt_rxd_bytes - d._rtt_rxd_bytes_at_part_req;
+			if (round_rtt > 0.0) {
+				d._req_data_rtt_rate = (double)transferred / round_rtt;
+				_update_eifr();
+				d._rtt_rxd_bytes_at_part_req = d._rtt_rxd_bytes;
+				if (d._req_data_rtt_rate > Type::Resource::RATE_FAST &&
+				    d._fast_rate_rounds < Type::Resource::FAST_RATE_THRESHOLD) {
+					++d._fast_rate_rounds;
+					if (d._fast_rate_rounds == Type::Resource::FAST_RATE_THRESHOLD) {
+						d._window_max = Type::Resource::WINDOW_MAX_FAST;
+					}
+				}
+				if (d._fast_rate_rounds == 0 &&
+				    d._req_data_rtt_rate < Type::Resource::RATE_VERY_SLOW &&
+				    d._very_slow_rate_rounds < Type::Resource::VERY_SLOW_RATE_THRESHOLD) {
+					++d._very_slow_rate_rounds;
+					if (d._very_slow_rate_rounds == Type::Resource::VERY_SLOW_RATE_THRESHOLD) {
+						d._window_max = Type::Resource::WINDOW_MAX_VERY_SLOW;
+					}
+				}
+			}
+		}
 		_request_window();
+	}
 
 	if (d._total_parts > 0 && d._received >= d._total_parts) {
 		Bytes assembled;
@@ -547,7 +658,18 @@ void Resource::request(const Bytes& request_data) {
 	assert(_object);
 	ResourceData& d = *_object;
 	if (!d._outbound) return;
+	if (d._status == Type::Resource::FAILED) return;
 	if (request_data.size() < 1 + 32) return;
+
+	// A part request answers our advertisement: first one measures the
+	// resource rtt; every one proves the receiver is alive (upstream
+	// Resource.request head).
+	const double req_now = OS::time();
+	if (d._rtt <= 0.0 && d._adv_sent > 0.0) {
+		d._rtt = req_now - d._adv_sent;
+	}
+	d._status = Type::Resource::TRANSFERRING;
+	d._retries_left = Type::Resource::MAX_RETRIES;
 
 	size_t pos = 0;
 	const uint8_t exhausted = request_data.data()[pos++];
@@ -577,6 +699,12 @@ void Resource::request(const Bytes& request_data) {
 				Packet part_packet(d._link, d._parts[i],
 				                   Type::Packet::DATA, Type::Packet::RESOURCE);
 				part_packet.send();
+				if (i < d._part_sent.size() && !d._part_sent[i]) {
+					d._part_sent[i] = 1;
+					++d._sent_parts;
+				}
+				d._last_activity = OS::time();
+				d._last_part_sent = d._last_activity;
 				break;
 			}
 		}
@@ -631,11 +759,18 @@ void Resource::request(const Bytes& request_data) {
 		Packet hmu_packet(d._link, hmu, Type::Packet::DATA,
 		                  Type::Packet::RESOURCE_HMU);
 		hmu_packet.send();
+		d._last_activity = OS::time();
 		INFOF("Resource::request HMU seg=%zu parts[%zu..%zu) of %zu",
 		      segment, hm_start, hm_end, (size_t)d._total_parts);
 	}
 
-	d._status = Type::Resource::TRANSFERRING;
+	// Every part has been sent at least once — the rest of the transfer is
+	// retransmits and the proof; switch the watchdog to the proof timeout
+	// (upstream: status = AWAITING_PROOF, retries_left = 3).
+	if (d._sent_parts >= d._parts.size()) {
+		d._status = Type::Resource::AWAITING_PROOF;
+		d._retries_left = 3;
+	}
 }
 
 Bytes Resource::generate_proof() const {
@@ -662,8 +797,167 @@ void Resource::cancel() {
 	if (!_object) return;
 	if (_object->_status != Type::Resource::COMPLETE) {
 		_object->_status = Type::Resource::FAILED;
+		// Tell the receiver we gave up so it can drop its inbound state
+		// (upstream cancel: RESOURCE_ICL from the initiator).
+		if (_object->_outbound) {
+			Packet cancel_packet(_object->_link, Bytes(_object->_resource_hash, 32),
+			                     Type::Packet::DATA, Type::Packet::RESOURCE_ICL);
+			cancel_packet.send();
+		}
 	}
 	if (_object->_callbacks._concluded) _object->_callbacks._concluded(*this);
+}
+
+// Upstream update_eifr: expected in-flight rate in bits/s. Before any
+// request→data rate sample exists, estimate from the link establishment
+// cost over one rtt (upstream also consults the link's previous-resource
+// eifr, which this port doesn't track).
+void Resource::_update_eifr() {
+	assert(_object);
+	ResourceData& d = *_object;
+	const double rtt = d._rtt > 0.0 ? d._rtt : d._link.rtt();
+	double eifr;
+	if (d._req_data_rtt_rate != 0.0) {
+		eifr = d._req_data_rtt_rate * 8.0;
+	}
+	else if (rtt > 0.0) {
+		eifr = (double)d._link.establishment_cost() * 8.0 / rtt;
+	}
+	else {
+		eifr = 0.0;
+	}
+	d._eifr = eifr;
+}
+
+// Poll-driven port of upstream Resource.__watchdog_job. Each state's
+// deadline arithmetic matches upstream line-for-line; instead of a thread
+// sleeping until the deadline, Transport::jobs calls this periodically and
+// the deadline is re-checked against `now`. Retries send packets through
+// Transport::outbound, so this must never run inside the jobs lock (see
+// the call site in Transport::jobs).
+void Resource::watchdog(double now) {
+	if (!_object) return;
+	ResourceData& d = *_object;
+
+	switch (d._status) {
+
+	case Type::Resource::ADVERTISED: {
+		// Sender: no part request answered our advertisement yet.
+		double tmo = d._timeout;
+		if (tmo <= 0.0) tmo = d._link.rtt() * d._timeout_factor;
+		if (tmo <= 0.0) return;   // link rtt not yet measured; check next tick
+		if (now > d._adv_sent + tmo + Type::Resource::PROCESSING_GRACE) {
+			if (d._retries_left <= 0) {
+				DEBUG("Resource transfer timeout after sending advertisement");
+				cancel();
+			}
+			else {
+				DEBUGF("Resource %s: no part requests received, retrying advertisement (%d left)",
+					d._hash.toHex().c_str(), d._retries_left);
+				--d._retries_left;
+				advertise();   // re-stamps _adv_sent/_last_activity
+			}
+		}
+		break;
+	}
+
+	case Type::Resource::TRANSFERRING: {
+		if (!d._outbound) {
+			// Receiver: re-request outstanding parts when the expected
+			// time-of-flight (from the expected in-flight rate) has passed.
+			const int retries_used = Type::Resource::MAX_RETRIES - d._retries_left;
+			const double extra_wait = retries_used * Type::Resource::PER_RETRY_DELAY;
+			_update_eifr();
+			if (d._eifr <= 0.0) return;   // no rate estimate yet
+			const double sdu_bits = (double)Type::Resource::SDU * 8.0;
+			const double expected_hmu_wait =
+				(d._waiting_hmu || d._outstanding_parts == 0)
+					? (sdu_bits * Type::Resource::HMU_WAIT_FACTOR) / d._eifr : 0.0;
+			const double expected_tof =
+				((double)d._outstanding_parts * sdu_bits) / d._eifr;
+			double deadline;
+			if (d._req_resp_rtt_rate != 0.0) {
+				deadline = d._last_activity +
+					d._part_timeout_factor * expected_tof + expected_hmu_wait +
+					Type::Resource::RETRY_GRACE_TIME + extra_wait;
+			}
+			else {
+				// Pre-rate-sample fallback; the missing *8 on the sdu term
+				// is upstream's formula verbatim (Resource.py __watchdog_job).
+				deadline = d._last_activity +
+					d._part_timeout_factor * ((3.0 * Type::Resource::SDU) / d._eifr) +
+					Type::Resource::RETRY_GRACE_TIME + extra_wait;
+			}
+			if (now > deadline) {
+				if (d._retries_left > 0) {
+					DEBUGF("Resource %s: timed out waiting for %zu parts, requesting retry (%d left)",
+						d._hash.toHex().c_str(), d._outstanding_parts, d._retries_left);
+					if (d._window > d._window_min) {
+						--d._window;
+						if (d._window_max > d._window_min) {
+							--d._window_max;
+							if ((d._window_max - d._window) > (d._window_flexibility - 1)) {
+								--d._window_max;
+							}
+						}
+					}
+					--d._retries_left;
+					d._waiting_hmu = false;
+					_request_window();
+				}
+				else {
+					cancel();
+				}
+			}
+		}
+		else {
+			// Sender: give the receiver its full retry budget plus grace
+			// before declaring the transfer dead.
+			const double rtt = d._rtt > 0.0 ? d._rtt : d._link.rtt();
+			const int mr = Type::Resource::MAX_RETRIES;
+			const double max_extra_wait =
+				Type::Resource::PER_RETRY_DELAY * (mr * (mr + 1) / 2.0);
+			const double max_wait = rtt * d._timeout_factor * mr +
+				Type::Resource::SENDER_GRACE_TIME + max_extra_wait;
+			if (now > d._last_activity + max_wait) {
+				DEBUGF("Resource %s: timed out waiting for part requests",
+					d._hash.toHex().c_str());
+				cancel();
+			}
+		}
+		break;
+	}
+
+	case Type::Resource::AWAITING_PROOF: {
+		// Sender: all parts sent, waiting for the receiver's proof. Proof
+		// packets are much smaller than a req/resp round trip, hence the
+		// reduced timeout factor. Upstream spends its retries querying the
+		// network packet cache (Transport.cache_request); this port has no
+		// packet cache, so each retry just extends the wait window before
+		// giving up.
+		const double rtt = d._rtt > 0.0 ? d._rtt : d._link.rtt();
+		if (rtt <= 0.0) return;
+		if (now > d._last_part_sent +
+		          rtt * Type::Resource::PROOF_TIMEOUT_FACTOR +
+		          Type::Resource::SENDER_GRACE_TIME) {
+			if (d._retries_left <= 0) {
+				DEBUGF("Resource %s: timed out waiting for proof",
+					d._hash.toHex().c_str());
+				cancel();
+			}
+			else {
+				DEBUGF("Resource %s: no proof received, extending wait (%d left)",
+					d._hash.toHex().c_str(), d._retries_left);
+				--d._retries_left;
+				d._last_part_sent = now;
+			}
+		}
+		break;
+	}
+
+	default:
+		break;
+	}
 }
 
 bool Resource::is_outbound() const {

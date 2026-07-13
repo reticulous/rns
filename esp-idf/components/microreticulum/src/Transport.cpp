@@ -359,6 +359,12 @@ DestinationEntry empty_destination_entry;
 	 * _jobs_running == false because jobs() is what clears it). Collect and
 	 * defer, matching the outgoing/path_requests pattern. */
 	std::vector<Link> reap_links;
+	/* Spangap: links whose in-flight Resources need a watchdog poll this
+	 * tick (upstream runs a thread per resource; we poll on the links-check
+	 * cadence, which matches upstream's WATCHDOG_MAX_SLEEP of 1 s). Same
+	 * deferral as reap_links: retries send packets via Transport::outbound,
+	 * which spins on _jobs_running. */
+	std::vector<Link> watchdog_links;
 	int count;
 	_jobs_running = true;
 
@@ -433,6 +439,10 @@ DestinationEntry empty_destination_entry;
 						reap_links.push_back(link);
 						_active_links.erase(link);
 					}
+				}
+
+				for (auto& link : _active_links) {
+					watchdog_links.push_back(link);
 				}
 
 				_links_last_checked = OS::time();
@@ -838,6 +848,13 @@ DestinationEntry empty_destination_entry;
 	// _jobs_running, so this MUST run after the assignment above.
 	for (auto& link : reap_links) {
 		link.teardown();
+	}
+
+	// Spangap: poll Resource retransmission watchdogs (adv retries, part
+	// re-requests, proof timeouts). Also deferred past the _jobs_running
+	// clear — retries transmit through Transport::outbound().
+	for (auto& link : watchdog_links) {
+		link.resource_watchdogs();
 	}
 
 	// CBA send announce retransmission packets

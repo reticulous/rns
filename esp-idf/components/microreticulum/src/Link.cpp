@@ -1709,6 +1709,36 @@ bool Link::has_incoming_resource(const Resource& resource) {
 	return false;
 }
 
+// Drive the poll-driven Resource watchdogs (upstream runs one thread per
+// resource; here Transport::jobs calls this per active link). Concluded
+// resources are swept out afterwards — completions are already removed by
+// the receive paths, so this mainly clears watchdog-cancelled (FAILED)
+// transfers. Iterates over copies: watchdog() → cancel() → concluded
+// callbacks may re-enter and mutate the underlying sets.
+void Link::resource_watchdogs() {
+	assert(_object);
+	const double now = OS::time();
+	std::set<Resource> outgoing(_object->_outgoing_resources);
+	for (const auto& resource : outgoing) {
+		Resource r = resource;
+		r.watchdog(now);
+		if (r.status() == Type::Resource::FAILED ||
+		    r.status() == Type::Resource::COMPLETE) {
+			_object->_outgoing_resources.erase(resource);
+		}
+	}
+	std::set<Resource> incoming(_object->_incoming_resources);
+	for (const auto& resource : incoming) {
+		Resource r = resource;
+		r.watchdog(now);
+		if (r.status() == Type::Resource::FAILED ||
+		    r.status() == Type::Resource::COMPLETE ||
+		    r.status() == Type::Resource::CORRUPT) {
+			_object->_incoming_resources.erase(resource);
+		}
+	}
+}
+
 void Link::cancel_outgoing_resource(const Resource& resource) {
 	assert(_object);
 	if (_object->_outgoing_resources.count(resource) > 0) {

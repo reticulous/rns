@@ -125,6 +125,28 @@ Our deltas, by category:
   All multi-segment destinations (`lxmf.delivery`, `nomadnetwork.node`) are
   unaffected; the fix only changes app-name-only destinations, which were
   previously mis-hashed and matched nothing.
+- `Resource.cpp`/`ResourceData.h`/`Link.cpp`/`Transport.cpp`/`Type.h` —
+  **Resource retransmission watchdogs.** The port originally had no equivalent
+  of upstream's per-resource `__watchdog_job` thread: one lost RESOURCE_REQ,
+  part or proof packet stalled a transfer forever (rnsd's wall-clock backstop
+  then failed the whole message). Ported poll-driven: `Transport::jobs()` calls
+  `Link::resource_watchdogs()` for every active link on the links-check cadence
+  (~1 s, matching upstream's `WATCHDOG_MAX_SLEEP`), deferred past the
+  `_jobs_running` clear like link teardown because retries transmit through
+  `Transport::outbound`. `Resource::watchdog(now)` re-checks each state's
+  deadline (upstream's arithmetic verbatim): advertisement retries
+  (`MAX_ADV_RETRIES`), receiver part re-requests with window shrink, sender
+  part-request timeout, and `AWAITING_PROOF` (upstream retries via the network
+  packet cache, which this port lacks — a retry just extends the wait).
+  Alongside it, the receiver's adaptive window now matches upstream:
+  `_request_window` only fires when the outstanding window has drained (asking
+  while parts are in flight made the sender resend them), the window grows
+  toward `window_max`, and measured request→data rates escalate to
+  `WINDOW_MAX_FAST` or cap at `WINDOW_MAX_VERY_SLOW` (the newer upstream
+  very-slow-link constants are ported too, and `MAX_RETRIES` is upstream's
+  current 16). `Resource::cancel()` on an outbound resource now sends
+  `RESOURCE_ICL` so the receiver drops its inbound state instead of waiting
+  out its own timeout.
 - **Tunable identity-cache size** — `RNS::Identity::known_destinations_maxsize` is
   driven by `s.rnsd.identity.cache_max` (default `1000`, ~200 KiB PSRAM). The
   generous default prevents cache eviction before probes conclude on a busy network.

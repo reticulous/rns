@@ -500,10 +500,13 @@ namespace RNS { namespace Type {
 		static const uint8_t WINDOW               = 4;
 
 		// Absolute minimum window size during transfer
-		static const uint8_t WINDOW_MIN           = 1;
+		static const uint8_t WINDOW_MIN           = 2;
 
 		// The maximum window size for transfers on slow links
 		static const uint8_t WINDOW_MAX_SLOW      = 10;
+
+		// The maximum window size for transfers on very slow links
+		static const uint8_t WINDOW_MAX_VERY_SLOW = 4;
 
 		// The maximum window size for transfers on fast links
 		static const uint8_t WINDOW_MAX_FAST      = 75;
@@ -516,11 +519,21 @@ namespace RNS { namespace Type {
 		// rounds, the fast link window size will be allowed.
 		static const uint8_t FAST_RATE_THRESHOLD  = WINDOW_MAX_SLOW - WINDOW - 2;
 
+		// If the very slow rate is sustained for this many request
+		// rounds, window will be capped to the very slow limit.
+		static const uint8_t VERY_SLOW_RATE_THRESHOLD = 2;
+
 		// If the RTT rate is higher than this value,
 		// the max window size for fast links will be used.
 		// The default is 50 Kbps (the value is stored in
 		// bytes per second, hence the "/ 8").
 		static const uint16_t RATE_FAST            = (50*1000) / 8;
+
+		// If the RTT rate is lower than this value,
+		// the window size will be capped at the very
+		// slow limit. The default is 2 Kbps (stored in
+		// bytes per second, hence the "/ 8").
+		static const uint16_t RATE_VERY_SLOW       = (2*1000) / 8;
 
 		// The minimum allowed flexibility of the window size.
 		// The difference between window_max and window_min
@@ -556,9 +569,12 @@ namespace RNS { namespace Type {
 
 		static const uint8_t PART_TIMEOUT_FACTOR           = 4;
 		static const uint8_t PART_TIMEOUT_FACTOR_AFTER_RTT = 2;
-		static const uint8_t MAX_RETRIES                   = 8;
+		static const uint8_t PROOF_TIMEOUT_FACTOR          = 3;
+		static const float HMU_WAIT_FACTOR                = 3.5;
+		static const uint8_t MAX_RETRIES                   = 16;
 		static const uint8_t MAX_ADV_RETRIES               = 4;
 		static const uint8_t SENDER_GRACE_TIME             = 10;
+		static const float PROCESSING_GRACE              = 1.0;
 		static const float RETRY_GRACE_TIME              = 0.25;
 		static const float PER_RETRY_DELAY               = 0.5;
 
