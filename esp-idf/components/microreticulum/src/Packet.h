@@ -269,6 +269,13 @@ namespace RNS {
 		inline const Bytes& plaintext() { assert(_object); return _object->_plaintext; }
 		inline bool packed() const { assert(_object); return _object->_packed; }
 		inline bool from_packed() const { assert(_object); return _object->_fromPacked; }
+		// Spangap fork: per-packet signal-quality accessors, backported from
+		// upstream attermann/microReticulum 032c751. Fields default to NaN
+		// ("metric not present"); an interface that measures them would set
+		// them at receive time (not yet wired here — see Link::receive).
+		inline float rssi() const { assert(_object); return _object->_rssi; }
+		inline float snr()  const { assert(_object); return _object->_snr; }
+		inline float q()    const { assert(_object); return _object->_q; }
 
 		// setters
 		inline void destination(const Destination& destination) { assert(_object); _object->_destination = destination; }
@@ -280,6 +287,9 @@ namespace RNS {
 		inline void hops(uint8_t hops) { assert(_object); _object->_hops = hops; }
 		inline void cached(bool cached) { assert(_object); _object->_cached = cached; }
 		inline void transport_id(const Bytes& transport_id) { assert(_object); _object->_transport_id = transport_id; }
+		inline void rssi(float rssi) { assert(_object); _object->_rssi = rssi; }
+		inline void snr(float snr)   { assert(_object); _object->_snr = snr; }
+		inline void q(float q)       { assert(_object); _object->_q = q; }
 		//CBA Following method is only used by Link to provide Resource access to decrypted resource advertisement. Consider a better way.
 		inline void plaintext(const Bytes& plaintext) { assert(_object); _object->_plaintext = plaintext; }
 
@@ -331,9 +341,11 @@ namespace RNS {
 			uint16_t _MTU = Type::Reticulum::MTU;
 			double _sent_at = 0;
 
-			float _rssi = 0.0;
-			float _snr = 0.0;
-			float _q = 0.0;
+			// Spangap fork: default to NaN ("metric not present") so a real
+			// 0.0 reading is distinguishable from unset (upstream 032c751).
+			float _rssi = Type::NaN<float>;
+			float _snr  = Type::NaN<float>;
+			float _q    = Type::NaN<float>;
 
 			Bytes _packet_hash;
 			Bytes _ratchet_id;

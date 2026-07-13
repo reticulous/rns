@@ -18,6 +18,8 @@
 
 #include <stdint.h>
 #include <math.h>
+#include <cmath>
+#include <limits>
 
 #ifndef RNS_QUEUED_ANNOUNCES_MAX
 #define RNS_QUEUED_ANNOUNCES_MAX 20
@@ -43,6 +45,17 @@
 
 
 namespace RNS { namespace Type {
+
+	// Spangap fork: NaN sentinel + test, backported from upstream
+	// attermann/microReticulum 032c751. Used as the "metric not present"
+	// marker on per-packet signal-quality fields (rssi/snr/q) so a real
+	// 0.0 reading is distinguishable from "unset".
+	template <typename T>
+	constexpr T NaN = std::numeric_limits<T>::quiet_NaN();
+	template <typename T>
+	constexpr bool isNan(T val) {
+		return std::isnan(val);
+	}
 
 	// generic empty object constructor type
 	enum NoneConstructor {

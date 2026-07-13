@@ -1106,6 +1106,17 @@ void Link::receive(const Packet& packet) {
 			}
 			_object->_rx += 1;
 			_object->_rxbytes += packet.data().size();
+			/* Spangap fork: snapshot per-packet signal-quality stats onto the
+			 * link's "last received" fields so consumers can read
+			 * rssi()/snr()/q() without holding the Packet (backport of
+			 * upstream attermann/microReticulum 032c751). NaN means the source
+			 * packet (or its receiving interface) didn't carry that metric —
+			 * which is the case for every packet today: no interface here
+			 * populates them yet (iface-lora → rnsd doesn't forward radio
+			 * stats over ITS), so this is dormant until that wiring lands. */
+			if (!Type::isNan(packet.rssi())) _object->_rssi = packet.rssi();
+			if (!Type::isNan(packet.snr()))  _object->_snr  = packet.snr();
+			if (!Type::isNan(packet.q()))    _object->_q    = packet.q();
 			if (_object->_status == STALE) {
 				_object->_status = Type::Link::ACTIVE;
 			}
@@ -1871,6 +1882,25 @@ double Link::request_time() const {
 double Link::last_inbound() const {
 	assert(_object);
 	return _object->_last_inbound;
+}
+
+// Spangap fork: last-received signal-quality readings on this link
+// (backport of upstream attermann/microReticulum 032c751). NaN until an
+// interface that measures them populates the inbound Packet — see
+// Link::receive.
+float Link::rssi() const {
+	assert(_object);
+	return _object->_rssi;
+}
+
+float Link::snr() const {
+	assert(_object);
+	return _object->_snr;
+}
+
+float Link::q() const {
+	assert(_object);
+	return _object->_q;
 }
 
 std::set<RNS::RequestReceipt>& Link::pending_requests() const {

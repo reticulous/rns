@@ -270,6 +270,12 @@ namespace RNS {
 		uint8_t traffic_timeout_factor() const;
 		double request_time() const;
 		double last_inbound() const;
+		// Spangap fork: last-received per-packet signal quality (NaN if the
+		// receiving interface didn't report it). Backport of upstream
+		// attermann/microReticulum 032c751.
+		float rssi() const;
+		float snr() const;
+		float q() const;
 		std::set<RequestReceipt>& pending_requests() const;
 		Type::Link::teardown_reason teardown_reason() const;
 		bool initiator() const;
