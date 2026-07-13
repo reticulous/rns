@@ -214,7 +214,6 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.link.request_timeout_s` | `15` | Request/response (page fetch) timeout. |
 | `s.rnsd.link.max_inbound_resources_total` | `4` | Concurrent inbound Resource cap across all links. |
 | `s.rnsd.its_no_pool` | `0` | Disable the ITS server inbox pool (debug). |
-| `s.rnsd.debug.only_local` | `0` | Demote announce-traffic debug logs to verbose. |
 | `s.lxmf.max_resource_size` | `262144` | Size gate for accepting an inbound Resource. |
 | `s.net.up_wait_s` | `20` | Boot barrier: how long to wait for the network at startup. |
 

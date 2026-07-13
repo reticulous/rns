@@ -73,13 +73,6 @@ static const char* TAG = "rnsd";
 
 static std::string formatAnnounceAppData(const RNS::Bytes& app_data);
 
-/* Cached `s.rnsd.debug.only_local` — when true, the dbg() lines that
- * describe announces (everyone's traffic) are demoted to verb() so
- * they only show at log level verbose. dbg-level then surfaces just
- * the traffic that affects this node directly. Live-mirrored from
- * storage via subscription, so writes take effect immediately. */
-static bool s_dbg_only_local = false;
-
 #define RNSD_VERSION 1
 
 /* Up to N concurrent registered interfaces. Each TCP peer is its
@@ -353,6 +346,62 @@ static iface_t* ifaceAlloc(void)
     return nullptr;
 }
 
+/* One-line wire-header summary for the per-iface tx/rx dbg lines below.
+ * The lora driver logs every tx it performs; tcp/espnow logged nothing per
+ * packet, which made loss of link-addressed packets between us and the
+ * first hop undiagnosable. This decodes the raw Reticulum header at the
+ * single chokepoint every interface passes through. */
+static const char* wirePktType(uint8_t t)
+{
+    switch (t) { case 0: return "data"; case 1: return "announce";
+                 case 2: return "lreq"; default: return "proof"; }
+}
+static const char* wireDestType(uint8_t t)
+{
+    switch (t) { case 0: return "single"; case 1: return "group";
+                 case 2: return "plain"; default: return "link"; }
+}
+static void logWire(const char* iface, const char* dir, const uint8_t* p, size_t n)
+{
+    if (n < 2) return;
+    const uint8_t flags = p[0];
+    if (flags & 0x80) {   /* IFAC bit: access code precedes the header — skip decode */
+        dbg("%s %s ifac-framed %zuB", iface, dir, n);
+        return;
+    }
+    const uint8_t htype = (flags >> 6) & 0x01;
+    const uint8_t dtype = (flags >> 2) & 0x03;
+    const uint8_t ptype = flags & 0x03;
+    const size_t  addr  = 2 + (htype ? 16 : 0);   /* dest hash offset (past transport_id) */
+    char hash[33] = "?";
+    char ctx[4] = "?";
+    if (n >= addr + 16) {
+        for (int j = 0; j < 16; ++j) sprintf(&hash[j * 2], "%02x", p[addr + j]);
+        if (n >= addr + 17) snprintf(ctx, sizeof(ctx), "%02x", p[addr + 16]);
+    }
+    if (dir[0] == 'r') {
+        /* Announces and path requests (PLAIN-destination broadcasts) arrive
+         * by the hundreds from busy TCP peers — that's everyone else's
+         * traffic. Demote the inbound flood to verbose so debug level shows
+         * only packets that can involve this node (single/group/link-
+         * addressed, proofs, lreqs). Our own tx of these stays at debug. */
+        if (ptype == 1 /*announce*/ || dtype == 2 /*plain*/) {
+            verb("%s rx %s %s %s ctx=%s hops=%u %zuB",
+                 iface, wirePktType(ptype), wireDestType(dtype), hash, ctx,
+                 (unsigned)p[1], n);
+        }
+        else {
+            dbg("%s rx %s %s %s ctx=%s hops=%u %zuB",
+                iface, wirePktType(ptype), wireDestType(dtype), hash, ctx,
+                (unsigned)p[1], n);
+        }
+        return;
+    }
+    /* tx: no hop count — it's 0 on everything we originate. */
+    dbg("%s tx %s %s %s ctx=%s %zuB",
+        iface, wirePktType(ptype), wireDestType(dtype), hash, ctx, n);
+}
+
 void TaskInterface::send_outgoing(const RNS::Bytes& data)
 {
     if (_handle < 0) return;
@@ -361,6 +410,7 @@ void TaskInterface::send_outgoing(const RNS::Bytes& data)
         warn("iface %s: ITS send dropped (%zu B)", _name.c_str(), data.size());
         return;
     }
+    logWire(_name.c_str(), "tx", data.data(), data.size());
     _txb += data.size();
     if (iface_t* i = ifaceFindByHandle(_handle)) {
         i->tx_packets++;
@@ -515,6 +565,7 @@ static void onTransportRecv(int handle, size_t /*bytesAvail*/)
     i->rx_bytes += n;
     s_stats.packets_in++;
     s_stats.bytes_in += n;
+    logWire(i->info.name, "rx", pktbuf, n);
 
     /* Hand to mR Transport via the Interface — InterfaceImpl::handle_incoming
      * routes through to Transport::inbound(data, iface), which decodes the
@@ -1520,26 +1571,20 @@ public:
     void received_announce(const RNS::Bytes& destination_hash,
                            const RNS::Identity& announced_identity,
                            const RNS::Bytes& app_data) override {
-        /* All output here is dbg() — or verb() when `s.rnsd.debug.only_local`
-         * is set, which demotes announce noise so it only shows at the
-         * verbose level. Gate against the level we'd actually fire at so
-         * the msgpack walker / shape detectors in formatAnnounceAppData
-         * (a few hundred µs per announce — measurable on a busy testnet)
-         * aren't paid when the output would be suppressed anyway. */
+        /* Announces are everyone else's traffic and busy TCP peers deliver
+         * hundreds of them, so all output here is verb() — debug level
+         * stays readable. Gate against the verbose level up front so the
+         * msgpack walker / shape detectors in formatAnnounceAppData (a few
+         * hundred µs per announce — measurable on a busy testnet) aren't
+         * paid when the output would be suppressed anyway. */
         esp_log_level_t lvl = esp_log_level_get(TAG);
-        esp_log_level_t needed = s_dbg_only_local ? ESP_LOG_VERBOSE : ESP_LOG_DEBUG;
-        if (lvl < needed) return;
+        if (lvl < ESP_LOG_VERBOSE) return;
 
         int hops = (int)RNS::Transport::hops_to(destination_hash);
         std::string body = formatAnnounceAppData(app_data);
-        if (s_dbg_only_local)
-            verb("announce dest=%s id=%s hops=%d app_data %s",
-                 destination_hash.toHex().c_str(),
-                 announced_identity.hexhash().c_str(), hops, body.c_str());
-        else
-            dbg ("announce dest=%s id=%s hops=%d app_data %s",
-                 destination_hash.toHex().c_str(),
-                 announced_identity.hexhash().c_str(), hops, body.c_str());
+        verb("announce dest=%s id=%s hops=%d app_data %s",
+             destination_hash.toHex().c_str(),
+             announced_identity.hexhash().c_str(), hops, body.c_str());
         if (app_data.size() > 0)
             verb("announce hex %s", app_data.toHex().c_str());
     }
@@ -5614,16 +5659,6 @@ static void rnsdTaskMain(void*)
          * CLI writes to this key; we build the Link here on the rnsd task. */
         storageSubscribeChanges("rnsd.cmd.link.open", onCmdLinkOpen);
 
-        /* Live-mirror s.rnsd.debug.only_local into the cached bool so
-         * toggling at runtime takes effect on the next announce. Also
-         * push the same flag into mR's Transport so its high-volume
-         * announce/path-request DEBUGFs demote to VERBOSE. */
-        RNS::Transport::demote_dbg(s_dbg_only_local);
-        storageSubscribeChanges("s.rnsd.debug.only_local",
-            [](const char* /*key*/, const char* val) {
-                s_dbg_only_local = val && val[0] && std::atoi(val) != 0;
-                RNS::Transport::demote_dbg(s_dbg_only_local);
-            });
     } catch (const std::exception& e) {
         err("Reticulum::start threw: %s", e.what());
     }
@@ -5725,7 +5760,6 @@ void RnsdService::onInit()
     if (storageGetInt("s.rnsd.version", 0) < RNSD_VERSION) {
         storageDefault("s.rnsd.remote_management", 1);      /* host rnstransport.remote.management */
         storageDefault("s.rnsd.respond_to_probes", 0);      /* host rnstransport.probe (PROVE_ALL) */
-        storageDefault("s.rnsd.debug.only_local", 0);       /* demote announce-traffic dbg to verb */
         storageDefault("s.rnsd.link.path_timeout_s", 30);   /* LR retry budget */
         /* `s.rnsd.path.max` / `s.rnsd.path.ttl` removed: mR's path table is
          * unbounded (BasicHeapStore), pruned only by PATHFINDER_E (24 h).
@@ -5734,7 +5768,6 @@ void RnsdService::onInit()
         storageSet("s.rnsd.version", RNSD_VERSION);
     }
 
-    s_dbg_only_local = storageGetInt("s.rnsd.debug.only_local", 0) != 0;
 
     cliRegisterCmd("rnsd",     cliRnsd);
     cliRegisterCmd("rnstatus", cliRnstatus);

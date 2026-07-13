@@ -38,21 +38,19 @@ using namespace RNS::Utilities;
 using namespace RNS::Persistence;
 
 /* Spangap: announce-processing and incoming-path-request DEBUGFs route
- * through this — when Transport::_demote_dbg is set (mirrors
- * `s.rnsd.debug.only_local`), they fire at VERBOSE instead of DEBUG.
- * The intent: every per-packet announce log (heard/rebroadcast/held/
- * dropped/replaced/now-N-hops-away) and every received-path-request log
- * (the request itself, dedup/tagless drops, not-answering decisions,
- * discovery/forwarding on behalf of others, no-path drops, waiting-PR
- * culls) is suppressible noise unless it concerns us.
- * The exceptions — kept at their normal level (DEBUGF/INFOF) so they are
- * never suppressed — are path requests that concern us, i.e. answered
- * path requests ("Answering path request ..." INFOFs, for a local
- * destination or a known path) and local-destination DATA hits. */
-#define DBGF_DEMOTE(...) \
-	do { if (Transport::demote_dbg()) VERBOSEF(__VA_ARGS__); else DEBUGF(__VA_ARGS__); } while (0)
-#define DBG_DEMOTE(msg) \
-	do { if (Transport::demote_dbg()) VERBOSE(msg); else DEBUG(msg); } while (0)
+ * through this and fire at VERBOSE, not DEBUG. Busy TCP peers deliver
+ * hundreds of announces and path requests — every per-packet announce log
+ * (heard/rebroadcast/held/dropped/replaced/now-N-hops-away) and every
+ * received-path-request log (the request itself, dedup/tagless drops,
+ * not-answering decisions, discovery/forwarding on behalf of others,
+ * no-path drops, waiting-PR culls) is other people's traffic, so debug
+ * level stays readable and surfaces only packets that involve this node.
+ * (This used to be switchable via `s.rnsd.debug.only_local`; the demotion
+ * is now unconditional.) The exception — kept at INFOF so it is never
+ * suppressed — is a path request answered for a destination local to this
+ * system, which does concern us. */
+#define DBGF_DEMOTE(...) VERBOSEF(__VA_ARGS__)
+#define DBG_DEMOTE(msg) VERBOSE(msg)
 
 #ifndef RNS_PATH_TABLE_MAX
 #define RNS_PATH_TABLE_MAX 100
@@ -112,7 +110,6 @@ using namespace RNS::Persistence;
 /*static*/ uint16_t Transport::_LOCAL_CLIENT_CACHE_MAXSIZE = 512;
 
 /*static*/ double Transport::_start_time				= 0.0;
-/*static*/ bool Transport::_demote_dbg					= false;
 /*static*/ bool Transport::_jobs_locked					= false;
 /*static*/ bool Transport::_jobs_running				= false;
 /*static*/ float Transport::_job_interval				= 0.250;
@@ -537,7 +534,9 @@ DestinationEntry empty_destination_entry;
 
 							new_packet.hops(announce_entry._hops);
 							if (announce_entry._block_rebroadcasts) {
-								INFOF("Sent requested route for %s to transport %s (hop count %d)",
+								/* Serving someone else's route request — verbose,
+								 * like the rest of the path-request processing. */
+								VERBOSEF("Sent requested route for %s to transport %s (hop count %d)",
 									announce_destination.hash().toHex().c_str(),
 									announce_entry._attached_interface ? announce_entry._attached_interface.toString().c_str() : "<all>",
 									new_packet.hops());
@@ -709,7 +708,7 @@ DestinationEntry empty_destination_entry;
 				 * interface hash yields a null receiving_interface, which
 				 * call sites handle.
 				 *
-				if (_demote_dbg) VERBOSE("Culling path table..."); else DEBUG("Culling path table...");
+				VERBOSE("Culling path table...");
 				try {
 					std::vector<Bytes> stale_paths;
 					stale_paths.reserve(_path_table.size());
@@ -3629,7 +3628,10 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 				DBGF_DEMOTE("Not answering path request for destination %s%s back out its own interface: path is %u hops, not a direct neighbor on that medium", destination_hash.toHex().c_str(), interface_str.c_str(), (unsigned)destination_entry._hops);
 			}
 			else {
-				INFOF("Answering path request for destination %s%s, path is known", destination_hash.toHex().c_str(), interface_str.c_str());
+				/* Transporting on behalf of others — verbose, like the rest
+				 * of the path-request processing. The local-destination case
+				 * above stays at INFOF: that one concerns this node. */
+				VERBOSEF("Answering path request for destination %s%s, path is known", destination_hash.toHex().c_str(), interface_str.c_str());
 
 				double now = OS::time();
 				uint8_t retries = Type::Transport::PATHFINDER_R;

@@ -165,12 +165,16 @@ Our deltas, by category:
 - **Tunable identity-cache size** — `RNS::Identity::known_destinations_maxsize` is
   driven by `s.rnsd.identity.cache_max` (default `1000`, ~200 KiB PSRAM). The
   generous default prevents cache eviction before probes conclude on a busy network.
-- **Log-demotion hook** — `RNS::Transport::demote_dbg(bool)` (wired from
-  `s.rnsd.debug.only_local`) routes the high-volume DEBUGFs in `Transport::inbound`/
-  `packet_filter`/`path_request` and `Identity::clean_known_destinations` through
-  `DBGF_DEMOTE`/`DBG_DEMOTE` macros that drop them to verbose when set — otherwise
-  announce traffic floods the log. A few DEBUGFs were also promoted to INFOF, plus
-  a diagnostic for "DATA arrived for a dest with no local destination."
+- **Announce/path-request logs are verbose** — the high-volume DEBUGFs in
+  `Transport::inbound`/`packet_filter`/`path_request` and
+  `Identity::clean_known_destinations` route through `DBGF_DEMOTE`/`DBG_DEMOTE`
+  macros that emit at verbose unconditionally — busy TCP peers deliver hundreds
+  of announces and route requests, and it's all other people's traffic. Same for
+  rnsd's own per-announce logger and the per-packet iface tx/rx wire log. The one
+  exception stays at INFOF: answering a path request for a destination local to
+  this system. (Formerly switchable via `s.rnsd.debug.only_local`; the knob is
+  gone.) A few DEBUGFs were also promoted to INFOF, plus a diagnostic for "DATA
+  arrived for a dest with no local destination."
 
 **Constraint we design around (not a patch)**
 
