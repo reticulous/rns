@@ -1106,6 +1106,26 @@ static const Bytes& ifac_salt() {
 	else {
 		TRACE("Transport::outbound: Path to destination is unknown");
 		bool stored_hash = false;
+		/* Fail-open link pin: only enforce the Link's interface pin if that
+		 * interface is actually among our current OUT interfaces. The pin is
+		 * packet.destination_link().attached_interface() == the interface the
+		 * link traffic arrived on, which can be a per-connection SPAWNED child
+		 * (a TCP-accepted socket, a shared-instance client) or a replaced impl
+		 * that never appears in _interfaces (keyed by name-hash) under that
+		 * name. Enforcing an unmatchable pin drops link DATA/PROOF on every
+		 * interface — a black hole. Broadcasting in that case restores delivery
+		 * (pre-pin behaviour) while keeping the restriction whenever the pin is
+		 * honorable. */
+		std::string link_pin;
+		bool link_pin_matchable = false;
+		if (packet.destination().type() == Type::Destination::LINK && packet.destination_link()) {
+			const Interface& link_iface = packet.destination_link().attached_interface();
+			if (link_iface) {
+				link_pin = link_iface.toString();
+				for (auto& [h2, if2] : _interfaces)
+					if (if2.OUT() && if2.toString() == link_pin) { link_pin_matchable = true; break; }
+			}
+		}
 		for (auto& [hash, interface] : _interfaces) {
 			TRACEF("Transport::outbound: Checking interface %s", interface.toString().c_str());
 			if (interface.OUT()) {
@@ -1125,8 +1145,7 @@ static const Bytes& ifac_salt() {
 					 * a new impl with the same name and must keep carrying the
 					 * link. No pin yet (pre-proof) → broadcast on all OUT
 					 * interfaces, as for any other unknown-path packet. */
-					const Interface& link_interface = packet.destination_link().attached_interface();
-					if (should_transmit && link_interface && interface.toString() != link_interface.toString()) {
+					if (should_transmit && link_pin_matchable && interface.toString() != link_pin) {
 						TRACE("Transport::outbound: Interface is not the link's attached interface, not transmitting");
 						should_transmit = false;
 					}

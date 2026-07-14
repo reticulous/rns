@@ -458,11 +458,13 @@ static TickType_t       s_rnsd_last_announce_tick = 0;
 static void publishIfaceUp(const iface_t& i)
 {
     char key[80];
+    storageBegin();
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.up", i.info.name);          storageSet(key, 1);
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.mtu", i.info.name);         storageSet(key, (int)i.info.mtu);
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.bitrate", i.info.name);     storageSet(key, (int)i.info.bitrate);
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.mode", i.info.name);        storageSet(key, mode_name(i.info.mode));
     storageSet("rnsd.iface_event_seq", ++s_iface_event_seq);
+    storageEnd();
     /* If we're hosting any rnsd-side destination (management and/or
      * probe), (re)arm the announce debounce. Same 10 s rate-limit
      * shape as lxmf's. */
@@ -3542,8 +3544,10 @@ static void linkStartOutboundResource(link_conn_t& c, void* buf,
         c.res_outbound = true;
         c.res_opaque   = opaque;
         char k[96];
+        storageBegin();
         linkKey(c, "resource.state", k, sizeof(k)); storageSet(k, "sending");
         linkKey(c, "resource.size",  k, sizeof(k)); storageSet(k, (int)reqlen);
+        storageEnd();
         info("link[%s]: sending %uB resource (opaque=%u)",
              c.tag, (unsigned)reqlen, (unsigned)opaque);
     } catch (const std::exception& e) {
@@ -3565,6 +3569,7 @@ static void onLinkEstablishedCb(RNS::Link& link)
     info("link[%s]: ACTIVE link_id=%s mtu=%u rtt=%.3fs",
          c->tag, lid.c_str(), (unsigned)link.get_mtu(), link.rtt());
 
+    storageBegin();
     linkSetStr(*c, "link_id", lid.c_str());
     linkSetInt(*c, "mtu", (int)link.get_mtu());
     linkSetInt(*c, "rtt_ms", (int)(link.rtt() * 1000.0));
@@ -3580,6 +3585,7 @@ static void onLinkEstablishedCb(RNS::Link& link)
         snprintf(k, sizeof(k), "rnsd.links.byid.%s", lid.c_str());
         storageSet(k, c->tag);
     }
+    storageEnd();
 
     /* Flush the one-packet pre-active outbox. */
     if (c->pend_used) {
@@ -3587,8 +3593,10 @@ static void onLinkEstablishedCb(RNS::Link& link)
             RNS::Packet pkt(c->link,
                             RNS::Bytes(c->pend_bytes.data(), c->pend_bytes.size()));
             linkTrackTxReceipt(*c, pkt.send());
+            storageBegin();
             linkSetInt(*c, "tx_packets", 1);
             linkSetInt(*c, "last_outbound_s", (int)RNS::Utilities::OS::time());
+            storageEnd();
             info("link[%s]: flushed queued %zuB on establish",
                  c->tag, c->pend_bytes.size());
         } catch (const std::exception& e) {
@@ -3631,11 +3639,13 @@ static void onLinkClosedCb(RNS::Link& link)
     info("link[%s]: CLOSED reason=%s", c->tag, tdrName(reason));
     c->state   = LST_CLOSED;
     c->dead_at = RNS::Utilities::OS::time();
+    storageBegin();
     if (reason == (unsigned)RNS::Type::Link::TIMEOUT)
         linkSetError(*c, "timeout");
     else if (reason == (unsigned)RNS::Type::Link::DESTINATION_CLOSED)
         linkSetError(*c, "remote_closed");
     linkPublishState(*c);
+    storageEnd();
     /* Release the mR wrapper now; slot + storage tree are reclaimed
      * after a short grace window by linkTick so subscribers observe
      * the "closed" transition first. */
@@ -3698,9 +3708,11 @@ static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packe
     if (s_prove_incoming)
         const_cast<RNS::Packet&>(packet).prove();
     char k[96];
+    storageBegin();
     linkKey(*c, "rx_packets", k, sizeof(k));
     storageSet(k, storageGetInt(k, 0) + 1);
     linkSetInt(*c, "last_inbound_s", (int)RNS::Utilities::OS::time());
+    storageEnd();
 }
 
 /* ─────────────── Resource transfer ───────────────
@@ -3796,9 +3808,11 @@ static bool onResAdvertised(const RNS::ResourceAdvertisement& adv)
     c->res_outbound = false;
     c->res_opaque   = 0;
     char k[96];
+    storageBegin();
     linkKey(*c, "resource.state", k, sizeof(k)); storageSet(k, "receiving");
     linkKey(*c, "resource.size",  k, sizeof(k)); storageSet(k, (int)adv.d);
     linkKey(*c, "resource.parts", k, sizeof(k)); storageSet(k, (int)adv.n);
+    storageEnd();
     info("link[%s]: accepting resource %uB (%u parts)",
          c->tag, (unsigned)adv.d, (unsigned)adv.n);
     return true;
@@ -4021,8 +4035,10 @@ static void linkStartRequest(link_conn_t& c, const std::string& path,
         c.req_deadline = RNS::Utilities::OS::time() + timeout + 5.0;
         linkTouch(c);
         char k[96];
+        storageBegin();
         linkKey(c, "request.path", k, sizeof(k));  storageSet(k, path.c_str());
         linkKey(c, "request.state", k, sizeof(k)); storageSet(k, "sent");
+        storageEnd();
         info("link[%s]: request '%s' sent (cid=%u, req_id=%s)",
              c.tag, path.c_str(), (unsigned)cid, c.req_mrid.toHex().c_str());
     } catch (const std::exception& e) {
@@ -4041,8 +4057,10 @@ static bool linkKickoff(link_conn_t& c)
     RNS::Identity local{RNS::Type::NONE};
     if (!linkLoadIdentity(c.identity_key, local)) {
         c.state = LST_FAILED;
+        storageBegin();
         linkSetError(c, "no_identity");
         linkPublishState(c);
+        storageEnd();
         return true;   /* terminal — caller stops retrying */
     }
 
@@ -4066,8 +4084,10 @@ static bool linkKickoff(link_conn_t& c)
                  c.tag, c.aspect.c_str(), c.dest_hash.toHex().c_str(),
                  out_dest.hash().toHex().c_str());
             c.state = LST_FAILED;
+            storageBegin();
             linkSetError(c, "aspect_mismatch");
             linkPublishState(c);
+            storageEnd();
             return true;   /* terminal — caller stops retrying */
         }
         c.link = RNS::Link(out_dest);
@@ -4107,8 +4127,10 @@ static bool linkKickoff(link_conn_t& c)
     } catch (const std::exception& e) {
         warn("link[%s]: kickoff threw: %s", c.tag, e.what());
         c.state = LST_FAILED;
+        storageBegin();
         linkSetError(c, "ctor_threw");
         linkPublishState(c);
+        storageEnd();
     }
     return true;
 }
@@ -4220,8 +4242,10 @@ static void linkTick(void)
             } else if (now >= c.path_deadline) {
                 warn("link[%s]: no path within budget", c.tag);
                 c.state = LST_FAILED;
+                storageBegin();
                 linkSetError(c, "no_path");
                 linkPublishState(c);
+                storageEnd();
                 c.dead_at = now;
             }
             break;
@@ -4232,8 +4256,10 @@ static void linkTick(void)
                 try { if (c.link) c.link.teardown(); } catch (...) {}
                 c.link = RNS::Link{RNS::Type::NONE};
                 c.state = LST_FAILED;
+                storageBegin();
                 linkSetError(c, "establish_timeout");
                 linkPublishState(c);
+                storageEnd();
                 c.dead_at = now;
             }
             break;
@@ -4321,11 +4347,13 @@ static int onLinkConnect(int handle, const void* data, size_t len)
 
     /* Initial state tree. storageSet (not Default) so the browser /
      * consumer subscribers fire on every field. */
+    storageBegin();
     linkSetStr(*c, "direction", "out");
     linkSetStr(*c, "aspect", c->aspect.c_str());
     linkSetStr(*c, "remote_hash", c->dest_hash.toHex().c_str());
     linkSetInt(*c, "opened_s", (int)c->opened_at);
     linkSetStr(*c, "last_error", "");
+    storageEnd();
 
     /* Require BOTH a path and a recallable identity before establishing (mirrors
      * chanConnect): a cached identity alone (recall() true) does not mean the
@@ -4371,9 +4399,11 @@ static void onLinkRecv(int handle, size_t /*bytesAvail*/)
             linkTrackTxReceipt(*c, pkt.send());
             linkTouch(*c);
             char k[96];
+            storageBegin();
             linkKey(*c, "tx_packets", k, sizeof(k));
             storageSet(k, storageGetInt(k, 0) + 1);
             linkSetInt(*c, "last_outbound_s", (int)RNS::Utilities::OS::time());
+            storageEnd();
         } catch (const std::exception& e) {
             warn("link[%s]: send threw: %s", c->tag, e.what());
             linkSetError(*c, "send_threw");
@@ -4615,6 +4645,7 @@ static void onIncomingLinkEstablished(RNS::Link& link)
         if (ri) rid = ri.hash();
     }
 
+    storageBegin();
     linkSetStr(*c, "direction", "in");
     linkSetStr(*c, "aspect", c->aspect.c_str());
     linkSetStr(*c, "local_hash", local.toHex().c_str());
@@ -4641,6 +4672,7 @@ static void onIncomingLinkEstablished(RNS::Link& link)
         snprintf(k, sizeof(k), "rnsd.links.byid.%s", lid.c_str());
         storageSet(k, c->tag);
     }
+    storageEnd();
 
     rnsd_link_incoming_t pl = {};
     safeStrncpy(pl.tag, c->tag, sizeof(pl.tag));
@@ -4802,6 +4834,7 @@ static void onChanLinkEstablishedCb(RNS::Link& link) {
     chanTouch(*c);
     c->channel = link.get_channel();
     c->channel.set_receive_callback(onChannelMsgCb, c);
+    storageBegin();
     chanSetStr(*c, "link_id", link.link_id().toHex().c_str());
     chanSetInt(*c, "mtu", (int)link.get_mtu());
     chanSetInt(*c, "rtt_ms", (int)(link.rtt() * 1000.0));
@@ -4813,6 +4846,7 @@ static void onChanLinkEstablishedCb(RNS::Link& link) {
         snprintf(k, sizeof(k), "rnsd.chan.byid.%s", link.link_id().toHex().c_str());
         storageSet(k, c->tag);
     }
+    storageEnd();
     info("chan[%s]: ACTIVE link_id=%s mtu=%u", c->tag,
          link.link_id().toHex().c_str(), (unsigned)link.get_mtu());
     chanFlushOutbox(*c);
@@ -4823,12 +4857,14 @@ static void onChanLinkClosedCb(RNS::Link& link) {
     if (!c) return;
     c->state = LST_CLOSED;
     c->dead_at = RNS::Utilities::OS::time();
+    storageBegin();
     switch (link.teardown_reason()) {
         case RNS::Type::Link::TIMEOUT:            chanSetError(*c, "timeout"); break;
         case RNS::Type::Link::DESTINATION_CLOSED: chanSetError(*c, "remote_closed"); break;
         default: break;
     }
     chanPublishState(*c);
+    storageEnd();
     c->channel = RNS::Channel{RNS::Type::NONE};
     c->link    = RNS::Link{RNS::Type::NONE};
 }
@@ -4912,11 +4948,13 @@ static int onChannelConnect(int handle, const void* data, size_t len) {
                                          : storageGetInt("s.rnsd.link.path_timeout_s", 30);
     c->path_deadline = c->opened_at + path_to_s;
 
+    storageBegin();
     chanSetStr(*c, "direction", "out");
     chanSetStr(*c, "aspect", c->aspect.c_str());
     chanSetStr(*c, "remote_hash", c->dest_hash.toHex().c_str());
     chanSetInt(*c, "opened_s", (int)c->opened_at);
     chanSetStr(*c, "last_error", "");
+    storageEnd();
 
     /* Require BOTH a path and a recallable identity before establishing — a
      * cached identity alone (recall() true) does not mean the path table still
@@ -5004,6 +5042,7 @@ static void onIncomingChannelEstablished(RNS::Link& link) {
     RNS::Bytes rid;
     { const RNS::Identity& ri = link.get_remote_identity(); if (ri) rid = ri.hash(); }
 
+    storageBegin();
     chanSetStr(*c, "direction", "in");
     chanSetStr(*c, "aspect", c->aspect.c_str());
     chanSetStr(*c, "local_hash", local.toHex().c_str());
@@ -5015,6 +5054,7 @@ static void onIncomingChannelEstablished(RNS::Link& link) {
     chanSetStr(*c, "last_error", "");
     chanPublishState(*c);
     { char k[96]; snprintf(k, sizeof(k), "rnsd.chan.byid.%s", lid.c_str()); storageSet(k, c->tag); }
+    storageEnd();
 
     rnsd_link_incoming_t pl = {};
     safeStrncpy(pl.tag, c->tag, sizeof(pl.tag));
@@ -5418,8 +5458,10 @@ static void rnsdTaskMain(void*)
     if (storageGetInt("s.rnsd.enable", 1) == 0) {
         warn("[%s] s.rnsd.enable=0 — RNS disabled; mesh not started "
              "(set s.rnsd.enable=1 and reboot to enable)", TAG);
+        storageBegin();
         storageSet("rnsd.up", 0);
         storageSet("rnsd.enabled", 0);
+        storageEnd();
         for (;;) vTaskDelay(portMAX_DELAY);
     }
 
@@ -5525,9 +5567,11 @@ static void rnsdTaskMain(void*)
     itsServerOnRecv(RNSD_PORT_CHANNEL,       onChannelRecv);
 
     loadOrCreateIdentity();
+    storageBegin();
     storageSet("rnsd.up", 1);
     storageSet("rnsd.enabled", 1);
     if (s_identity) storageSet("rnsd.identity_hash", s_identity->hexhash().c_str());
+    storageEnd();
 
     /* ── Boot barrier: publish rns.ready (ephemeral) ─────────────────────────
      * rnsd's ports are open now, but the whole RNS universe stays quiet until
@@ -5758,6 +5802,7 @@ void RnsdService::onInit()
 
     /* One-time storage defaults gated on version. */
     if (storageGetInt("s.rnsd.version", 0) < RNSD_VERSION) {
+        storageBegin();
         storageDefault("s.rnsd.remote_management", 1);      /* host rnstransport.remote.management */
         storageDefault("s.rnsd.respond_to_probes", 0);      /* host rnstransport.probe (PROVE_ALL) */
         storageDefault("s.rnsd.link.path_timeout_s", 30);   /* LR retry budget */
@@ -5766,6 +5811,7 @@ void RnsdService::onInit()
          * Re-add when we implement post-process pruning or interface-mode
          * intake control. */
         storageSet("s.rnsd.version", RNSD_VERSION);
+        storageEnd();
     }
 
 
