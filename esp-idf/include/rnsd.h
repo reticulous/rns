@@ -104,6 +104,15 @@ void rnsdIdentityErase(const char* identity_key);
 bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                       uint8_t out_pubkey[RNSD_PUBKEY_LEN]);
 
+/** Recall the last-heard announce app_data for a destination from the
+ *  same identity cache. Copies up to `*inout_len` bytes into `out` and
+ *  writes the actual length back to `*inout_len`. Returns false if the
+ *  destination is unknown, carried no app_data, or the payload exceeds
+ *  the supplied buffer. Same mutex/threading guarantees as
+ *  rnsdRecallPubkey. app_data is opaque here — the consumer parses it. */
+bool rnsdRecallAppData(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+                       uint8_t* out, size_t* inout_len);
+
 /** Issue an async path request for `dest_hash`. Writes a storage
  *  sentinel; rnsd's task processes it (mR's Transport::request_path
  *  must run on the task that owns Transport state, otherwise the

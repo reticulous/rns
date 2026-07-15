@@ -2776,6 +2776,23 @@ bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
     }
 }
 
+bool rnsdRecallAppData(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+                       uint8_t* out, size_t* inout_len)
+{
+    if (!out || !inout_len) return false;
+    try {
+        RNS::Bytes ad = RNS::Identity::recall_app_data(
+            RNS::Bytes(dest_hash, RNSD_DEST_HASH_LEN));
+        if (ad.size() == 0 || ad.size() > *inout_len) return false;
+        std::memcpy(out, ad.data(), ad.size());
+        *inout_len = ad.size();
+        return true;
+    } catch (const std::exception& e) {
+        warn("rnsdRecallAppData: %s", e.what());
+        return false;
+    }
+}
+
 void rnsdRequestPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN])
 {
     /* Write a self-clearing sentinel; rnsd's task picks it up via
