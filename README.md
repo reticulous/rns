@@ -206,8 +206,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.identity.cache_max` | `1000` | Known-destination (identity) cache capacity (`Identity::known_destinations_maxsize`). |
 | `s.rnsd.jobs_interval_ms` | `250` | Transport `jobs()` cadence, milliseconds (`Transport::job_interval`). |
 | `s.rnsd.cull_interval_s` | `60` | Table-cull cadence, seconds (`Transport::tables_cull_interval`). |
-| `s.rnsd.remote_management` | `1` | Host the `rnstransport.remote.management` destination. |
-| `s.rnsd.respond_to_probes` | `0` | Host `rnstransport.probe` and answer probes (PROVE_ALL). |
+| `s.rnsd.respond_to_probes` | `1` | Host `rnstransport.probe` and answer probes (PROVE_ALL). |
 | `s.rnsd.prove_incoming` | `1` | Emit delivery proofs for inbound packets we receive. |
 | `s.rnsd.proof_timeout_s` | `60` | Deadline for an outbound delivery-proof receipt. |
 | `s.rnsd.link.path_timeout_s` | `30` | Path-request / link-request retry budget. |

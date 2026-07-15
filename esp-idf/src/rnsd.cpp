@@ -73,7 +73,7 @@ static const char* TAG = "rnsd";
 
 static std::string formatAnnounceAppData(const RNS::Bytes& app_data);
 
-#define RNSD_VERSION 1
+#define RNSD_VERSION 2
 
 /* Up to N concurrent registered interfaces. Each TCP peer is its
  * own iface, so this caps total interfaces (lora + auto + espnow + N tcp). */
@@ -428,28 +428,18 @@ void TaskInterface::send_outgoing(const RNS::Bytes& data)
  * (or just react), never by absolute value. */
 static int s_iface_event_seq = 0;
 
-/* ─────────────── remote-management announce ───────────────
+/* ─────────────── probe responder ───────────────
  *
- * Conventional Reticulum probe endpoint on aspect
- * `rnstransport.remote.management`, hosted on this node's transport
- * identity. Construct + register with Transport when
- * `s.rnsd.remote_management != 0`; deregister when flipped off. Same
- * 10 s debounce-after-iface-up + periodic schedule as lxmf's
- * announces.
+ * When `s.rnsd.respond_to_probes != 0` we host an IN/SINGLE
+ * destination at aspect `rnstransport.probe` with accepts_links(false)
+ * + PROVE_ALL — same shape as upstream rnsd. mR auto-proves every DATA
+ * packet that reaches the destination, so `rnprobe` from a peer
+ * round-trips at the protocol level (no application code involved).
  *
  * State lives here (above publishIfaceUp) so the iface-up debounce
  * arm fits inline; the helpers (Up/Down/sendAnnounce) are defined
- * lower alongside the rest of the protocol plumbing.
- *
- * No packet callback yet — inbound probes silently land at the
- * destination and get dropped. Probe-reply is a separate change. */
-static RNS::Destination s_management_dest{RNS::Type::NONE};
-/* Probe responder. When `s.rnsd.respond_to_probes != 0` we host an
- * IN/SINGLE destination at aspect `rnstransport.probe` with
- * accepts_links(false) + PROVE_ALL — same shape as upstream rnsd. mR
- * auto-proves every DATA packet that reaches the destination, so
- * `rnprobe` from a peer round-trips at the protocol level (no
- * application code involved). */
+ * lower alongside the rest of the protocol plumbing. Same 10 s
+ * debounce-after-iface-up + periodic schedule as lxmf's announces. */
 static RNS::Destination s_probe_dest{RNS::Type::NONE};
 static TickType_t       s_rnsd_announce_due_tick  = 0;
 static TickType_t       s_rnsd_last_announce_tick = 0;
@@ -465,10 +455,9 @@ static void publishIfaceUp(const iface_t& i)
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.mode", i.info.name);        storageSet(key, mode_name(i.info.mode));
     storageSet("rnsd.iface_event_seq", ++s_iface_event_seq);
     storageEnd();
-    /* If we're hosting any rnsd-side destination (management and/or
-     * probe), (re)arm the announce debounce. Same 10 s rate-limit
-     * shape as lxmf's. */
-    if (s_management_dest || s_probe_dest) {
+    /* If we're hosting the probe destination, (re)arm the announce
+     * debounce. Same 10 s rate-limit shape as lxmf's. */
+    if (s_probe_dest) {
         s_rnsd_announce_due_tick = xTaskGetTickCount() +
             pdMS_TO_TICKS(RNSD_ANNOUNCE_DEBOUNCE_MS);
     }
@@ -1519,7 +1508,7 @@ static std::string appDataMsgPack(const RNS::Bytes& app_data) {
  *   - otherwise                                  → "(NB)=\"<printable>\""
  *
  * Used by both incoming announces (AnnounceDebugLogger) and outgoing
- * announces (our-dest ANNOUNCE / management dest) so they format the
+ * announces (our-dest ANNOUNCE / probe dest) so they format the
  * same way. Returns a self-contained suffix; callers prepend whatever
  * destination/identity/hops context they have. */
 static std::string formatAnnounceAppData(const RNS::Bytes& app_data)
@@ -1677,65 +1666,6 @@ public:
 };
 
 static std::shared_ptr<AnnounceFanout> s_announce_fanout;
-
-static void rnsdManagementDestUp(void)
-{
-    if (s_management_dest) return;   /* already up */
-    if (!s_identity)       return;
-    try {
-        s_management_dest = RNS::Destination(*s_identity,
-            RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE,
-            "rnstransport", "remote.management");
-        /* Refuse Link requests until we port register_request_handler
-         * and know how to service them. */
-        s_management_dest.accepts_links(false);
-        info("management dest up: %s",
-             s_management_dest.hash().toHex().c_str());
-        /* Arm the debounce so the announce goes out after the usual
-         * iface-settling window — covers the boot case where ifaces
-         * came up before we ran this. */
-        s_rnsd_announce_due_tick = xTaskGetTickCount() +
-            pdMS_TO_TICKS(RNSD_ANNOUNCE_DEBOUNCE_MS);
-    } catch (const std::exception& e) {
-        err("management dest construct threw: %s", e.what());
-    }
-}
-
-static void rnsdManagementDestDown(void)
-{
-    if (!s_management_dest) return;
-    try { RNS::Transport::deregister_destination(s_management_dest); }
-    catch (const std::exception& e) { warn("deregister_destination threw: %s", e.what()); }
-    s_management_dest = RNS::Destination(RNS::Type::NONE);
-    /* Don't zero the shared announce ticks here — probe may still be
-     * up and needing them. The scheduling loop guards on dest presence. */
-    info("management dest down");
-}
-
-static void sendManagementAnnounce(void)
-{
-    if (!s_management_dest) return;
-    try {
-        RNS::Bytes empty;
-        s_management_dest.announce(empty, /*path_response=*/false);
-        TickType_t t = xTaskGetTickCount();
-        s_rnsd_last_announce_tick = (t == 0) ? 1 : t;  /* 0 = never */
-        info("announced %s aspect=rnstransport.remote.management app_data %s",
-             s_management_dest.hash().toHex().c_str(),
-             formatAnnounceAppData(empty).c_str());
-    } catch (const std::exception& e) {
-        err("management announce threw: %s", e.what());
-    }
-}
-
-/* Subscriber callback: s.rnsd.remote_management flipped. Runs on the
- * rnsd task (subscriptions dispatch on the registering task). */
-static void onRemoteManagementChange(const char* /*key*/, const char* val)
-{
-    bool enabled = val && std::atoi(val) != 0;
-    if (enabled) rnsdManagementDestUp();
-    else         rnsdManagementDestDown();
-}
 
 static void rnsdProbeDestUp(void)
 {
@@ -5677,18 +5607,12 @@ static void rnsdTaskMain(void*)
         s_announce_fanout = std::make_shared<AnnounceFanout>();
         RNS::Transport::register_announce_handler(s_announce_fanout);
 
-        /* Bring up the management destination if enabled, and subscribe
-         * for runtime flips of the gate. The subscriber callback runs
-         * on the rnsd task (storage subs dispatch on the registering
-         * task), which is where mR state must be touched. */
-        if (storageGetInt("s.rnsd.remote_management", 1))
-            rnsdManagementDestUp();
-        storageSubscribeChanges("s.rnsd.remote_management",
-                                onRemoteManagementChange);
-
-        /* Probe responder. Same lifecycle pattern as the management
-         * dest, gated by s.rnsd.respond_to_probes (default 0 — opt-in). */
-        if (storageGetInt("s.rnsd.respond_to_probes", 0))
+        /* Probe responder, gated by s.rnsd.respond_to_probes (default
+         * 1). Bring it up if enabled and subscribe for runtime flips of
+         * the gate. The subscriber callback runs on the rnsd task
+         * (storage subs dispatch on the registering task), which is
+         * where mR state must be touched. */
+        if (storageGetInt("s.rnsd.respond_to_probes", 1))
             rnsdProbeDestUp();
         storageSubscribeChanges("s.rnsd.respond_to_probes",
                                 onRespondToProbesChange);
@@ -5756,16 +5680,15 @@ static void rnsdTaskMain(void*)
                 channelTick();
 
                 /* Rnsd-hosted announces — debounce fire + periodic check.
-                 * Each sendX() is a no-op when its destination is down,
-                 * so flipping mgmt/probe at runtime works cleanly. Cheap
+                 * sendProbeAnnounce() is a no-op when the destination is
+                 * down, so flipping probe at runtime works cleanly. Cheap
                  * either way (tick compare + maybe an mR announce). */
                 if (s_rnsd_announce_due_tick != 0 &&
                     (int32_t)(now - s_rnsd_announce_due_tick) >= 0) {
                     s_rnsd_announce_due_tick = 0;
-                    sendManagementAnnounce();
                     sendProbeAnnounce();
                 }
-                if ((s_management_dest || s_probe_dest) &&
+                if (s_probe_dest &&
                     s_rnsd_last_announce_tick != 0) {
                     int announce_s = storageGetInt("s.rnsd.announce.interval", 1800);
                     /* Signed comparison: the sendX() helpers re-read
@@ -5778,7 +5701,6 @@ static void rnsdTaskMain(void*)
                     if (announce_s > 0 &&
                         (int32_t)(now - s_rnsd_last_announce_tick) >=
                             (int32_t)pdMS_TO_TICKS(announce_s * 1000)) {
-                        sendManagementAnnounce();
                         sendProbeAnnounce();
                     }
                 }
@@ -5801,15 +5723,24 @@ void RnsdService::onInit()
     for (auto& s : s_announce_subs) { s.used = false; s.handle = -1; s.aspect[0] = '\0'; }
 
     /* One-time storage defaults gated on version. */
-    if (storageGetInt("s.rnsd.version", 0) < RNSD_VERSION) {
+    int prev_version = storageGetInt("s.rnsd.version", 0);
+    if (prev_version < RNSD_VERSION) {
         storageBegin();
-        storageDefault("s.rnsd.remote_management", 1);      /* host rnstransport.remote.management */
-        storageDefault("s.rnsd.respond_to_probes", 0);      /* host rnstransport.probe (PROVE_ALL) */
+        storageDefault("s.rnsd.respond_to_probes", 1);      /* host rnstransport.probe (PROVE_ALL) */
         storageDefault("s.rnsd.link.path_timeout_s", 30);   /* LR retry budget */
         /* `s.rnsd.path.max` / `s.rnsd.path.ttl` removed: mR's path table is
          * unbounded (BasicHeapStore), pruned only by PATHFINDER_E (24 h).
          * Re-add when we implement post-process pruning or interface-mode
          * intake control. */
+        /* v1→v2: rnstransport.remote.management was never implemented
+         * (announced an endpoint that dropped every packet), so it's
+         * gone. Drop its orphaned gate, and promote the probe responder
+         * to on-by-default — v1 devices stored respond_to_probes=0, so
+         * force the flip rather than leaving the stale value. */
+        if (prev_version >= 1 && prev_version < 2) {
+            storageUnset("s.rnsd.remote_management");
+            storageSet("s.rnsd.respond_to_probes", 1);
+        }
         storageSet("s.rnsd.version", RNSD_VERSION);
         storageEnd();
     }

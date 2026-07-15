@@ -218,9 +218,8 @@ Our deltas, by category:
 
 One FreeRTOS task, **core 0, prio 2, 12 KB PSRAM stack**. It owns µR's
 `Reticulum` + `Transport`, the interface table, the hosted-destination (our-dest)
-ports, the announce fan-out, the link slots, the management destination
-(`rnstransport.remote.management`), and the optional probe responder
-(`rnstransport.probe`, gated on `s.rnsd.respond_to_probes`).
+ports, the announce fan-out, the link slots, and the probe responder
+(`rnstransport.probe`, gated on `s.rnsd.respond_to_probes`, default on).
 
 **Threading rule that governs everything:** µR's Transport/Link/Identity state
 is single-task-owned. Anything that mutates it — `Transport::request_path`,
@@ -571,11 +570,12 @@ auto-create an application identity at boot — that is the app's call.
   spangap's log *macros* corrupt them. `rnsd.cpp` `#pragma push_macro` + `#undef`s
   each name around the µR includes, then `pop_macro`s. Replicate it in any file
   that mixes the two.
-- **We host `rnstransport.remote.management` but don't service its requests yet.**
-  It's announced and accepts links, but has no request handler (pending a
-  `register_request_handler` port), so `rnstatus -R` / `rnpath -R` *against this
-  node* don't work — µR's `Link::handle_request` returns one opaque `bin`, while
-  upstream expects an inline `[stats-dict, link_count]`.
+- **No remote-management endpoint.** Upstream rnsd hosts
+  `rnstransport.remote.management` so `rnstatus -R` / `rnpath -R` can query a node
+  remotely; we don't. Servicing it needs a `register_request_handler` port plus a
+  reply shaped as upstream's inline `[stats-dict, link_count]` (µR's
+  `Link::handle_request` returns one opaque `bin`). Until then we don't announce
+  the aspect at all, rather than advertising an endpoint that drops every request.
 
 ## 9. Browser UI
 
