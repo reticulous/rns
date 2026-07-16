@@ -390,6 +390,7 @@ void Link::validate_proof(const Packet& packet) {
 					_object->_status = Type::Link::ACTIVE;
 					_object->_activated_at = OS::time();
 					_object->_last_proof = _object->_activated_at;
+					update_keepalive();
 					Transport::activate_link(*this);
 					VERBOSEF("Link %s established with %s, RTT is %.3f s", toString().c_str(), _object->_destination.toString().c_str(), OS::round(_object->_rtt, 3));
 					
@@ -567,6 +568,7 @@ void Link::rtt_packet(const Packet& packet) {
 			_object->_rtt = std::max(measured_rtt, rtt);
 			_object->_status = Type::Link::ACTIVE;
 			_object->_activated_at = OS::time();
+			update_keepalive();
 
 			//p if _object->_rtt != None and _object->_establishment_cost != None and _object->_rtt > 0 and _object->_establishment_cost > 0:
 			if (_object->_rtt != 0.0 && _object->_establishment_cost != 0.0 && _object->_rtt > 0 and _object->_establishment_cost > 0) {
@@ -806,11 +808,61 @@ void Link::link_closed() {
 	}
 }
 
-// CBA TODO Implement watchdog
+// The per-link watchdog is poll-driven, not threaded: Transport::jobs calls
+// link_watchdog() on each active link (beside resource_watchdogs()). This
+// stub stays as the establishment-time hook so call sites match upstream.
 void Link::start_watchdog() {
 	//z thread = threading.Thread(target=_object->___watchdog_job)
 	//z thread.daemon = True
 	//z thread.start()
+}
+
+// Poll-driven port of __watchdog_job's ACTIVE/STALE phases (upstream runs
+// one thread per link and sleeps between checks; here Transport::jobs calls
+// this once per active link). PENDING/HANDSHAKE establishment timeouts are
+// enforced by Transport::jobs' half-open reap, so this covers only the
+// steady-state phases:
+//
+//   - The initiator sends a keepalive (0xFF) once no inbound traffic has
+//     been seen for KEEPALIVE seconds; the responder answers with 0xFE
+//     (Link::receive), refreshing the initiator's _last_inbound. The
+//     responder never originates keepalives — it only watches for silence.
+//   - Either side that sees no inbound for STALE_TIME marks the link STALE
+//     and (initiator) sends a final keepalive, then tears the link down
+//     after an RTT-scaled grace if still silent. Any inbound packet flips
+//     STALE back to ACTIVE in Link::receive.
+void Link::link_watchdog() {
+	assert(_object);
+	const double now = OS::time();
+
+	if (_object->_status == Type::Link::ACTIVE) {
+		double last_inbound = std::max(std::max(_object->_last_inbound, _object->_last_proof),
+		                               _object->_activated_at);
+
+		if (now >= last_inbound + _object->_keepalive) {
+			// A silent peer never advances _last_inbound and an outbound
+			// keepalive does not refresh our own inbound clock, so gate on
+			// _last_keepalive to emit at most one keepalive per interval.
+			if (_object->_initiator && now >= _object->_last_keepalive + _object->_keepalive) {
+				send_keepalive();
+				_object->_last_keepalive = now;
+			}
+
+			if (now >= last_inbound + _object->_stale_time) {
+				_object->_stale_deadline = now
+					+ _object->_rtt * _object->_keepalive_timeout_factor
+					+ Type::Link::STALE_GRACE;
+				_object->_status = Type::Link::STALE;
+			}
+		}
+	}
+	else if (_object->_status == Type::Link::STALE) {
+		if (now >= _object->_stale_deadline) {
+			_object->_status = Type::Link::CLOSED;
+			_object->_teardown_reason = Type::Link::TIMEOUT;
+			link_closed();
+		}
+	}
 }
 
 /*p TODO
@@ -886,6 +938,23 @@ void Link::__watchdog_job() {
 			sleep(sleep_time)
 
 */
+
+// Adapt the keepalive/stale intervals to the measured RTT (upstream
+// __update_keepalive), called wherever _rtt is established — the initiator's
+// LRPROOF validation and the responder's RTT packet. The effective interval
+// scales linearly with RTT (reaching KEEPALIVE_MAX at KEEPALIVE_MAX_RTT) and
+// is clamped to [KEEPALIVE_MIN, KEEPALIVE_MAX]; stale_time follows at
+// STALE_FACTOR x keepalive. Without this both stay at the fixed 360/720 s
+// defaults, so on a fast link a peer-as-responder — which derives its own
+// stale_time from RTT — would reap the link long before our keepalive fired.
+void Link::update_keepalive() {
+	assert(_object);
+	double ka = _object->_rtt * ((double)Type::Link::KEEPALIVE_MAX / Type::Link::KEEPALIVE_MAX_RTT);
+	if (ka > Type::Link::KEEPALIVE_MAX) ka = Type::Link::KEEPALIVE_MAX;
+	if (ka < Type::Link::KEEPALIVE_MIN) ka = Type::Link::KEEPALIVE_MIN;
+	_object->_keepalive  = (uint16_t)ka;
+	_object->_stale_time = (uint16_t)(_object->_keepalive * Type::Link::STALE_FACTOR);
+}
 
 void Link::send_keepalive() {
 	assert(_object);

@@ -221,6 +221,8 @@ namespace RNS {
 		void link_closed();
 		void start_watchdog();
 		void __watchdog_job();
+		void link_watchdog();
+		void update_keepalive();
 		void send_keepalive();
 		void handle_request(const Bytes& request_id, const ResourceRequest& unpacked_request);
 		void handle_response(const Bytes& request_id, const Bytes& response_data, size_t response_size, size_t response_transfer_size);

@@ -422,12 +422,12 @@ DestinationEntry empty_destination_entry;
 					/* Spangap: reap a half-open link. Recipient Links enter _active_links
 					 * at HANDSHAKE (register_link) and only reach ACTIVE when the
 					 * initiator's RTT packet arrives and fires the establishment callback
-					 * that wires the packet callback. With the per-link watchdog disabled,
-					 * such a Link would otherwise live here forever and Link::receive would
-					 * keep decrypting-and-dropping (now un-proved) its data. Enforce the
-					 * establishment timeout the watchdog used to: teardown() sends a
-					 * LINKCLOSE for a HANDSHAKE link so the initiator drops its side and the
-					 * next send re-establishes cleanly. */
+					 * that wires the packet callback. link_watchdog() covers only the
+					 * ACTIVE/STALE phases, so establishment timeouts are enforced here:
+					 * without this a stuck HANDSHAKE Link would live forever and
+					 * Link::receive would keep decrypting-and-dropping (now un-proved)
+					 * its data. teardown() sends a LINKCLOSE for a HANDSHAKE link so the
+					 * initiator drops its side and the next send re-establishes cleanly. */
 					else if ((link.status() == Type::Link::PENDING || link.status() == Type::Link::HANDSHAKE) &&
 					         link.establishment_timeout() > 0 &&
 					         OS::time() >= link.request_time() + link.establishment_timeout()) {
@@ -854,6 +854,10 @@ DestinationEntry empty_destination_entry;
 	// clear — retries transmit through Transport::outbound().
 	for (auto& link : watchdog_links) {
 		link.resource_watchdogs();
+		// Keepalive + stale-link teardown for the ACTIVE/STALE phases.
+		// Deferred past _jobs_running like resource_watchdogs: send_keepalive
+		// and the STALE teardown transmit through Transport::outbound().
+		link.link_watchdog();
 	}
 
 	// CBA send announce retransmission packets

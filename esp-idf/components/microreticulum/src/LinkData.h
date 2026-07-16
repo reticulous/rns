@@ -73,6 +73,9 @@ namespace RNS {
 		uint16_t _stale_time = Type::Link::STALE_TIME;
 		bool _watchdog_lock = false;
 		double _activated_at = 0.0;
+		// Absolute time at which a STALE link is torn down if no inbound
+		// traffic revives it; set when link_watchdog() flips ACTIVE->STALE.
+		double _stale_deadline = 0.0;
 		// CBA LINK
 		//Type::Destination::types _type = Type::Destination::LINK;
 		Destination _owner = {Type::NONE};
