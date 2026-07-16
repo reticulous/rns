@@ -155,6 +155,21 @@ static struct {
 
 static TickType_t s_lastPublishTick = 0;
 
+/* Adaptive main-loop cadence. The rnsd task wakes every s_tickPeriodMs to run
+ * the housekeeping block (stats, Transport::jobs(), link/channel/receipt ticks,
+ * periodic announce). A LoRa-only node can sit silent for minutes, so holding a
+ * fixed 1 s wake burns battery for no work. When nothing is in flight the period
+ * backs off exponentially — doubling each idle tick from s_tickMinMs up to
+ * s_tickMaxMs — and snaps back to the floor the moment there's work: any inbound
+ * packet, or any open/pending link. Inbound LoRa frames reach the task over ITS
+ * and wake itsPoll() immediately regardless of the deadline, so the long sleep
+ * only adds housekeeping slack, never inbound latency. Both bounds are the
+ * s.rnsd.tick_{min,max}_ms knobs. */
+static uint32_t s_tickPeriodMs   = 1000;
+static uint32_t s_tickMinMs      = 1000;
+static uint32_t s_tickMaxMs      = 60000;
+static uint64_t s_tickPrevPktsIn = 0;
+
 /* ─────────────── RNSD_PORT_DEST state ───────────────
  *
  * Per-connection state for the bidirectional destination API. Apps
@@ -2626,9 +2641,9 @@ static void cliRnprobe(const char* args)
 
 static TickType_t nextDeadline(void)
 {
-    /* Publish stats at 1 Hz. */
+    /* Housekeeping tick, at the current adaptive cadence (see s_tickPeriodMs). */
     TickType_t now = xTaskGetTickCount();
-    TickType_t due = s_lastPublishTick + pdMS_TO_TICKS(1000);
+    TickType_t due = s_lastPublishTick + pdMS_TO_TICKS(s_tickPeriodMs);
     if (due <= now) return 0;
     return due - now;
 }
@@ -5602,6 +5617,22 @@ static void rnsdTaskMain(void*)
     NOW_AND_ON_CHANGE("s.rnsd.cull_interval_s", {
         RNS::Transport::tables_cull_interval((float)storageGetInt(key, 60));
     });
+    /* Adaptive main-loop cadence bounds (ms). tick_min_ms is the busy floor —
+     * the wake period while packets flow or links are up; keep it at 1000 to
+     * preserve the burst load-shed tuning (see the jobs() defer block). Drop it
+     * toward 250 only if you want faster housekeeping under load. tick_max_ms is
+     * the idle ceiling the period backs off to (×2 per idle tick) on a silent
+     * LoRa-only node. */
+    NOW_AND_ON_CHANGE("s.rnsd.tick_min_ms", {
+        int v = storageGetInt(key, 1000);
+        s_tickMinMs = v < 50 ? 50 : (uint32_t)v;
+        if (s_tickMaxMs < s_tickMinMs) s_tickMaxMs = s_tickMinMs;
+        if (s_tickPeriodMs < s_tickMinMs) s_tickPeriodMs = s_tickMinMs;
+    });
+    NOW_AND_ON_CHANGE("s.rnsd.tick_max_ms", {
+        int v = storageGetInt(key, 60000);
+        s_tickMaxMs = (uint32_t)v < s_tickMinMs ? s_tickMinMs : (uint32_t)v;
+    });
 
     /* Bring up mR. Reticulum::transport_enabled() is a static global
      * consulted by Transport for forwarding decisions. We mirror our
@@ -5649,6 +5680,8 @@ static void rnsdTaskMain(void*)
     }
 
     s_lastPublishTick = xTaskGetTickCount();
+    s_tickPrevPktsIn  = s_stats.packets_in;
+    s_tickPeriodMs    = s_tickMinMs;
     int tickPhase = 0;
 
     /* Load-shedding state for the Transport::jobs() sweep (see below). */
@@ -5663,7 +5696,22 @@ static void rnsdTaskMain(void*)
         channelPollAll();
 
         TickType_t now = xTaskGetTickCount();
-        if (now - s_lastPublishTick >= pdMS_TO_TICKS(1000)) {
+        /* Run the block on schedule, but if we're backed off and a packet has
+         * landed since the last block, run it now so the cadence snaps back to
+         * the floor promptly. In the busy state (period == floor) this is inert,
+         * so bursts keep the normal periodic cadence rather than running the
+         * block per packet. */
+        bool wakeForPkt = s_tickPeriodMs > s_tickMinMs &&
+                          s_stats.packets_in != s_tickPrevPktsIn;
+        if (wakeForPkt || now - s_lastPublishTick >= pdMS_TO_TICKS(s_tickPeriodMs)) {
+            /* Did anything happen this tick? Any inbound packet or any
+             * open/pending link keeps us at the fast floor; a fully idle tick
+             * lets the cadence back off (recomputed at the end of the block). */
+            uint32_t dinTick = (uint32_t)(s_stats.packets_in - s_tickPrevPktsIn);
+            s_tickPrevPktsIn = s_stats.packets_in;
+            bool tickBusy = dinTick > 0 ||
+                            RNS::Transport::active_links_count()  > 0 ||
+                            RNS::Transport::pending_links_count() > 0;
             /* The 1 Hz block is unyieldy except for publishPathTable's
              * internal yield-every-8. Running Transport::jobs() *and*
              * publishPathTable() in the same tick can park the rnsd task
@@ -5729,6 +5777,14 @@ static void rnsdTaskMain(void*)
             publishStats();   /* cheap, every tick */
             tickPhase ^= 1;
             s_lastPublishTick = now;
+
+            /* Adapt the cadence: floor when busy, else double up to the cap. */
+            if (tickBusy) {
+                s_tickPeriodMs = s_tickMinMs;
+            } else {
+                uint32_t next = s_tickPeriodMs * 2;
+                s_tickPeriodMs = next > s_tickMaxMs ? s_tickMaxMs : next;
+            }
         }
     }
 }

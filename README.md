@@ -204,8 +204,10 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.path.ttl_ap` | `21600` | Access-point path lifetime, seconds (`Transport::ap_path_time`). |
 | `s.rnsd.path.ttl_roaming` | `3600` | Roaming path lifetime, seconds (`Transport::roaming_path_time`). |
 | `s.rnsd.identity.cache_max` | `1000` | Known-destination (identity) cache capacity (`Identity::known_destinations_maxsize`). |
-| `s.rnsd.jobs_interval_ms` | `250` | Transport `jobs()` cadence, milliseconds (`Transport::job_interval`). |
+| `s.rnsd.jobs_interval_ms` | `250` | Transport `jobs()` cadence, milliseconds (`Transport::job_interval`). Only consulted by `Transport::loop()`, which rnsd does not drive — inert on the rnsd path; the real cadence is `s.rnsd.tick_min_ms`/`tick_max_ms` below. |
 | `s.rnsd.cull_interval_s` | `60` | Table-cull cadence, seconds (`Transport::tables_cull_interval`). |
+| `s.rnsd.tick_min_ms` | `1000` | Busy floor for the main-loop housekeeping tick, milliseconds — the wake period while packets flow or links are up. Keep at `1000` to preserve the burst load-shed tuning; drop toward `250` only for faster housekeeping under load. |
+| `s.rnsd.tick_max_ms` | `60000` | Idle ceiling the tick backs off to (×2 per idle tick) on a silent LoRa-only node. Any inbound packet or open/pending link snaps the cadence back to `tick_min_ms`. |
 | `s.rnsd.respond_to_probes` | `1` | Host `rnstransport.probe` and answer probes (PROVE_ALL). |
 | `s.rnsd.prove_incoming` | `1` | Emit delivery proofs for inbound packets we receive. |
 | `s.rnsd.proof_timeout_s` | `60` | Deadline for an outbound delivery-proof receipt. |
