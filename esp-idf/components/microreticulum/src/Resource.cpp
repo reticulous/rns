@@ -530,6 +530,12 @@ bool Resource::receive_part(const Bytes& part_data) {
 			break;
 		}
 	}
+	/* TEMP diag: a part reached the Resource engine. If we see the missing
+	 * part here as REJECTED with the expected size, it arrived intact but the
+	 * map-hash didn't match (corruption / hashmap bug); if we NEVER see it,
+	 * it was dropped on the wire before reaching us. size shows truncation. */
+	DEBUGF("Resource::receive_part rx %zuB → %s", part_data.size(),
+	       accepted ? "accepted" : "REJECTED (no map-hash match)");
 	if (!accepted) return false;
 
 	// Advance the consecutive-completed height.
@@ -696,6 +702,8 @@ void Resource::request(const Bytes& request_data) {
 			rns_map_hash(d._parts[i].data(), d._parts[i].size(),
 			             d._random_hash, Type::Resource::RANDOM_HASH_SIZE, mh);
 			if (std::memcmp(mh, wanted, Type::Resource::MAPHASH_LEN) == 0) {
+				DEBUGF("Resource::request → tx part[%zu] %zuB", i,
+				       d._parts[i].size());
 				Packet part_packet(d._link, d._parts[i],
 				                   Type::Packet::DATA, Type::Packet::RESOURCE);
 				part_packet.send();

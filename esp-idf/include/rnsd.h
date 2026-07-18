@@ -104,6 +104,38 @@ void rnsdIdentityErase(const char* identity_key);
 bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                       uint8_t out_pubkey[RNSD_PUBKEY_LEN]);
 
+/** Insert a (dest_hash → public_key) mapping into rnsd's identity cache — the
+ *  same process-global `_known_destinations` table that inbound announces
+ *  populate and rnsdRecallPubkey reads. This is the write counterpart to
+ *  rnsdRecallPubkey; rnsd owns the table, this shim is how a consumer seeds it.
+ *
+ *  Ownership / who calls it: rnsd owns the cache. The intended caller is lxmf's
+ *  contact-identity persistence: it stores each contact's public key in the
+ *  contact record (rnsd's cache is RAM-only and self-culls, so the key is lost
+ *  on reboot or when the cache fills with announces), and re-seeds it here at
+ *  comms-initiate. That makes the peer recallable again so an outbound link /
+ *  inbound-signature verification can proceed WITHOUT waiting for a fresh
+ *  announce. Note it seeds only the identity, not a path — the caller still
+ *  needs a route (has_path / rnsdRequestPath) before a link will establish.
+ *
+ *  Arguments:
+ *    dest_hash  the peer's RNS destination hash — RNSD_DEST_HASH_LEN (16) bytes,
+ *               the same value rnsdRecallPubkey / rnsdDestHash use as the key.
+ *    pubkey     the peer's public key — RNSD_PUBKEY_LEN (64) bytes, X25519(32) ‖
+ *               Ed25519(32), exactly the layout rnsdRecallPubkey returns.
+ *
+ *  Semantics: idempotent and non-destructive — a hash already cached is left
+ *  unchanged (mR's insert does not overwrite), so re-seeding never clobbers a
+ *  live entry; a freshly inserted entry is timestamped now, so it is not the
+ *  one the immediate cull drops. packet_hash / app_data are stored empty (unused
+ *  by recall). Returns true if the mapping is present after the call (inserted
+ *  or already there), false only if `pubkey` is malformed (wrong length).
+ *
+ *  Threading: takes the recursive mutex around `_known_destinations` internally
+ *  — safe from any task, same as rnsdRecallPubkey. */
+bool rnsdRememberPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+                        const uint8_t pubkey[RNSD_PUBKEY_LEN]);
+
 /** Recall the last-heard announce app_data for a destination from the
  *  same identity cache. Copies up to `*inout_len` bytes into `out` and
  *  writes the actual length back to `*inout_len`. Returns false if the
@@ -120,6 +152,14 @@ bool rnsdRecallAppData(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
  *  has no return value — the caller polls via rnsdRecallPubkey or
  *  the path table. */
 void rnsdRequestPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
+
+/** Evict `dest_hash` from the path table (mR's Transport::remove_path).
+ *  Same async storage-sentinel discipline as rnsdRequestPath — the removal
+ *  runs on rnsd's task, which owns the path table. Fire-and-forget; no return.
+ *  Intended for a deliberate "forget the route and rediscover it" step, e.g.
+ *  lxmf's delivery retry after a proof/response timeout, so the next send
+ *  triggers a fresh path lookup instead of reusing a stale/dead route. */
+void rnsdDropPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
 
 /* ──────────────── destination / link client API ────────────────
  *

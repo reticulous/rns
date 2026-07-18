@@ -87,6 +87,11 @@ namespace RNS {
 		std::string _name;
 		size_t _rxb = 0;
 		size_t _txb = 0;
+		// Last received-packet radio signal, set by the interface driver just
+		// before handle_incoming; Transport::inbound copies them onto the packet
+		// (and Link.cpp onto the Link). NaN = interface reports no signal metric.
+		float _r_stat_rssi = Type::NaN<float>;
+		float _r_stat_snr  = Type::NaN<float>;
 		bool _online = false;
 		Bytes _ifac_identity;
 		// IFAC (Interface Access Codes). _ifac_identity doubles as the
@@ -234,6 +239,12 @@ namespace RNS {
 		inline float announce_cap() const { assert(_impl); return _impl->_announce_cap; }
 		inline size_t rxb() const { assert(_impl); return _impl->_rxb; }
 		inline size_t txb() const { assert(_impl); return _impl->_txb; }
+		// Per-packet radio signal (see InterfaceImpl). Setter used by the driver
+		// (rnsd) before handle_incoming; getter read by Transport::inbound.
+		inline float r_stat_rssi() const { assert(_impl); return _impl->_r_stat_rssi; }
+		inline float r_stat_snr()  const { assert(_impl); return _impl->_r_stat_snr; }
+		inline void  r_stat_rssi(float v) { assert(_impl); _impl->_r_stat_rssi = v; }
+		inline void  r_stat_snr(float v)  { assert(_impl); _impl->_r_stat_snr = v; }
 		inline std::list<AnnounceEntry>& announce_queue() const { assert(_impl); return _impl->_announce_queue; }
 		inline bool is_connected_to_shared_instance() const { assert(_impl); return _impl->_is_connected_to_shared_instance; }
 		inline bool is_local_shared_instance() const { assert(_impl); return _impl->_is_local_shared_instance; }

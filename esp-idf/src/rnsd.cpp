@@ -567,17 +567,37 @@ static void onTransportRecv(int handle, size_t /*bytesAvail*/)
     PSRAM_BSS static uint8_t pktbuf[600];   /* > RNS MTU 500 */
     size_t n = itsRecv(handle, pktbuf, sizeof(pktbuf), 0);
     if (n == 0) return;
+
+    /* Radio ifaces (rx_signal) prefix each frame with int16 rssi | int16 snr*10
+     * (BE, INT16_MIN rssi = absent). Strip it and attach it to the interface so
+     * Transport::inbound copies it onto the decoded packet — and mR onto the
+     * Link, so it reaches Link/Resource callbacks too, not just this packet. */
+    const uint8_t* pkt = pktbuf;
+    if (i->info.rx_signal && i->mr_iface) {
+        if (n >= 4) {
+            int16_t rssi = (int16_t)(((uint16_t)pktbuf[0] << 8) | pktbuf[1]);
+            int16_t snr  = (int16_t)(((uint16_t)pktbuf[2] << 8) | pktbuf[3]);
+            bool none = (rssi == INT16_MIN);
+            i->mr_iface.r_stat_rssi(none ? RNS::Type::NaN<float> : (float)rssi);
+            i->mr_iface.r_stat_snr (none ? RNS::Type::NaN<float> : snr / 10.0f);
+            pkt += 4; n -= 4;
+        } else {
+            i->mr_iface.r_stat_rssi(RNS::Type::NaN<float>);
+            i->mr_iface.r_stat_snr (RNS::Type::NaN<float>);
+        }
+    }
+
     i->rx_packets++;
     i->rx_bytes += n;
     s_stats.packets_in++;
     s_stats.bytes_in += n;
-    logWire(i->info.name, "rx", pktbuf, n);
+    logWire(i->info.name, "rx", pkt, n);
 
     /* Hand to mR Transport via the Interface — InterfaceImpl::handle_incoming
      * routes through to Transport::inbound(data, iface), which decodes the
      * packet, updates the path table on announces, and forwards as needed. */
     if (i->mr_iface) {
-        RNS::Bytes data(pktbuf, n);
+        RNS::Bytes data(pkt, n);
         i->mr_iface.handle_incoming(data);
     }
 }
@@ -644,10 +664,36 @@ static const char* destRetryReasonName(uint8_t reason)
     }
 }
 
-static void ourDestSendOutResult(our_dest_t& c, uint16_t send_id,
-                                 uint8_t status, uint32_t rtt_ms, uint8_t hops)
+/* OUT_RESULT: send_id(2) | status(1) | rtt_ms(4 BE) | hops(1), with an OPTIONAL
+ * routing-telemetry trailer first_hop(16) | iface_len(1) | iface[iface_len]
+ * appended when the outgoing path is known (the SENT result). `first_hop` is the
+ * RNS next-hop transport-node hash (nullptr / all-zero = no transit node);
+ * `iface` is the raw mR interface name. Consumers read fixed offsets and ignore
+ * the trailer if absent, so this stays backward-compatible with rnprobe. */
+/* "Interface[name]" → "name"; defined in the path-table block below. */
+static std::string ifaceShortName(const std::string& mrToString);
+
+/* Encode an mR float RSSI(dBm)/SNR(dB) pair into the wire int16s used by the
+ * inbound telemetry frames: rssi = INT16_MIN when the metric is absent (NaN),
+ * snr carried as dB*10. Shared by the opportunistic, Link, and Resource paths. */
+static void rnsdSignalToInt16(float rssi_f, float snr_f, int16_t& rssi, int16_t& snr)
 {
-    uint8_t f[9];
+    auto rnd = [](float x) { return (int16_t)(x < 0 ? x - 0.5f : x + 0.5f); };
+    if (RNS::Type::isNan(rssi_f)) { rssi = INT16_MIN; snr = 0; return; }
+    rssi = rnd(rssi_f);
+    snr  = RNS::Type::isNan(snr_f) ? 0 : rnd(snr_f * 10.0f);
+}
+static inline void rnsdPacketSignal(const RNS::Packet& p, int16_t& rssi, int16_t& snr)
+{
+    rnsdSignalToInt16(p.rssi(), p.snr(), rssi, snr);
+}
+
+static void ourDestSendOutResult(our_dest_t& c, uint16_t send_id,
+                                 uint8_t status, uint32_t rtt_ms, uint8_t hops,
+                                 const uint8_t* first_hop = nullptr,
+                                 const char* iface = nullptr)
+{
+    uint8_t f[9 + RNSD_DEST_HASH_LEN + 1 + 24];
     f[0] = RNSD_DEST_OUT_RESULT;
     f[1] = (uint8_t)(send_id >> 8);
     f[2] = (uint8_t)(send_id & 0xFF);
@@ -657,7 +703,17 @@ static void ourDestSendOutResult(our_dest_t& c, uint16_t send_id,
     f[6] = (uint8_t)((rtt_ms >>  8) & 0xFF);
     f[7] = (uint8_t)( rtt_ms        & 0xFF);
     f[8] = hops;
-    if (itsSend(c.handle, f, sizeof(f), pdMS_TO_TICKS(100)) == 0)
+    size_t len = 9;
+    if (first_hop || iface) {
+        if (first_hop) memcpy(f + len, first_hop, RNSD_DEST_HASH_LEN);
+        else           memset(f + len, 0,         RNSD_DEST_HASH_LEN);
+        len += RNSD_DEST_HASH_LEN;
+        size_t ilen = iface ? strnlen(iface, 24) : 0;
+        f[len++] = (uint8_t)ilen;
+        memcpy(f + len, iface, ilen);
+        len += ilen;
+    }
+    if (itsSend(c.handle, f, len, pdMS_TO_TICKS(100)) == 0)
         warn("our-dest: OUT_RESULT send dropped (send_id=%u)", (unsigned)send_id);
 }
 
@@ -965,13 +1021,19 @@ static int ourDestTrySend(our_dest_t& c, uint16_t send_id,
             return -1;
         }
         ourDestSendOutStatusBare(c, send_id, RNSD_DEST_AUX_EGRESS_QUEUED);
+        /* Routing telemetry for the msgmeta store: outgoing interface + RNS
+         * next-hop transport node (empty when the dest is a direct neighbour). */
+        RNS::Interface oif = RNS::Transport::next_hop_interface(dh);
+        RNS::Bytes     nh  = RNS::Transport::next_hop(dh);
+        std::string    ifn = oif ? ifaceShortName(oif.toString()) : std::string();
+        const uint8_t* fh  = (nh.size() == RNSD_DEST_HASH_LEN) ? nh.data() : nullptr;
         /* Egress accepted → SENT immediately (the UI's fast grey check).
          * Upstream peers prove opportunistic packets, so keep the receipt
          * and follow up with a second OUT_RESULT — DELIVERED when the
          * proof lands, PROOF_TIMEOUT otherwise. */
-        ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_SENT, 0, hops);
+        ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_SENT, 0, hops,
+                             fh, ifn.empty() ? nullptr : ifn.c_str());
         ourDestReceiptTrack(c, send_id, receipt, hops);
-        RNS::Interface oif = RNS::Transport::next_hop_interface(dh);
         info("our-dest: send_id=%u sent to %s via %s (hops=%u, %zuB payload)",
              (unsigned)send_id, dh.toHex().c_str(),
              oif ? oif.toString().c_str() : "<none>",
@@ -1010,18 +1072,44 @@ static void onOurDestInbound(const RNS::Bytes& plaintext, const RNS::Packet& pac
      * own destination hash (the IN destination that received this packet)
      * before handing off to the consumer. Symmetric with the strip done
      * in ourDestTrySend. See LXMF LXMRouter.delivery_packet(). */
-    if (plaintext.size() + 1 + 16 > RNSD_OUR_DEST_INBOUND_MAX) {
+    /* Routing telemetry prepended ahead of the reconstructed LXM wire:
+     * hops(1) | rssi(2 BE) | snr(2 BE) | first_hop(16) | iface_len(1) |
+     * iface[iface_len]. `first_hop` is the RNS transport-node this packet last
+     * transited (all-zero = received direct); `iface` is the receiving
+     * interface's raw mR name. rssi/snr are the radio signal telemetry
+     * (INT16_MIN rssi = none — non-radio iface); snr is dB*10. */
+    std::string ifn = packet.receiving_interface()
+                    ? ifaceShortName(packet.receiving_interface().toString()) : std::string();
+    size_t ilen = ifn.size() > 24 ? 24 : ifn.size();
+    /* Radio signal now rides the decoded packet (Transport::inbound copies it
+     * from the receiving interface). INT16_MIN rssi = no metric. */
+    int16_t rssi, snr;
+    rnsdPacketSignal(packet, rssi, snr);
+    size_t meta = 1 + 2 + 2 + RNSD_DEST_HASH_LEN + 1 + ilen;
+    if (meta + 16 + plaintext.size() > RNSD_OUR_DEST_INBOUND_MAX) {
         warn("our-dest inbound: oversize plaintext %zu B (dropping)", plaintext.size());
         return;
     }
-    info("our-dest inbound: %zuB for dest %s → handle=%d",
-         plaintext.size(), packet.destination().hash().toHex().c_str(), c->handle);
+    info("our-dest inbound: %zuB for dest %s → handle=%d (hops=%u via %s rssi=%d)",
+         plaintext.size(), packet.destination().hash().toHex().c_str(), c->handle,
+         (unsigned)packet.hops(), ifn.empty() ? "?" : ifn.c_str(),
+         rssi == INT16_MIN ? 0 : (int)rssi);
     rnsdDbgMsgContent("recv", plaintext.data(), plaintext.size());
     uint8_t f[RNSD_OUR_DEST_INBOUND_MAX];
-    f[0] = RNSD_DEST_IN_PACKET;
-    memcpy(f + 1,      packet.destination().hash().data(), 16);
-    memcpy(f + 1 + 16, plaintext.data(), plaintext.size());
-    if (itsSend(c->handle, f, 1 + 16 + plaintext.size(), pdMS_TO_TICKS(100)) == 0) {
+    size_t  o = 0;
+    f[o++] = RNSD_DEST_IN_PACKET;
+    f[o++] = packet.hops();
+    f[o++] = (uint8_t)((uint16_t)rssi >> 8); f[o++] = (uint8_t)rssi;
+    f[o++] = (uint8_t)((uint16_t)snr  >> 8); f[o++] = (uint8_t)snr;
+    const RNS::Bytes& tid = packet.transport_id();
+    if (tid.size() == RNSD_DEST_HASH_LEN) memcpy(f + o, tid.data(), RNSD_DEST_HASH_LEN);
+    else                                  memset(f + o, 0,          RNSD_DEST_HASH_LEN);
+    o += RNSD_DEST_HASH_LEN;
+    f[o++] = (uint8_t)ilen;
+    memcpy(f + o, ifn.data(), ilen);       o += ilen;
+    memcpy(f + o, packet.destination().hash().data(), 16);   o += 16;
+    memcpy(f + o, plaintext.data(), plaintext.size());       o += plaintext.size();
+    if (itsSend(c->handle, f, o, pdMS_TO_TICKS(100)) == 0) {
         /* Hand-off failed: do NOT prove. The sender keeps its receipt and
          * retries rather than settling DELIVERED on a message we dropped. */
         warn("our-dest inbound: ITS send dropped (%zu B) — NOT proved, sender will retry",
@@ -2791,6 +2879,23 @@ bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
     }
 }
 
+bool rnsdRememberPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+                        const uint8_t pubkey[RNSD_PUBKEY_LEN])
+{
+    try {
+        /* Identity::remember takes _known_destinations_mux internally and
+         * throws if the key size is wrong; NONE packet_hash/app_data (unused
+         * for recall). */
+        RNS::Identity::remember({RNS::Bytes::NONE},
+                                RNS::Bytes(dest_hash, RNSD_DEST_HASH_LEN),
+                                RNS::Bytes(pubkey, RNSD_PUBKEY_LEN));
+        return true;
+    } catch (const std::exception& e) {
+        warn("rnsdRememberPubkey: %s", e.what());
+        return false;
+    }
+}
+
 bool rnsdRecallAppData(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                        uint8_t* out, size_t* inout_len)
 {
@@ -2817,6 +2922,16 @@ void rnsdRequestPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN])
     for (size_t i = 0; i < RNSD_DEST_HASH_LEN; ++i)
         std::snprintf(hex + 2*i, 3, "%02x", dest_hash[i]);
     storageSet("rnsd.cmd.request_path", hex);
+}
+
+void rnsdDropPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN])
+{
+    /* Same self-clearing-sentinel discipline as rnsdRequestPath: Transport's
+     * path table is owned by the rnsd task, so the removal runs there. */
+    char hex[RNSD_DEST_HASH_LEN * 2 + 1];
+    for (size_t i = 0; i < RNSD_DEST_HASH_LEN; ++i)
+        std::snprintf(hex + 2*i, 3, "%02x", dest_hash[i]);
+    storageSet("rnsd.cmd.drop_path", hex);
 }
 
 /* ──────────────── destination / link client API ──────────────── */
@@ -3024,6 +3139,28 @@ static void onCmdRequestPath(const char* key, const char* val)
         }
     } catch (const std::exception& e) {
         warn("cmd.request_path threw: %s", e.what());
+    }
+    storageUnset(key);
+}
+
+/* Subscription handler for rnsdDropPath. Runs on rnsd's task. */
+static void onCmdDropPath(const char* key, const char* val)
+{
+    if (!val || !*val) return;   /* self-unset re-fire */
+    if (std::strlen(val) != RNSD_DEST_HASH_LEN * 2) {
+        warn("cmd.drop_path: bad hex length");
+        storageUnset(key);
+        return;
+    }
+    try {
+        RNS::Bytes dh;
+        dh.assignHex((const uint8_t*)val, std::strlen(val));
+        if (dh.size() == RNSD_DEST_HASH_LEN) {
+            bool removed = RNS::Transport::remove_path(dh);
+            info("cmd.drop_path: %s (%s)", val, removed ? "removed" : "no entry");
+        }
+    } catch (const std::exception& e) {
+        warn("cmd.drop_path threw: %s", e.what());
     }
     storageUnset(key);
 }
@@ -3536,6 +3673,16 @@ static void onLinkEstablishedCb(RNS::Link& link)
     linkSetInt(*c, "mtu", (int)link.get_mtu());
     linkSetInt(*c, "rtt_ms", (int)(link.rtt() * 1000.0));
     linkSetInt(*c, "activated_s", (int)RNS::Utilities::OS::time());
+    /* Interface (raw mR short name) + hop count, so lxmf's resolveDirectSends can
+     * record routing telemetry for an outbound DIRECT/Resource send (the pill +
+     * interface in the message-detail box). The link rides one interface, set on
+     * its LRPROOF ingress. */
+    {
+        const RNS::Interface& lif = link.attached_interface();
+        if (lif) linkSetStr(*c, "iface", ifaceShortName(lif.toString()).c_str());
+        if (c->dest_hash.size() == RNSD_DEST_HASH_LEN)
+            linkSetInt(*c, "hops", (int)RNS::Transport::hops_to(c->dest_hash));
+    }
     /* Per-link delivery-proof counters (consumers baseline these at send
      * time and watch for increments — publish zeros so the keys exist). */
     linkSetInt(*c, "tx_proven", 0);
@@ -3654,9 +3801,33 @@ static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packe
              c->tag, plaintext.size());
         return;
     }
-    /* Packet-mode handle: one Link plaintext = one ITS packet, no type
-     * byte. Drop on back-pressure (timeout 0) rather than stall rnsd. */
-    size_t w = itsSend(c->handle, plaintext.data(), plaintext.size(), 0);
+    /* Packet-mode handle: one Link plaintext = one ITS packet. Prepend the
+     * inbound telemetry header (same layout as IN_PACKET minus the opcode:
+     * hops(1) | rssi(2 BE) | snr(2 BE) | first_hop(16) | iface_len(1) | iface[])
+     * so the consumer records routing + radio signal for DIRECT / backchannel
+     * messages, not just opportunistic ones. Drop on back-pressure (timeout 0)
+     * rather than stall rnsd. */
+    std::string ifn = packet.receiving_interface()
+                    ? ifaceShortName(packet.receiving_interface().toString()) : std::string();
+    size_t ilen = ifn.size() > 24 ? 24 : ifn.size();
+    int16_t rssi, snr;
+    rnsdPacketSignal(packet, rssi, snr);
+    const RNS::Bytes& tid = packet.transport_id();
+
+    PSRAM_BSS static uint8_t f[1 + 2 + 2 + RNSD_DEST_HASH_LEN + 1 + 24 + RNSD_OUR_DEST_INBOUND_MAX];
+    size_t o = 0;
+    f[o++] = packet.hops();
+    f[o++] = (uint8_t)((uint16_t)rssi >> 8); f[o++] = (uint8_t)rssi;
+    f[o++] = (uint8_t)((uint16_t)snr  >> 8); f[o++] = (uint8_t)snr;
+    if (tid.size() == RNSD_DEST_HASH_LEN) memcpy(f + o, tid.data(), RNSD_DEST_HASH_LEN);
+    else                                  memset(f + o, 0,          RNSD_DEST_HASH_LEN);
+    o += RNSD_DEST_HASH_LEN;
+    f[o++] = (uint8_t)ilen;
+    memcpy(f + o, ifn.data(), ilen); o += ilen;
+    size_t body = plaintext.size();
+    if (o + body > sizeof(f)) body = sizeof(f) - o;   /* defensive */
+    memcpy(f + o, plaintext.data(), body); o += body;
+    size_t w = itsSend(c->handle, f, o, 0);
     if (w == 0) {
         linkSetError(*c, "rx_overflow");
         warn("link[%s]: inbound pkt dropped, consumer rx overflow (%zuB) — NOT proved",
@@ -3732,6 +3903,17 @@ static void resSendAux(link_conn_t& c, uint8_t opcode,
     d.len       = len;
     d.opaque_id = c.res_opaque;
     d.flags     = flags;
+    /* Radio signal + interface of the last packet on this link, for the msgmeta
+     * store (INBOUND_DONE only — outbound/failed carry the absent sentinel). */
+    d.rssi = INT16_MIN; d.snr = 0;
+    if (opcode == RNSD_LINK_RESOURCE_INBOUND_DONE && c.link) {
+        rnsdSignalToInt16(c.link.rssi(), c.link.snr(), d.rssi, d.snr);
+        const RNS::Interface& lif = c.link.attached_interface();
+        if (lif) {
+            std::string ifn = ifaceShortName(lif.toString());
+            std::snprintf(d.iface, sizeof(d.iface), "%s", ifn.c_str());
+        }
+    }
     if (!itsSendAuxByTaskHandle(c.consumer_task, LXMF_LINK_RESOURCE_AUX_PORT,
                                 &d, sizeof(d), pdMS_TO_TICKS(2000))) {
         warn("link[%s]: resource aux send failed (op=%s)",
@@ -5172,11 +5354,20 @@ static void onClinkInboxRecv(int handle, size_t /*n*/)
     PSRAM_BSS static uint8_t b[1024];
     size_t n = itsRecv(handle, b, sizeof(b), 0);
     if (n == 0) return;
-    size_t show = n < 48 ? n : 48;
-    info("clink inbox: RX %zuB head=%s%s", n,
-         RNS::Bytes(b, show).toHex().c_str(), n > show ? "…" : "");
+    /* onLinkPacketCb prepends the inbound telemetry header
+     * (hops | rssi(2) | snr(2) | first_hop(16) | iface_len | iface[]); strip it
+     * so the echo carries only the peer's payload. */
+    size_t off = 0;
+    if (n >= 1 + 2 + 2 + RNSD_DEST_HASH_LEN + 1) {
+        size_t ilen = b[1 + 2 + 2 + RNSD_DEST_HASH_LEN];
+        size_t hdr  = 1 + 2 + 2 + RNSD_DEST_HASH_LEN + 1 + ilen;
+        if (hdr <= n) off = hdr;
+    }
+    size_t show = (n - off) < 48 ? (n - off) : 48;
+    info("clink inbox: RX %zuB head=%s%s", n - off,
+         RNS::Bytes(b + off, show).toHex().c_str(), (n - off) > show ? "…" : "");
     /* Echo it straight back over the same inbound Link. */
-    itsSend(handle, b, n, 0);
+    itsSend(handle, b + off, n - off, 0);
 }
 static void onClinkInboxDisc(int /*handle*/)
 {
@@ -5670,6 +5861,12 @@ static void rnsdTaskMain(void*)
          * this task (mR's Transport::request_path silently drops when
          * called from any other task). */
         storageSubscribeChanges("rnsd.cmd.request_path", onCmdRequestPath);
+
+        /* Path-eviction endpoint (rnsd.h API). Callers write
+         * `rnsd.cmd.drop_path = <32-hex>`; we call Transport::remove_path on
+         * this task. Used by lxmf's delivery retry to force a fresh path
+         * lookup after a proof/response timeout. */
+        storageSubscribeChanges("rnsd.cmd.drop_path", onCmdDropPath);
 
         /* `rnsd link <hash> [aspect]` one-shot probe.
          * CLI writes to this key; we build the Link here on the rnsd task. */

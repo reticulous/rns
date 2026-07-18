@@ -175,6 +175,10 @@ typedef struct {
     uint32_t len;
     uint32_t opaque_id;                /* OUTBOUND_DONE correlation */
     uint8_t  flags;                    /* bit0 compressed, bit1 has_metadata */
+    int16_t  rssi;                     /* INBOUND_DONE: link radio RSSI dBm (last part);
+                                          INT16_MIN = no radio metric */
+    int16_t  snr;                      /* INBOUND_DONE: link radio SNR dB*10 */
+    char     iface[24];                /* INBOUND_DONE: receiving interface raw name; '' = unknown */
     uint8_t  reserved[5];
 } rnsd_link_resource_done_t;
 static_assert(sizeof(rnsd_link_resource_done_t) <= ITS_MAX_MSG_DATA,
@@ -211,6 +215,10 @@ typedef struct {
     uint8_t  fwd;           /* 1 if iface forwards (transport node) */
     uint8_t  rpt;           /* 1 if iface repeats announces */
     uint8_t  ifac_size;     /* IFAC access-code length in bytes; 0 => default (1) */
+    uint8_t  rx_signal;     /* 1 => each inbound data frame is prefixed with a
+                               4-byte signal header int16 rssi_dBm | int16 snr_dB*10
+                               (both BE, INT16_MIN = absent). Set by radio ifaces
+                               (LoRa) that measure per-packet RSSI/SNR. */
     char     ifac_netname[32]; /* IFAC network_name; "" => no IFAC */
     char     ifac_netkey[64];  /* IFAC passphrase; "" => no IFAC */
 } rnsd_iface_t;

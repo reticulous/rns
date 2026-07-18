@@ -1675,28 +1675,14 @@ static const Bytes& ifac_salt() {
 	packet.receiving_interface(interface);
 	packet.hops(packet.hops() + 1);
 
-// TODO
-/*p
+	// Attach the receiving interface's last-packet radio signal (set by the
+	// driver just before handle_incoming). Consumers read packet.rssi()/snr();
+	// Link.cpp copies them onto the Link so they survive to link callbacks. The
+	// upstream local_client_rssi_cache (shared-instance RPC) is not used here.
 	if (interface) {
-		if hasattr(interface, "r_stat_rssi"):
-			if interface.r_stat_rssi != None:
-				packet.rssi = interface.r_stat_rssi
-				if len(Transport.local_client_interfaces) > 0:
-					Transport.local_client_rssi_cache.append([packet.packet_hash, packet.rssi])
-
-					while len(Transport.local_client_rssi_cache) > Transport.LOCAL_CLIENT_CACHE_MAXSIZE:
-						Transport.local_client_rssi_cache.pop()
-
-		if hasattr(interface, "r_stat_snr"):
-			if interface.r_stat_rssi != None:
-				packet.snr = interface.r_stat_snr
-				if len(Transport.local_client_interfaces) > 0:
-					Transport.local_client_snr_cache.append([packet.packet_hash, packet.snr])
-
-					while len(Transport.local_client_snr_cache) > Transport.LOCAL_CLIENT_CACHE_MAXSIZE:
-						Transport.local_client_snr_cache.pop()
+		if (!Type::isNan(interface.r_stat_rssi())) packet.rssi(interface.r_stat_rssi());
+		if (!Type::isNan(interface.r_stat_snr()))  packet.snr(interface.r_stat_snr());
 	}
-*/
 
 	if (_local_client_interfaces.size() > 0) {
 		if (is_local_client_interface(interface)) {
