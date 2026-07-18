@@ -5831,6 +5831,7 @@ void RnsdService::onInit()
     s_task = spawnTask(rnsdTaskMain, TAG, 12288, nullptr, 2, 0, STACK_PSRAM);
 
     /* clink smoke consumer — its own ITS-client task, idle until
-     * `rnsd clink …`. Core 1, prio 1, modest PSRAM stack. */
-    spawnTask(clinkTaskMain, CLINK_TAG, 6144, nullptr, 1, 1, STACK_PSRAM);
+     * `rnsd clink …`. Core 0 with rnsd (it drives real Link packet work when
+     * active, so it belongs off the UI core), prio 1, modest PSRAM stack. */
+    spawnTask(clinkTaskMain, CLINK_TAG, 6144, nullptr, 1, 0, STACK_PSRAM);
 }
