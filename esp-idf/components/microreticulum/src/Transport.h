@@ -448,6 +448,7 @@ namespace RNS {
 
 		static PathRequestTable _discovery_path_requests;	// A table for keeping track of path requests on behalf of other nodes
 		static std::set<Bytes> _discovery_pr_tags;	// A table for keeping track of tagged path requests
+		static std::list<Bytes> _discovery_pr_tags_order;	// insertion order for FIFO eviction of _discovery_pr_tags (std::set orders by content, not recency)
 
 		// Transport control destinations are used
 		// for control purposes like path requests

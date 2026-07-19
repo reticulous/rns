@@ -73,7 +73,12 @@ using namespace RNS::Persistence;
 #endif
 
 #ifndef RNS_PR_TAGS_MAX
-#define RNS_PR_TAGS_MAX	 32
+// Dedup window for forwarded path-request tags. Must be large enough that a
+// request still circulating the network (e.g. across several TCP uplinks that
+// reach each other) is still remembered when its echo returns, or the node
+// re-forwards it and joins a path-request storm. 32 was far too small once a
+// node bridges a busy transport network.
+#define RNS_PR_TAGS_MAX	 256
 #endif
 
 /*static*/ Transport::InterfaceTable Transport::_interfaces;
@@ -95,6 +100,7 @@ using namespace RNS::Persistence;
 
 /*static*/ std::map<Bytes, Transport::PathRequestEntry> Transport::_discovery_path_requests;
 /*static*/ std::set<Bytes> Transport::_discovery_pr_tags;
+/*static*/ std::list<Bytes> Transport::_discovery_pr_tags_order;
 
 /*static*/ std::set<Destination> Transport::_control_destinations;
 /*static*/ std::set<Bytes> Transport::_control_hashes;
@@ -474,6 +480,19 @@ DestinationEntry empty_destination_entry;
 
 			// Process announces needing retransmission
 			if (OS::time() > (_announces_last_checked + _announces_check_interval)) {
+				// Only a transport node re-broadcasts third-party announces. If
+				// transport was just disabled at runtime, drop whatever is still
+				// pending so it takes effect immediately — otherwise the table
+				// and per-interface queues that filled while enabled keep
+				// trickling out for minutes (looking like the toggle did nothing
+				// until a reboot cleared them).
+				if (!Reticulum::transport_enabled()) {
+					if (!_announce_table.empty()) {
+						_announce_table.clear();
+					}
+					drop_announce_queues();
+				}
+				else
 				//p for destination_hash in Transport.announce_table:
 				for (auto& [destination_hash, announce_entry] : _announce_table) {
 				//for (auto& pair : _announce_table) {
@@ -533,6 +552,14 @@ DestinationEntry empty_destination_entry;
 							);
 
 							new_packet.hops(announce_entry._hops);
+							// Carry the interface this announce arrived on onto the
+							// rebroadcast, so outbound()'s point-to-point split
+							// horizon can suppress echoing it back out that same
+							// interface. This is the reliable source signal — the
+							// original packet's receiving_interface, set at receive
+							// time — as opposed to a path-table lookup that can miss
+							// after culls or interface reconnects.
+							new_packet.receiving_interface(announce_entry._packet.receiving_interface());
 							if (announce_entry._block_rebroadcasts) {
 								/* Serving someone else's route request — verbose,
 								 * like the rest of the path-request processing. */
@@ -576,6 +603,22 @@ DestinationEntry empty_destination_entry;
 				_announces_last_checked = OS::time();
 			}
 
+			// Drain the per-interface announce hold queues that the bandwidth
+			// cap fills (outbound() defers announces exceeding announce_cap into
+			// interface.announce_queue). Upstream RNS reschedules a per-queue
+			// threading.Timer; mR has no timers, so poll each interface here and
+			// emit one held announce once its announce_allowed_at has elapsed.
+			// Cheap when queues are empty (the common case: cap not exceeded, or
+			// AP/roaming interfaces that never queue). Only a transport node has
+			// anything here — the queues only ever hold forwarded announces.
+			if (Reticulum::transport_enabled()) {
+				for (auto& [interface_hash, interface] : _interfaces) {
+					if (!interface.announce_queue().empty() && OS::time() > interface.announce_allowed_at()) {
+						interface.process_announce_queue();
+					}
+				}
+			}
+
 			// Cull the packet hashlist if it has reached its max size
 			if (_packet_hashlist.size() > _hashlist_maxsize) {
 				std::set<Bytes>::iterator iter = _packet_hashlist.begin();
@@ -583,11 +626,14 @@ DestinationEntry empty_destination_entry;
 				_packet_hashlist.erase(_packet_hashlist.begin(), iter);
 			}
 
-			// Cull the path request tags list if it has reached its max size
-			if (_discovery_pr_tags.size() > _max_pr_tags) {
-				std::set<Bytes>::iterator iter = _discovery_pr_tags.begin();
-				std::advance(iter, _discovery_pr_tags.size() - _max_pr_tags);
-				_discovery_pr_tags.erase(_discovery_pr_tags.begin(), iter);
+			// Cull the path request tags list if it has reached its max size.
+			// Evict oldest-first (FIFO via _discovery_pr_tags_order): std::set
+			// orders by tag content, so erasing from its begin() would drop
+			// tags at random w.r.t. recency and could forget a request still
+			// circulating — re-forwarding it and sustaining a path-request storm.
+			while (_discovery_pr_tags.size() > _max_pr_tags && !_discovery_pr_tags_order.empty()) {
+				_discovery_pr_tags.erase(_discovery_pr_tags_order.front());
+				_discovery_pr_tags_order.pop_front();
 			}
 
 			if (OS::time() > (_tables_last_culled + _tables_cull_interval)) {
@@ -865,9 +911,16 @@ DestinationEntry empty_destination_entry;
 		packet.send();
 	}
 
-	// CBA send link-related path requests
+	// CBA send link-related path requests. Send per-OUT-interface rather than a
+	// single broadcast so the point-to-point split horizon in request_path can
+	// suppress re-asking a link's own peer, and so access-point (radio edge)
+	// interfaces are skipped the same way the discovery forwarders skip them.
 	for (auto& destination_hash : path_requests) {
-		request_path(destination_hash);
+		for (auto& [interface_hash, interface] : _interfaces) {
+			if (interface.OUT() && interface.mode() != Type::Interface::MODE_ACCESS_POINT) {
+				request_path(destination_hash, interface);
+			}
+		}
 	}
 }
 
@@ -988,6 +1041,12 @@ static const Bytes& ifac_salt() {
 	_jobs_locked = true;
 
 	bool sent = false;
+	// An announce deferred into an interface's bandwidth-cap queue is handled,
+	// not failed — it will be emitted later by process_announce_queue(). Track
+	// that separately so outbound() doesn't report it as undeliverable (which
+	// made Packet::send log a spurious "No interfaces could process" error for
+	// every capped announce).
+	bool deferred = false;
 	double outbound_time = OS::time();
 
 	// Check if we have a known path for the destination in the path table
@@ -1248,12 +1307,35 @@ static const Bytes& ifac_salt() {
 										interface.announce_queue = []
 */
 
+								// Split horizon, but only on interfaces with no hidden-
+								// node problem (point_to_point: TCP, switched LAN).
+								// There, echoing a forwarded announce back out the
+								// interface it arrived on just returns it to the single
+								// peer that already has it. On shared radio (LoRa,
+								// ESP-NOW) point_to_point is false, so we still
+								// re-broadcast — that is how a node hidden from the
+								// origin, but in range of us, hears the announce.
+								// Keyed on the announce's receiving interface (carried
+								// on the rebroadcast packet), not a path-table lookup,
+								// so it holds even after path culls / interface
+								// reconnects.
+								const Interface& received_on = packet.receiving_interface();
+								bool split_horizon = interface.point_to_point() && received_on
+									&& received_on.get_hash() == interface.get_hash();
+
 								bool queued_announces = (interface.announce_queue().size() > 0);
-								if (!queued_announces && outbound_time > interface.announce_allowed_at()) {
-									uint16_t wait_time = 0;
+								if (split_horizon) {
+									should_transmit = false;
+								}
+								else if (!queued_announces && outbound_time > interface.announce_allowed_at()) {
+									// Seconds, in floating point: a frame's airtime is
+									// well under 1 s on fast links, so integer math here
+									// truncated tx_time (and thus wait_time) to 0 and the
+									// cap never engaged. announce_allowed_at is a double.
+									double wait_time = 0;
 									if (interface.bitrate() > 0 && interface.announce_cap() > 0) {
-										uint16_t tx_time = (packet.raw().size() * 8) / interface.bitrate();
-										wait_time = (tx_time / interface.announce_cap());
+										double tx_time = (double)(packet.raw().size() * 8) / (double)interface.bitrate();
+										wait_time = tx_time / interface.announce_cap();
 									}
 									interface.announce_allowed_at(outbound_time + wait_time);
 								}
@@ -1286,6 +1368,7 @@ static const Bytes& ifac_salt() {
 											queued_announces = (interface.announce_queue().size() > 0);
 											// CBA ACCUMULATES
 											interface.add_announce(entry);
+											deferred = true;
 
 											if (!queued_announces) {
 												double wait_time = std::max(interface.announce_allowed_at() - OS::time(), (double)0);
@@ -1373,8 +1456,17 @@ static const Bytes& ifac_salt() {
 		cache_packet(packet);
 	}
 
+	// A forwarded announce (hops>0) that this node chose not to re-broadcast on
+	// any interface — AP mode, an over-full cap queue, split horizon — is a
+	// routing decision, not a delivery failure. Treat it as handled so
+	// Packet::send doesn't log "No interfaces could process" for it. Own
+	// announces (hops==0) that reach no interface are still reported honestly.
+	if (!sent && !deferred && packet.packet_type() == Type::Packet::ANNOUNCE && packet.hops() > 0) {
+		deferred = true;
+	}
+
 	_jobs_locked = false;
-	return sent;
+	return sent || deferred;
 }
 
 #if 0
@@ -3426,6 +3518,20 @@ will announce it.
 */
 ///*static*/ void Transport::request_path(const Bytes& destination_hash, const Interface& on_interface /*= {Type::NONE}*/, const Bytes& tag /*= {}*/, bool recursive /*= false*/) {
 /*static*/ void Transport::request_path(const Bytes& destination_hash, const Interface& on_interface, const Bytes& tag /*= {}*/, bool recursive /*= false*/) {
+	// Split horizon on point-to-point links: don't ask a single-peer link
+	// (TCP, switched LAN) for a path to a destination we already learned via
+	// that very link — its one peer is exactly who told us. Genuine discovery
+	// of an unknown destination still goes out (next_hop_interface() is NONE
+	// then), and shared radio interfaces are not point_to_point, so hidden-node
+	// re-broadcast is unaffected.
+	if (on_interface && on_interface.point_to_point()) {
+		const Interface& learned_on = next_hop_interface(destination_hash);
+		if (learned_on && learned_on.get_hash() == on_interface.get_hash()) {
+			TRACEF("Not requesting path for %s back over point-to-point interface %s it was learned on", destination_hash.toHex().c_str(), on_interface.toString().c_str());
+			return;
+		}
+	}
+
 	Bytes request_tag;
 	if (!tag) {
 		request_tag = Identity::get_random_hash();
@@ -3471,10 +3577,12 @@ will announce it.
 			}
 			else {
 				//p tx_time   = ((len(path_request_data)+RNS.Reticulum.HEADER_MINSIZE)*8) / on_interface.bitrate
-				uint32_t wait_time = 0;
+				// Seconds, floating point — integer math truncated this to 0
+				// on any sub-1s frame, defeating the cap (see outbound()).
+				double wait_time = 0;
 				if ( on_interface.bitrate() > 0 && on_interface.announce_cap() > 0) {
-					uint32_t tx_time = ((path_request_data.size() + Type::Reticulum::HEADER_MINSIZE)*8) / on_interface.bitrate();
-					wait_time = (tx_time / on_interface.announce_cap());
+					double tx_time = (double)((path_request_data.size() + Type::Reticulum::HEADER_MINSIZE)*8) / (double)on_interface.bitrate();
+					wait_time = tx_time / on_interface.announce_cap();
 				}
 				const_cast<Interface&>(on_interface).announce_allowed_at(now + wait_time);
 			}
@@ -3528,6 +3636,7 @@ will announce it.
 				if (_discovery_pr_tags.find(unique_tag) == _discovery_pr_tags.end()) {
 					// CBA ACCUMULATES
 					_discovery_pr_tags.insert(unique_tag);
+					_discovery_pr_tags_order.push_back(unique_tag);
 
 					path_request(
 						destination_hash,
@@ -3740,7 +3849,13 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 		DBGF_DEMOTE("Forwarding path request from local client for destination %s%s to all other interfaces", destination_hash.toHex().c_str(), interface_str.c_str());
 		Bytes request_tag = Identity::get_random_hash();
 		for (auto& [hash, interface] : _interfaces) {
-			if (interface != attached_interface) {
+			// Don't propagate path requests onto access-point interfaces. Like
+			// announces (see outbound()'s AP block), an AP interface serves leaf
+			// clients at the edge; spraying the rest of the network's path-
+			// request discovery onto it floods the (often slow) RF segment.
+			// Requests that arrive FROM an AP client are still answered directly
+			// via path responses; this only suppresses onward propagation.
+			if (interface != attached_interface && interface.mode() != Type::Interface::MODE_ACCESS_POINT) {
 				request_path(destination_hash, interface, request_tag);
 			}
 		}
@@ -3771,14 +3886,20 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 				// Discovery still forwards out *other* interfaces (stock
 				// Reticulum behaviour); genuine multi-hop LoRa paths still
 				// propagate via normal announce flooding through transports.
-				if (interface != attached_interface) {
+				// Access-point interfaces are skipped: like announces, we don't
+				// spray discovery onto an edge/leaf RF segment (see outbound()'s
+				// AP block). Requests from AP clients are still answered directly.
+				if (interface == attached_interface) {
+					TRACEF("Transport::path_request: not requesting path on same interface %s", interface.toString().c_str());
+				}
+				else if (interface.mode() == Type::Interface::MODE_ACCESS_POINT) {
+					TRACEF("Transport::path_request: not requesting path on access-point interface %s", interface.toString().c_str());
+				}
+				else {
 					TRACEF("Transport::path_request: requesting path on interface %s", interface.toString().c_str());
 					// Use the previously extracted tag from this path request
 					// on the new path requests as well, to avoid potential loops
 					request_path(destination_hash, interface, tag, true);
-				}
-				else {
-					TRACEF("Transport::path_request: not requesting path on same interface %s", interface.toString().c_str());
 				}
 			}
 		}
@@ -3886,20 +4007,13 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 }
 
 /*static*/ void Transport::drop_announce_queues() {
-// TODO
-/*p
-	for interface in Transport.interfaces:
-		if hasattr(interface, "announce_queue") and interface.announce_queue != None:
-			na = len(interface.announce_queue)
-			if na > 0:
-				if na == 1:
-					na_str = "1 announce"
-				else:
-					na_str = str(na)+" announces"
-
-				interface.announce_queue = []
-				RNS.log("Dropped "+na_str+" on "+str(interface), RNS.LOG_VERBOSE)
-*/
+	for (auto& [interface_hash, interface] : _interfaces) {
+		size_t na = interface.announce_queue().size();
+		if (na > 0) {
+			interface.announce_queue().clear();
+			VERBOSEF("Dropped %lu queued announce%s on %s", (unsigned long)na, na == 1 ? "" : "s", interface.toString().c_str());
+		}
+	}
 }
 
 /*static*/ uint64_t Transport::announce_emitted(const Packet& packet) {

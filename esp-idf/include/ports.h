@@ -196,6 +196,10 @@ enum rns_iface_mode : uint8_t {
     RNS_IFACE_MODE_BOUNDARY      = 0x10,
 };
 
+/* Default announce bandwidth cap (percent) applied when an interface registers
+ * with announce_cap == 0. Mirrors RNS Reticulum.ANNOUNCE_CAP. */
+#define RNS_IFACE_ANNOUNCE_CAP_DEFAULT 2
+
 /** Connect payload for RNSD_PORT_IFACE. Sent by interface tasks when
  *  registering with rnsd. Fixed-size struct to keep the connect path cheap
  *  (fits in ITS_MAX_MSG_DATA).
@@ -215,6 +219,14 @@ typedef struct {
     uint8_t  fwd;           /* 1 if iface forwards (transport node) */
     uint8_t  rpt;           /* 1 if iface repeats announces */
     uint8_t  ifac_size;     /* IFAC access-code length in bytes; 0 => default (1) */
+    uint8_t  announce_cap;  /* max % of interface bandwidth spent propagating
+                               announces; 0 => rnsd applies the RNS default (2) */
+    uint8_t  point_to_point; /* 1 => no hidden-node problem (single peer, e.g.
+                               TCP, or a switched LAN): enables split-horizon so
+                               forwarded announces aren't echoed back out the
+                               interface they arrived on. 0 (default) => shared
+                               radio medium; keep re-broadcasting for hidden
+                               nodes (LoRa, ESP-NOW). */
     uint8_t  rx_signal;     /* 1 => each inbound data frame is prefixed with a
                                4-byte signal header int16 rssi_dBm | int16 snr_dB*10
                                (both BE, INT16_MIN = absent). Set by radio ifaces

@@ -109,6 +109,12 @@ namespace RNS {
 		bool _FIXED_MTU = false;
 		double _announce_allowed_at = 0;
 		float _announce_cap = 0.0;
+		// True for links with no hidden-node problem — a single peer (TCP) or a
+		// fully-connected medium (switched LAN) where every peer hears every
+		// other. Enables split-horizon: forwarded announces are not echoed back
+		// out the interface they were learned on. Radio interfaces (LoRa,
+		// ESP-NOW) leave this false so re-broadcasts still reach hidden nodes.
+		bool _point_to_point = false;
 		std::list<AnnounceEntry> _announce_queue;
 		bool _is_connected_to_shared_instance = false;
 		bool _is_local_shared_instance = false;
@@ -210,6 +216,11 @@ namespace RNS {
 		inline void bitrate(uint32_t bitrate) { assert(_impl); _impl->_bitrate = bitrate; }
 		inline void online(bool online) { assert(_impl); _impl->_online = online; }
 		inline void announce_allowed_at(double announce_allowed_at) { assert(_impl); _impl->_announce_allowed_at = announce_allowed_at; }
+		// announce_cap is a fraction of interface bandwidth (0.02 == 2%), used
+		// as the divisor in the announce-bandwidth throttle. Set at interface
+		// registration from the rnsd-facing percentage.
+		inline void announce_cap(float announce_cap) { assert(_impl); _impl->_announce_cap = announce_cap; }
+		inline void point_to_point(bool point_to_point) { assert(_impl); _impl->_point_to_point = point_to_point; }
 	public:
 		// getters
 		inline bool IN() const { assert(_impl); return _impl->_IN; }
@@ -237,6 +248,7 @@ namespace RNS {
 		inline bool FIXED_MTU() const { assert(_impl); return _impl->_FIXED_MTU; }
 		inline double announce_allowed_at() const { assert(_impl); return _impl->_announce_allowed_at; }
 		inline float announce_cap() const { assert(_impl); return _impl->_announce_cap; }
+		inline bool point_to_point() const { assert(_impl); return _impl->_point_to_point; }
 		inline size_t rxb() const { assert(_impl); return _impl->_rxb; }
 		inline size_t txb() const { assert(_impl); return _impl->_txb; }
 		// Per-packet radio signal (see InterfaceImpl). Setter used by the driver

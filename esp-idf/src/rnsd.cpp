@@ -115,6 +115,12 @@ public:
         _AUTOCONFIGURE_MTU = false;
         _bitrate = info.bitrate;
         _mode = mapIfaceMode(info.mode);
+        // announce_cap arrives as a percentage (0 => use the RNS default);
+        // mR's throttle wants it as a fraction of bandwidth.
+        uint8_t cap_pct = info.announce_cap ? info.announce_cap
+                                            : RNS::Type::Reticulum::ANNOUNCE_CAP;
+        _announce_cap = (float)cap_pct / 100.0f;
+        _point_to_point = info.point_to_point != 0;
     }
 protected:
     void send_outgoing(const RNS::Bytes& data) override;
@@ -468,6 +474,7 @@ static void publishIfaceUp(const iface_t& i)
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.mtu", i.info.name);         storageSet(key, (int)i.info.mtu);
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.bitrate", i.info.name);     storageSet(key, (int)i.info.bitrate);
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.mode", i.info.name);        storageSet(key, mode_name(i.info.mode));
+    snprintf(key, sizeof(key), "rnsd.ifaces.%s.announce_cap", i.info.name); storageSet(key, (int)(i.info.announce_cap ? i.info.announce_cap : RNS_IFACE_ANNOUNCE_CAP_DEFAULT));
     storageSet("rnsd.iface_event_seq", ++s_iface_event_seq);
     storageEnd();
     /* If we're hosting the probe destination, (re)arm the announce
@@ -2397,6 +2404,11 @@ static void rnstatusPrintIface(const iface_t& i)
     cliPrintf("\n%s\n", i.info.name);
     cliPrintf("Status       up\n");
     cliPrintf("Mode         %s\n", mode_name(i.info.mode));
+    cliPrintf("Announce cap %u%%\n",
+              (unsigned)(i.info.announce_cap ? i.info.announce_cap
+                                             : RNS_IFACE_ANNOUNCE_CAP_DEFAULT));
+    cliPrintf("Split horizon %s\n", i.info.point_to_point ? "yes (point-to-point)"
+                                                          : "no (shared/hidden-node)");
     cliPrintf("MTU          %u\n", (unsigned)i.info.mtu);
     cliPrintf("Bitrate      %s\n", formatBitrate(i.info.bitrate).c_str());
     cliPrintf("Traffic      %s in / %s out  (%llu pkt in / %llu out)\n",
@@ -2432,6 +2444,9 @@ static void rnstatusJson(const std::string& filter)
         cJSON* o = cJSON_CreateObject();
         cJSON_AddStringToObject(o, "name", i.info.name);
         cJSON_AddStringToObject(o, "mode", mode_name(i.info.mode));
+        cJSON_AddNumberToObject(o, "announce_cap",
+                                i.info.announce_cap ? i.info.announce_cap
+                                                    : RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
         cJSON_AddNumberToObject(o, "mtu", i.info.mtu);
         cJSON_AddNumberToObject(o, "bitrate", i.info.bitrate);
         cJSON_AddNumberToObject(o, "rx_packets", (double)i.rx_packets);
@@ -5830,8 +5845,18 @@ static void rnsdTaskMain(void*)
      * persistent flag into it before start(). */
     try {
         s_reticulum = std::make_unique<RNS::Reticulum>();
-        RNS::Reticulum::transport_enabled(
-            storageGetInt("s.rnsd.transport_enabled", 0) != 0);
+        /* Transport-node participation. Mirror the persistent flag into mR's
+         * static before start(), and re-mirror on live changes: Transport reads
+         * transport_enabled() per forwarding decision, so flipping the setting
+         * takes effect immediately, no reboot. The node re-announces its
+         * transport capability on the next announce cycle. */
+        NOW_AND_ON_CHANGE("s.rnsd.transport_enabled", {
+            bool en = storageGetInt(key, 0) != 0;
+            if (en != RNS::Reticulum::transport_enabled()) {
+                RNS::Reticulum::transport_enabled(en);
+                info("transport_enabled -> %d (live)", (int)en);
+            }
+        });
         s_reticulum->start();
         info("Reticulum/Transport up (transport_enabled=%d)",
              (int)RNS::Reticulum::transport_enabled());

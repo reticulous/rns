@@ -189,6 +189,54 @@ Our deltas, by category:
   on Channel messages instead. Anything needing the upstream `Buffer` API must
   implement it first.
 
+#### 1.1.1 Announce & path-request propagation
+
+The upstream port left the whole announce-bandwidth-management path stubbed;
+it is now implemented, plus fork-specific behaviour for point-to-point links.
+
+- **`announce_cap` now works.** Upstream RNS caps announce bandwidth per
+  interface (`Reticulum.ANNOUNCE_CAP`, default 2%): an announce whose airtime
+  would exceed the cap is deferred into a per-interface `announce_queue` and
+  emitted later. The port had `_announce_cap` hard-wired to `0` (so the throttle
+  never engaged) and `Interface::process_announce_queue()` stubbed. Both are
+  now live: `_announce_cap` is set at interface registration (percentage carried
+  in `rnsd_iface_t.announce_cap`, `0` ⇒ the 2% default; `RNS_IFACE_ANNOUNCE_CAP_DEFAULT`
+  in `ports.h`), configurable per interface. **The throttle math was also
+  broken by integer truncation** — `tx_time = (bytes*8)/bitrate` in `uint16_t`
+  is `0` for any sub-1-second frame, so `wait_time` was always `0`. All three
+  cap sites (`outbound()`, recursive `request_path()`, `process_announce_queue()`)
+  now compute in `double` seconds, matching upstream's float `announce_allowed_at`.
+- **Queue drain.** µR has no `threading.Timer`; `Transport::jobs()` polls each
+  interface and calls `process_announce_queue()` once `announce_allowed_at` has
+  elapsed, emitting one held announce (lowest hop count first). Queued announces
+  count as *handled* in `outbound()` (a `deferred` flag), so `Packet::send` no
+  longer logs a spurious "No interfaces could process" for a capped announce.
+- **Point-to-point split horizon.** A new interface property `point_to_point`
+  (`rnsd_iface_t.point_to_point`, mirrored to `Interface::_point_to_point`)
+  marks links with no hidden-node problem — a single peer (TCP) or a switched
+  LAN (auto). On those, `outbound()` does *not* re-broadcast a forwarded
+  announce back out the interface it arrived on, and `request_path()` does not
+  ask a peer for a path it just provided. This is a fork addition — stock RNS
+  does neither (it relies on `announce_cap` + receiver dedup). Radio interfaces
+  (LoRa, ESP-NOW) leave `point_to_point` false so re-broadcasts still reach
+  nodes hidden from the origin. The announce check keys off the rebroadcast
+  packet's `receiving_interface()` (carried from the stored announce packet at
+  retransmit time), **not** a `next_hop_interface()` path-table lookup — the
+  latter misses after path culls or interface reconnects.
+- **Path-request handling is mode-aware.** Discovery/forwarding and the
+  link-maintenance `request_path` sweep skip `MODE_ACCESS_POINT` interfaces
+  (don't spray the radio edge) and honour the point-to-point split horizon. The
+  forwarded-request dedup table (`_discovery_pr_tags`) evicts **FIFO**
+  (`_discovery_pr_tags_order`) instead of by `std::set` content order, and its
+  cap (`RNS_PR_TAGS_MAX`) is 256 — the old content-ordered eviction dropped
+  tags still circulating and let path requests loop between parallel uplinks.
+- **`transport_enabled` is live.** rnsd mirrors `s.rnsd.transport_enabled` into
+  the µR static via `NOW_AND_ON_CHANGE`, so toggling it takes effect without a
+  reboot (Transport reads the flag per forwarding decision). On the *disable*
+  transition `jobs()` clears `_announce_table` and drops all interface announce
+  queues (`drop_announce_queues()`, previously stubbed), so pending rebroadcasts
+  stop immediately instead of trickling the backlog out for minutes.
+
 ### 1.2 The rnsd layer (all new on top of µR)
 
 `rnsd` is entirely ours — µR has no concept of it. It adds:
