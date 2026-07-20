@@ -695,12 +695,48 @@ static inline void rnsdPacketSignal(const RNS::Packet& p, int16_t& rssi, int16_t
     rnsdSignalToInt16(p.rssi(), p.snr(), rssi, snr);
 }
 
+/* "Network infrastructure signal level": the received signal quality for the
+ * transport node that last relayed a packet to us. Published as rnsd.gw.rssi
+ * (dBm, int) and rnsd.gw.snr (dB, one decimal) — same string encoding as the
+ * per-message lxmf.msgmeta signal — for a packet that (a) arrived on a
+ * signal-capable interface (rssi present) and (b) transited at least one
+ * transport node. Fed centrally (onInboundPacketFilter, for anything addressed
+ * to one of our destinations or links — data, link setup, resource, at every
+ * stage) plus the delivery-proof path — not per protocol callback. Transport::
+ * inbound increments hops on every receive, so packet.hops() is 1 for a
+ * directly-received packet (0 transport relays) and >1 once relayed — hence the
+ * `<= 1` guard, not `== 0`. Kept as the last qualifying sample; not cleared when
+ * a direct packet arrives. */
+static void rnsdPublishGwSignalRaw(uint8_t hops, float rssi_f, float snr_f)
+{
+    if (hops <= 1) return;                          /* directly received ⇒ not a relayed/gateway sample */
+    int16_t rssi, snr;
+    rnsdSignalToInt16(rssi_f, snr_f, rssi, snr);
+    if (rssi == INT16_MIN) return;                 /* non-radio iface / no metric */
+    char rbuf[16], sbuf[16];
+    std::snprintf(rbuf, sizeof(rbuf), "%d", (int)rssi);
+    int sa = snr < 0 ? -snr : snr;                 /* sign kept separately so −0.x keeps its − */
+    std::snprintf(sbuf, sizeof(sbuf), "%s%d.%d", snr < 0 ? "-" : "", sa / 10, sa % 10);
+    storageBegin();
+    storageSet("rnsd.gw.rssi", rbuf);
+    storageSet("rnsd.gw.snr",  sbuf);
+    storageSet("rnsd.gw.timestamp", (int)RNS::Utilities::OS::time());   /* unix s; UIs fade the bars out over 30 min from here */
+    storageEnd();
+}
+static void rnsdPublishGwSignal(const RNS::Packet& packet)
+{
+    rnsdPublishGwSignalRaw(packet.hops(), packet.rssi(), packet.snr());
+}
+
 static void ourDestSendOutResult(our_dest_t& c, uint16_t send_id,
                                  uint8_t status, uint32_t rtt_ms, uint8_t hops,
                                  const uint8_t* first_hop = nullptr,
-                                 const char* iface = nullptr)
+                                 const char* iface = nullptr,
+                                 bool has_signal = false,
+                                 int16_t local_rssi = INT16_MIN, int16_t local_snr = 0,
+                                 int16_t remote_rssi = INT16_MIN, int16_t remote_snr = 0)
 {
-    uint8_t f[9 + RNSD_DEST_HASH_LEN + 1 + 24];
+    uint8_t f[9 + RNSD_DEST_HASH_LEN + 1 + 24 + 8];   /* +8 = optional signal trailer */
     f[0] = RNSD_DEST_OUT_RESULT;
     f[1] = (uint8_t)(send_id >> 8);
     f[2] = (uint8_t)(send_id & 0xFF);
@@ -720,8 +756,60 @@ static void ourDestSendOutResult(our_dest_t& c, uint16_t send_id,
         memcpy(f + len, iface, ilen);
         len += ilen;
     }
+    /* Optional signal trailer (the DELIVERED result): local(2+2) | remote(2+2),
+     * int16 BE each — rssi in dBm (INT16_MIN = absent), snr in dB×10. `local` is
+     * our rx of the proof packet; `remote` is the peer's rx of our message (from
+     * the rx-report proof). The consumer parses it by status, so it never
+     * collides with the first_hop/iface trailer carried on the SENT result. */
+    if (has_signal) {
+        f[len++] = (uint8_t)((uint16_t)local_rssi  >> 8); f[len++] = (uint8_t)local_rssi;
+        f[len++] = (uint8_t)((uint16_t)local_snr   >> 8); f[len++] = (uint8_t)local_snr;
+        f[len++] = (uint8_t)((uint16_t)remote_rssi >> 8); f[len++] = (uint8_t)remote_rssi;
+        f[len++] = (uint8_t)((uint16_t)remote_snr  >> 8); f[len++] = (uint8_t)remote_snr;
+    }
     if (itsSend(c.handle, f, len, pdMS_TO_TICKS(100)) == 0)
         warn("our-dest: OUT_RESULT send dropped (send_id=%u)", (unsigned)send_id);
+}
+
+/* ─────────────── rx-signal-report capability negotiation ───────────────
+ *
+ * Ephemeral per-peer map keyed by the peer's LXMF dest hash (hex), RAM-only and
+ * reset on reboot. `probes_sent` counts the extended (rx-report) proofs we've
+ * offered an unconfirmed peer, capped at s.rnsd.rx_report_probes; `confirmed`
+ * flips true once we receive an rx-report proof back (the peer is reticulous),
+ * after which we send only extended proofs to them. */
+struct peer_cap_t { uint8_t probes_sent = 0; bool confirmed = false; };
+static std::map<std::string, peer_cap_t> s_peer_caps;
+
+/* Prove an inbound direct packet, optionally appending our rx signal so a
+ * reticulous sender learns how we heard them (Packet::prove_report). Sends a
+ * plain proof when the feature is off, the packet wasn't a direct radio rx, or
+ * the peer is unknown; an extended proof only, once the peer is confirmed
+ * reticulous; and both (extended first, plain as the interop-safe fallback)
+ * while probing an unconfirmed peer, up to s.rnsd.rx_report_probes packets.
+ * peer_hex is the sender's LXMF dest hash (first 16 bytes of the decrypted
+ * plaintext). hops<=1 is a direct rx (Transport increments hops on receive). */
+static void proveInboundWithReport(RNS::Packet& packet, const std::string& peer_hex)
+{
+    int  budget = storageGetInt("s.rnsd.rx_report_probes", 3);
+    bool direct = packet.hops() <= 1;
+    bool radio  = !RNS::Type::isNan(packet.rssi());
+    if (budget <= 0 || !direct || !radio || peer_hex.empty()) {
+        packet.prove();
+        return;
+    }
+    peer_cap_t& cap = s_peer_caps[peer_hex];
+    if (cap.confirmed) {
+        packet.prove_report();               /* extended only */
+        return;
+    }
+    if (cap.probes_sent < (uint8_t)(budget > 255 ? 255 : budget)) {
+        packet.prove_report();               /* extended first … */
+        packet.prove();                      /* … then the vanilla safety net */
+        cap.probes_sent++;
+        return;
+    }
+    packet.prove();                          /* budget spent, unconfirmed → vanilla */
 }
 
 static void ourDestSendOutStatusBare(our_dest_t& c, uint16_t send_id, uint8_t type)
@@ -807,6 +895,7 @@ struct our_dest_receipt_t {
     uint16_t           send_id;
     uint8_t            hops;
     double             deadline;     /* OS::time() backstop */
+    RNS::Bytes         dest_hash;    /* recipient (peer) hash — keys the rx-report cap map */
     RNS::PacketReceipt receipt{RNS::Type::NONE};
 };
 
@@ -827,7 +916,10 @@ static void ourDestReceiptFree(our_dest_receipt_t& r)
 /* Free the slot, then emit the second OUT_RESULT iff the conn slot still
  * belongs to the consumer that sent (guards conn-slot reuse). */
 static void ourDestReceiptSettle(our_dest_receipt_t& r, uint8_t status,
-                                 uint32_t rtt_ms)
+                                 uint32_t rtt_ms,
+                                 bool has_signal = false,
+                                 int16_t local_rssi = INT16_MIN, int16_t local_snr = 0,
+                                 int16_t remote_rssi = INT16_MIN, int16_t remote_snr = 0)
 {
     int      conn_idx    = r.conn_idx;
     int      conn_handle = r.conn_handle;
@@ -836,7 +928,8 @@ static void ourDestReceiptSettle(our_dest_receipt_t& r, uint8_t status,
     ourDestReceiptFree(r);
     our_dest_t& c = s_our_dests[conn_idx];
     if (c.used && c.handle == conn_handle)
-        ourDestSendOutResult(c, send_id, status, rtt_ms, hops);
+        ourDestSendOutResult(c, send_id, status, rtt_ms, hops, nullptr, nullptr,
+                             has_signal, local_rssi, local_snr, remote_rssi, remote_snr);
 }
 
 /* mR delivery callback — runs on the rnsd task during Transport proof
@@ -851,13 +944,32 @@ static void onOurDestReceiptDelivery(const RNS::PacketReceipt& receipt)
         uint32_t rtt_ms = (uint32_t)(r.receipt.get_rtt() * 1000.0);
         info("our-dest: send_id=%u delivery proven (rtt=%u ms)",
              (unsigned)r.send_id, (unsigned)rtt_ms);
-        ourDestReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED, rtt_ms);
+        /* The delivery proof is itself a packet addressed to us; when it was
+         * relayed back over a radio interface it carries the gateway signal, so
+         * feed it to the gw indicator too (validate_proof_packet stamped its
+         * rssi/snr/hops onto the receipt). This lands the gw reading on the proof,
+         * a beat before the echo reply arrives. */
+        rnsdPublishGwSignalRaw(receipt.hops(), receipt.rssi(), receipt.snr());
+        /* Encode the proof's own rx signal (local: our rx of the proof packet)
+         * and, from an rx-report proof, the remote signal (the peer's rx of the
+         * message we sent) for the DELIVERED result → lxmf attaches both to the
+         * outbound message. A present remote reading also confirms the peer is
+         * reticulous, so we keep sending them extended proofs. */
+        int16_t lr, ls, rr, rs;
+        rnsdSignalToInt16(receipt.rssi(),        receipt.snr(),        lr, ls);
+        rnsdSignalToInt16(receipt.remote_rssi(), receipt.remote_snr(), rr, rs);
+        if (rr != INT16_MIN && r.dest_hash.size() >= RNSD_DEST_HASH_LEN)
+            s_peer_caps[r.dest_hash.toHex()].confirmed = true;
+        bool has_signal = (lr != INT16_MIN) || (rr != INT16_MIN);
+        ourDestReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED, rtt_ms,
+                             has_signal, lr, ls, rr, rs);
         return;
     }
 }
 
 static void ourDestReceiptTrack(our_dest_t& c, uint16_t send_id,
-                                RNS::PacketReceipt& receipt, uint8_t hops)
+                                RNS::PacketReceipt& receipt, uint8_t hops,
+                                const RNS::Bytes& dest_hash = {})
 {
     if (!s_our_dest_receipts || !receipt) return;
     our_dest_receipt_t* slot = nullptr;
@@ -879,6 +991,7 @@ static void ourDestReceiptTrack(our_dest_t& c, uint16_t send_id,
     slot->conn_handle = c.handle;
     slot->send_id     = send_id;
     slot->hops        = hops;
+    slot->dest_hash   = dest_hash;
     slot->deadline    = RNS::Utilities::OS::time()
                       + storageGetInt("s.rnsd.proof_timeout_s", 60);
     slot->receipt     = receipt;
@@ -1040,7 +1153,7 @@ static int ourDestTrySend(our_dest_t& c, uint16_t send_id,
          * proof lands, PROOF_TIMEOUT otherwise. */
         ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_SENT, 0, hops,
                              fh, ifn.empty() ? nullptr : ifn.c_str());
-        ourDestReceiptTrack(c, send_id, receipt, hops);
+        ourDestReceiptTrack(c, send_id, receipt, hops, dh);
         info("our-dest: send_id=%u sent to %s via %s (hops=%u, %zuB payload)",
              (unsigned)send_id, dh.toHex().c_str(),
              oif ? oif.toString().c_str() : "<none>",
@@ -1123,9 +1236,15 @@ static void onOurDestInbound(const RNS::Bytes& plaintext, const RNS::Packet& pac
              plaintext.size());
     }
     else if (s_prove_incoming) {
-        /* Delivered to the consumer task → emit the delivery proof now,
-         * exactly where upstream LXMF proves (inside delivery_packet). */
-        const_cast<RNS::Packet&>(packet).prove();
+        /* Delivered to the consumer task → emit the delivery proof now, exactly
+         * where upstream LXMF proves (inside delivery_packet). For a direct radio
+         * rx we may append our rx signal so the sender learns how we heard them;
+         * the peer key is the sender's LXMF dest hash — the first 16 bytes of the
+         * decrypted plaintext (dest||src||… with the leading dest stripped on the
+         * wire, so plaintext starts at src). */
+        std::string peer_hex = plaintext.size() >= RNSD_DEST_HASH_LEN
+            ? RNS::Bytes(plaintext.data(), RNSD_DEST_HASH_LEN).toHex() : std::string();
+        proveInboundWithReport(const_cast<RNS::Packet&>(packet), peer_hex);
     }
 }
 
@@ -3512,6 +3631,36 @@ static link_conn_t* linkFindByTag(const char* tag)
     return nullptr;
 }
 
+/* True when `dh` is one of our hosted destination hashes or an active link id —
+ * i.e. the packet is addressed to us, not just transiting through us. */
+static bool rnsdAddressedToUs(const RNS::Bytes& dh)
+{
+    if (ourDestFindByDestHash(dh)) return true;
+    if (s_link_conns)
+        for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++) {
+            link_conn_t& c = s_link_conns[j];
+            if (c.used && c.link && c.link.link_id().size() >= 16 && c.link.link_id() == dh)
+                return true;
+        }
+    return false;
+}
+
+/* Central inbound gw hook (Transport packet filter): ANY packet addressed to one
+ * of our destinations or links — opportunistic data, link setup, link data,
+ * resource, every stage — feeds the gateway signal when it was relayed to us
+ * over radio (rnsdPublishGwSignal applies the hops>1 + signal-present criteria).
+ * Doing it here, once, avoids instrumenting each protocol path. Delivery proofs
+ * (addressed by packet hash, not our dest) are handled in the receipt-delivery
+ * callback. Observe only — always accepts, never drops. Runs on the rnsd task
+ * (Transport::inbound is driven from onTransportRecv), so table access is
+ * lock-free. */
+static bool onInboundPacketFilter(const RNS::Packet& packet)
+{
+    if (rnsdAddressedToUs(packet.destination_hash()))
+        rnsdPublishGwSignal(packet);
+    return true;
+}
+
 static void linkFreeSlot(link_conn_t& c);   /* defined below */
 
 static inline void linkTouch(link_conn_t& c)
@@ -5858,6 +6007,9 @@ static void rnsdTaskMain(void*)
             }
         });
         s_reticulum->start();
+        /* Central gw-signal hook: see onInboundPacketFilter. Set after start so
+         * the stack is up; it only observes (always accepts). */
+        RNS::Transport::set_filter_packet_callback(onInboundPacketFilter);
         info("Reticulum/Transport up (transport_enabled=%d)",
              (int)RNS::Reticulum::transport_enabled());
 

@@ -95,6 +95,19 @@ Our deltas, by category:
   exists and verifies against the peer's link signing key, so the call is wired
   up. Without it a packet sent over a Link could never conclude its receipt
   (`DELIVERED`), which the per-link proof counters depend on.
+- `Packet.{h,cpp}`/`Identity.{h,cpp}` — **rx-signal report riding the delivery
+  proof** (the "extended proof"; see [rnsd §5.7](../../INTERNALS.md)). `Packet::
+  prove_report` / `Identity::prove(report_signal=true)` append the prover's own
+  rx signal (`int16 rssi dBm | int16 snr×10`, BE) after the proof data, outside
+  the signature (which covers only the packet hash). `validate_proof` accepts the
+  trailing 4 bytes on both proof forms — `IMPL_LENGTH + 4` (implicit, the default
+  per `should_use_implicit_proof`) and `EXPL_LENGTH + 4` — and `validate_proof_
+  packet` decodes them into new `PacketReceipt::remote_rssi/remote_snr` (which
+  also captures the proof packet's own rssi/snr/hops for the receipt callback).
+  `Transport.cpp`'s proof-hash size check likewise admits `EXPL_LENGTH + 4`.
+  **Pitfall:** the trailer is inert to validation (signature covers only the
+  hash), but a *vanilla* receiver length-rejects the longer proof — so rnsd only
+  emits it under the per-peer negotiation in rnsd §5.7, never blindly.
 - `Link.cpp`/`Transport.cpp` — **links follow the peer across interfaces.**
   `Link::receive` treated a link packet arriving on an interface other than
   `_attached_interface` as hostile ("Someone might be trying to manipulate your
@@ -530,6 +543,47 @@ channel.
   reverse index `rnsd.chan.byid.<link_id>`. Closing the ITS handle tears the
   Channel + hidden Link down and deletes the subtree — same 1:1 handle==channel
   lifetime as Links (§5.2).
+
+## 5.7 rx-signal reports & the gateway indicator
+
+Two related radio-signal features, both rnsd-side (the on-wire proof format
+lives in µR — see §1.1).
+
+**Gateway signal (`rnsd.gw.*`).** The received quality of the transport node
+that last relayed a packet to us. Published centrally from
+`onInboundPacketFilter` (registered as µR's `Transport` packet filter, so it
+observes every inbound packet — data, link setup, link data, resource — with
+rssi/hops already attached) for any packet addressed to one of our hosted
+destinations or active links (`rnsdAddressedToUs`), plus the delivery-proof path
+(`onOurDestReceiptDelivery`). A sample qualifies only when it arrived on a
+signal-capable interface (rssi present) and transited ≥1 transport node. Note
+`Transport::inbound` increments hops on every receive, so a **directly**-received
+packet reports `hops()==1`; the gateway test is therefore `hops() > 1`, and a
+direct packet feeds the per-contact/per-message signal instead, never gw.
+Published as `rnsd.gw.{rssi,snr,timestamp}`; kept as the last qualifying sample.
+
+**Per-message rx reports (the "extended proof").** So a sender can learn how
+well the recipient heard it, a reticulous node appends its own rx signal
+(`int16 rssi dBm | int16 snr×10`, BE) to the delivery proofs it emits for
+messages that reached it **direct** (`hops ≤ 1`) on radio — `Packet::prove_report`
+/ `Identity::prove(report_signal=true)`. The receiver decodes it off the proof
+into `PacketReceipt::remote_rssi/remote_snr` and rnsd forwards local (our rx of
+the proof) + remote (the peer's rx of our message) on the DELIVERED `OUT_RESULT`
+signal trailer, keyed by send_id, for lxmf to attach to the outbound message.
+
+*Interop.* The append lengthens the proof, which a vanilla RNS node would
+length-reject (losing its delivered-tick). So `proveInboundWithReport` negotiates
+per peer (`s_peer_caps`, keyed by the sender's LXMF hash = first 16 bytes of the
+decrypted plaintext; RAM-only, reboot-reset): while a peer is unconfirmed it
+sends the **extended proof first, then a plain proof** as the interop-safe
+fallback, for up to `s.rnsd.rx_report_probes` packets; receiving an extended
+proof *back* from a peer confirms it reticulous, after which only the extended
+proof is sent. A vanilla peer thus always validates the plain proof and never
+sees a lone extended one. `0` disables emission entirely.
+
+The gateway's *own* remote half (the transport node's rx of us) has no source
+yet — the rx report is endpoint-direct-only — so the gw indicator is single-set
+until a transit-node report mechanism is added.
 
 ## 6. Boot barrier
 

@@ -2875,7 +2875,10 @@ static const Bytes& ifac_salt() {
 				}
 
 				Bytes proof_hash;
-				if (packet.data().size() == Type::PacketReceipt::EXPL_LENGTH) {
+				// EXPL_LENGTH (+4 for a reticulous rx-report trailer) is an
+				// explicit proof; the hash is its first HASHLENGTH bytes.
+				if (packet.data().size() == Type::PacketReceipt::EXPL_LENGTH ||
+				    packet.data().size() == Type::PacketReceipt::EXPL_LENGTH + 4) {
 					proof_hash = packet.data().left(Type::Identity::HASHLENGTH/8);
 				}
 

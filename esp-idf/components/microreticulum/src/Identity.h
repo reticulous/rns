@@ -128,7 +128,7 @@ namespace RNS {
 		bool validate(const Bytes& signature, const Bytes& message) const;
 		// CBA following default for reference value requires inclusiion of header
 		//void prove(const Packet& packet, const Destination& destination = {Type::NONE}) const;
-		void prove(const Packet& packet, const Destination& destination) const;
+		void prove(const Packet& packet, const Destination& destination, bool report_signal = false) const;
 		void prove(const Packet& packet) const;
 
 		static const Identity from_file(const char* path);

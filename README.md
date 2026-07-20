@@ -211,6 +211,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.respond_to_probes` | `1` | Host `rnstransport.probe` and answer probes (PROVE_ALL). |
 | `s.rnsd.prove_incoming` | `1` | Emit delivery proofs for inbound packets we receive. |
 | `s.rnsd.proof_timeout_s` | `60` | Deadline for an outbound delivery-proof receipt. |
+| `s.rnsd.rx_report_probes` | `3` | Reticulous rx-signal report: how many delivery proofs to a new direct peer carry our rx signal appended (the "extended" proof), before we give up probing an unconfirmed peer. `0` disables the feature (plain proofs only). See INTERNALS §5.7. |
 | `s.rnsd.link.path_timeout_s` | `30` | Path-request / link-request retry budget. |
 | `s.rnsd.link.request_timeout_s` | `15` | Request/response (page fetch) timeout. |
 | `s.rnsd.link.max_inbound_resources_total` | `4` | Concurrent inbound Resource cap across all links. |
@@ -228,6 +229,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.identity_hash` | Hex hash of rnsd's default identity. |
 | `rnsd.iface_event_seq` | Monotonic counter bumped on interface up/down. |
 | `rnsd.stats.{packets_in,packets_out,bytes_in,bytes_out,ifaces_up}` | Traffic counters. |
+| `rnsd.gw.{rssi,snr,timestamp}` | Gateway/infrastructure signal — the received quality (rssi dBm, snr dB) of the transport node that last relayed a packet to us: the last packet addressed to one of our destinations/links that arrived on a signal-capable interface with more than one hop. `timestamp` is device unix-seconds of that sample (UIs fade the indicator out over ~30 min from it). Kept as the last qualifying sample; not cleared on a direct packet. |
 | `rnsd.links.<tag>.{state,direction,aspect,remote_hash,opened_s,last_error,…}` | Per-link state tree, keyed by the caller's `tag` — observable before the link_id exists. |
 | `rnsd.links.byid.<link_id>` | Reverse index: link_id → tag. |
 | `rnsd.chan.<tag>.{state,direction,aspect,remote_hash,link_id,mtu,rtt_ms,tx_msgs,rx_msgs,last_error,…}` | Per-channel state tree (`rnsdChannelOpen`), same shape as the link tree. |

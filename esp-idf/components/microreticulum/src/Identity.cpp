@@ -677,7 +677,7 @@ bool Identity::validate(const Bytes& signature, const Bytes& message) const {
 	}
 }
 
-void Identity::prove(const Packet& packet, const Destination& destination /*= {Type::NONE}*/) const {
+void Identity::prove(const Packet& packet, const Destination& destination /*= {Type::NONE}*/, bool report_signal /*= false*/) const {
 	assert(_object);
 	Bytes signature(sign(packet.packet_hash()));
 	Bytes proof_data;
@@ -689,7 +689,21 @@ void Identity::prove(const Packet& packet, const Destination& destination /*= {T
 		proof_data = packet.packet_hash() + signature;
 		TRACEF("Identity::prove: explicit proof data: %s", proof_data.toHex().c_str());
 	}
-	
+	// Reticulous "rx report": append our own rx signal of the proven packet
+	// (int16 rssi dBm | int16 snr×10, big-endian) AFTER the proof data, outside
+	// the signature (which covers only packet_hash). Only when asked and we have
+	// a radio reading. A vanilla receiver ignores or length-rejects the longer
+	// proof; a reticulous receiver reads it as the remote reading for the message
+	// this proves. See Packet::prove_report and PacketReceipt::validate_proof.
+	if (report_signal && !Type::isNan(packet.rssi())) {
+		auto rnd = [](float x) -> int16_t { return (int16_t)(x < 0 ? x - 0.5f : x + 0.5f); };
+		int16_t r = rnd(packet.rssi());
+		int16_t s = Type::isNan(packet.snr()) ? 0 : rnd(packet.snr() * 10.0f);
+		uint8_t tail[4] = { (uint8_t)((uint16_t)r >> 8), (uint8_t)r,
+		                    (uint8_t)((uint16_t)s >> 8), (uint8_t)s };
+		proof_data << Bytes(tail, sizeof(tail));
+	}
+
 	if (!destination) {
 		TRACE("Identity::prove: proving packet with proof destination...");
 		ProofDestination proof_destination = packet.generate_proof_destination();

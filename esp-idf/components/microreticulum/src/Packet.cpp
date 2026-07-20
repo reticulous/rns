@@ -554,6 +554,24 @@ void Packet::prove(const Destination& destination /*= {Type::NONE}*/) {
 	}
 }
 
+void Packet::prove_report(const Destination& destination /*= {Type::NONE}*/) {
+	assert(_object);
+	TRACE("Packet::prove_report: proving packet with rx-report...");
+	if (_object->_fromPacked && _object->_destination) {
+		if (_object->_destination.identity() && _object->_destination.identity().prv()) {
+			_object->_destination.identity().prove(*this, destination, /*report_signal=*/true);
+		}
+	}
+	else if (_object->_fromPacked && _object->_link) {
+		// Link proofs use LRPROOF framing; the rx-report append isn't wired for
+		// them, so fall back to a plain link proof.
+		_object->_link.prove_packet(*this);
+	}
+	else {
+		ERROR("Could not prove packet associated with neither a destination nor a link");
+	}
+}
+
 
 // Generates a special destination that allows Reticulum
 // to direct the proof back to the proved packet's sender
@@ -854,6 +872,31 @@ PacketReceipt::PacketReceipt(const Packet& packet) : _object(new Object()) {
 
 // Validate a proof packet
 bool PacketReceipt::validate_proof_packet(const Packet& proof_packet) {
+	// Capture the proof packet's radio signal + hop count onto the receipt
+	// before validating, so the delivery callback fired below can read the
+	// received quality of the transport node that relayed the proof back to us
+	// (Transport::inbound already copied the interface's rssi/snr onto it).
+	if (_object && proof_packet) {
+		_object->_hops = proof_packet.hops();
+		_object->_rssi = proof_packet.rssi();
+		_object->_snr  = proof_packet.snr();
+		// Reticulous rx-report trailer: a proof followed by 4 bytes (int16 rssi
+		// dBm | int16 snr×10, big-endian) — the prover's own rx of the packet we
+		// sent. Decode as the REMOTE reading, independent of whether the receipt is
+		// still pending (so it survives the vanilla/extended proof race). The proof
+		// body is IMPL_LENGTH (sig only — the default, should_use_implicit_proof)
+		// or EXPL_LENGTH (hash+sig); the trailer is the last 4 bytes.
+		const Bytes& d = proof_packet.data();
+		size_t base = (d.size() == IMPL_LENGTH + 4) ? IMPL_LENGTH
+		            : (d.size() == EXPL_LENGTH + 4) ? EXPL_LENGTH : 0;
+		if (base > 0) {
+			const uint8_t* p = d.data() + base;
+			int16_t r = (int16_t)(((uint16_t)p[0] << 8) | p[1]);
+			int16_t s = (int16_t)(((uint16_t)p[2] << 8) | p[3]);
+			_object->_remote_rssi = (float)r;
+			_object->_remote_snr  = s / 10.0f;
+		}
+	}
 	if (proof_packet.link()) {
 		return validate_link_proof(proof_packet.data(), proof_packet.link(), proof_packet);
 	}
@@ -940,7 +983,11 @@ bool PacketReceipt::validate_proof(const Bytes& proof, const Packet& proof_packe
 	TRACE("PacketReceipt::validate_proof: validating proof...");
 	// CBA LINK
 	// CBA TODO: Determine whether to use destination.identity or link.identity here!!!
-	if (proof.size() == EXPL_LENGTH) {
+	// EXPL_LENGTH + 4 is a reticulous rx-report proof (explicit proof + trailing
+	// signal). The hash+sig are the first EXPL_LENGTH bytes and the signature
+	// covers only the hash, so the trailer is inert to validation here (it's
+	// decoded in validate_proof_packet). Accept it exactly like a plain explicit.
+	if (proof.size() == EXPL_LENGTH || proof.size() == EXPL_LENGTH + 4) {
 		// This is an explicit proof
 		Bytes proof_hash = proof.left(Type::Identity::HASHLENGTH/8);
 		Bytes signature = proof.mid(Type::Identity::HASHLENGTH/8, Type::Identity::SIGLENGTH/8);
@@ -969,8 +1016,11 @@ bool PacketReceipt::validate_proof(const Bytes& proof, const Packet& proof_packe
 			return false;
 		}
 	}
-	else if (proof.size() == IMPL_LENGTH) {
-		// This is an implicit proof
+	else if (proof.size() == IMPL_LENGTH || proof.size() == IMPL_LENGTH + 4) {
+		// This is an implicit proof (the default). IMPL_LENGTH + 4 is a reticulous
+		// rx-report proof: the signature is the first IMPL_LENGTH bytes and the
+		// trailing 4 signal bytes are inert to validation (decoded separately in
+		// validate_proof_packet), so accept it exactly like a plain implicit proof.
 		if (!_object->_destination.identity()) {
 			return false;
 		}

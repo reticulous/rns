@@ -1,9 +1,11 @@
 import { ref } from 'vue'
 import { useMenuStore } from 'spangap-browser/stores/menu'
 import { registerWindowMount } from 'spangap-browser/lib/windowMounts'
+import { registerTopbarIcon } from 'spangap-browser/lib/topbarIcons'
 import RnsdPanel from '../panels/RnsdPanel.vue'
 import MapWindow from '../panels/MapWindow.vue'
 import NodesWindow from '../panels/NodesWindow.vue'
+import GwSignal from '../panels/GwSignal.vue'
 
 /* Visibility ref for the Status → Map floating window. Toggled by the menu
  * action below; <StraddleWindows/> binds the MapWindow component to it via the
@@ -14,6 +16,10 @@ export const nodesVisible = ref(false)
 
 export function registerRnsd() {
   const menu = useMenuStore()
+
+  /* Gateway/infrastructure signal bars in the app header, left of the power
+   * button — the received quality of the transport node that last relayed to us. */
+  registerTopbarIcon({ id: 'rnsd-gw-signal', component: GwSignal })
 
   registerWindowMount({ id: 'nodes', title: 'Reticulum Nodes',
                         component: NodesWindow, visible: nodesVisible })

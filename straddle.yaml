@@ -71,6 +71,8 @@ settings:
       - switch: { label: "Enable", key: "s.rnsd.enable", default: 1 }
       - switch: { label: "Transport node", key: "s.rnsd.transport_enabled", default: 0 }
       - slider: { label: "Announce (s)", key: "s.rnsd.announce.interval", min: 0, max: 21600, default: 1800 }
+      - slider: { label: "Signal-report probes", key: "s.rnsd.rx_report_probes", min: 0, max: 10, default: 3 }
+      - caption: "Extra proofs offering our rx signal to a new direct peer (0 = off)."
       - section: "Path Table"
       - slider: { label: "Capacity", key: "s.rnsd.path.max", min: 64, max: 512 }
       - slider: { label: "TTL (s)", key: "s.rnsd.path.ttl", min: 3600, max: 604800 }

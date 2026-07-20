@@ -118,6 +118,18 @@ namespace RNS {
 		inline Type::PacketReceipt::Status status() const { assert(_object); return _object->_status; }
 		inline bool proved() const { assert(_object); return _object->_proved; }
 		inline double concluded_at() const { assert(_object); return _object->_concluded_at; }
+		// Radio signal + hops of the proof packet that concluded this receipt
+		// (valid once proved(); NaN rssi/snr = the proof arrived on a non-radio
+		// interface). hops is the raw RNS count (1 = directly received).
+		inline uint8_t hops() const { assert(_object); return _object->_hops; }
+		inline float rssi() const { assert(_object); return _object->_rssi; }
+		inline float snr()  const { assert(_object); return _object->_snr; }
+		// REMOTE signal the prover reported (its own rx of the packet we sent),
+		// decoded from the 4 bytes a reticulous prover appends to a direct-rx
+		// proof; NaN = the proof carried none (relayed, non-radio, or a vanilla
+		// prover). See Packet::prove_report / validate_proof.
+		inline float remote_rssi() const { assert(_object); return _object->_remote_rssi; }
+		inline float remote_snr()  const { assert(_object); return _object->_remote_snr; }
 		inline const Bytes& truncated_hash() const { assert(_object); return _object->_truncated_hash; }
 		inline const Callbacks& callbacks() const { assert(_object); return _object->_callbacks; }
 
@@ -144,6 +156,17 @@ namespace RNS {
 			// CBA TODO This shoujld almost certainly not be a reference but we have an issue with circular dependency between Packet and PacketReceipt
 			//Packet _proof_packet = {Type::NONE};
 			int16_t _timeout = 0;
+			// Radio signal + hop count of the validating proof packet, captured
+			// in validate_proof*() so a delivery callback can read the received
+			// quality of the transport node that relayed the proof back to us
+			// (the same telemetry Packet carries; NaN = no signal / non-radio).
+			uint8_t _hops = 0;
+			float _rssi = Type::NaN<float>;
+			float _snr  = Type::NaN<float>;
+			// Coarse-free REMOTE signal appended by a reticulous prover (its rx of
+			// the packet we sent); decoded from the proof's trailing 4 bytes.
+			float _remote_rssi = Type::NaN<float>;
+			float _remote_snr  = Type::NaN<float>;
 		friend class PacketReceipt;
 		};
 		std::shared_ptr<Object> _object;
@@ -230,6 +253,14 @@ namespace RNS {
 		PacketReceipt send();
 		bool resend();
 		void prove(const Destination& destination = {Type::NONE});
+		// Like prove(), but appends this packet's own rx signal (int16 rssi dBm |
+		// int16 snr×10, big-endian) after the proof data, outside the signature.
+		// The reticulous receiver reads it as the "remote" reading for the message
+		// this proves; a vanilla receiver length-rejects the longer proof (which is
+		// why rnsd only sends it alongside a plain prove() until the peer is known
+		// reticulous). Opportunistic (Identity) proofs only; link proofs fall back
+		// to a plain prove.
+		void prove_report(const Destination& destination = {Type::NONE});
 		ProofDestination generate_proof_destination() const;
 		bool validate_proof_packet(const Packet& proof_packet);
 		bool validate_proof(const Bytes& proof);
