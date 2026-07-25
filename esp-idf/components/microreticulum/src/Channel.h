@@ -32,8 +32,10 @@
 //     already polls link tx receipts — no global receipt registry.
 //   * A single receive callback carrying an opaque ctx pointer replaces the
 //     Python message-handler list; the rnsd bridge sets ctx to its channel slot.
-//   * The message layer is generic opaque bytes (one internal MSGTYPE); callers
-//     frame their own application protocol inside the payload.
+//   * The message layer carries the upstream 16-bit envelope msgtype end to end:
+//     send() takes it and the receive callback delivers it, so callers can speak
+//     a multi-message-type application protocol (e.g. rnsh) byte-identically to
+//     upstream Reticulum. MSGTYPE_RAW remains the default for opaque-bytes users.
 
 #include "Bytes.h"
 #include "Type.h"
@@ -48,8 +50,9 @@ namespace RNS {
 	class Channel {
 
 	public:
-		// Internal envelope message type for opaque consumer bytes. Unique and
-		// < 0xf000 (upstream reserves >= 0xf000 for system types).
+		// Default envelope message type for opaque consumer bytes. Unique and
+		// < 0xf000 (upstream reserves >= 0xf000 for system types). Callers that
+		// speak a typed protocol pass their own msgtype to send().
 		static const uint16_t MSGTYPE_RAW = 0x0100;
 
 		// Initial / bounded window. v1 uses a small fixed window (adaptive RTT
@@ -62,9 +65,10 @@ namespace RNS {
 		static const uint32_t SEQ_MODULUS = 0x10000;
 		static const uint8_t  MAX_TRIES   = 5;
 
-		// Signature of the delivered-message sink. `data` is the message payload
-		// (envelope contents, not the header). Delivered in strict sequence order.
-		using Receive = void(*)(void* ctx, const Bytes& data);
+		// Signature of the delivered-message sink. `msgtype` is the envelope's
+		// 16-bit message type; `data` is the payload (envelope contents, not the
+		// header). Delivered in strict sequence order.
+		using Receive = void(*)(void* ctx, uint16_t msgtype, const Bytes& data);
 
 	public:
 		Channel(Type::NoneConstructor none) {}
@@ -87,10 +91,12 @@ namespace RNS {
 	public:
 		// True when the TX window has room for another send.
 		bool is_ready_to_send() const;
-		// Wrap `data` in an envelope and transmit as one CHANNEL link packet.
-		// Returns false (and sends nothing) if not ready or the packed size
-		// exceeds the channel MDU — the caller should buffer and retry.
-		bool send(const Bytes& data);
+		// Wrap `data` in an envelope (of type `msgtype`) and transmit as one
+		// CHANNEL link packet. Returns false (and sends nothing) if not ready or
+		// the packed size exceeds the channel MDU — the caller should buffer and
+		// retry. The no-msgtype overload uses MSGTYPE_RAW.
+		bool send(uint16_t msgtype, const Bytes& data);
+		bool send(const Bytes& data) { return send(MSGTYPE_RAW, data); }
 		// Fed by Link::receive() with the decrypted plaintext of an inbound
 		// CHANNEL packet. Handles sequencing/dedup and fires the receive callback
 		// for each in-order message.

@@ -35,6 +35,7 @@ namespace RNS {
 	public:
 		struct Envelope {
 			uint16_t sequence = 0;
+			uint16_t msgtype = Channel::MSGTYPE_RAW;  // RX: envelope msgtype.
 			Bytes    raw;                    // TX: packed 6B header + payload.
 			                                 // RX: extracted payload only.
 			Packet   packet{Type::NONE};     // TX only: the sent link packet.
@@ -99,7 +100,7 @@ bool Channel::is_ready_to_send() const {
 	return outstanding < d._window;
 }
 
-bool Channel::send(const Bytes& data) {
+bool Channel::send(uint16_t msgtype, const Bytes& data) {
 	if (!_object) return false;
 	ChannelData& d = *_object;
 	if (!is_ready_to_send()) return false;
@@ -107,8 +108,8 @@ bool Channel::send(const Bytes& data) {
 	uint16_t seq = d._next_sequence;
 	uint16_t len = (uint16_t)data.size();
 	uint8_t hdr[6];
-	hdr[0] = (uint8_t)(MSGTYPE_RAW >> 8);
-	hdr[1] = (uint8_t)(MSGTYPE_RAW & 0xFF);
+	hdr[0] = (uint8_t)(msgtype >> 8);
+	hdr[1] = (uint8_t)(msgtype & 0xFF);
 	hdr[2] = (uint8_t)(seq >> 8);
 	hdr[3] = (uint8_t)(seq & 0xFF);
 	hdr[4] = (uint8_t)(len >> 8);
@@ -187,6 +188,7 @@ void Channel::_receive(const Bytes& raw) {
 	ChannelData& d = *_object;
 	if (raw.size() < 6) return;
 	const uint8_t* p = raw.data();
+	uint16_t msgtype = (uint16_t)((p[0] << 8) | p[1]);
 	uint16_t seq = (uint16_t)((p[2] << 8) | p[3]);
 	uint16_t len = (uint16_t)((p[4] << 8) | p[5]);
 	size_t avail = raw.size() - 6;
@@ -209,6 +211,7 @@ void Channel::_receive(const Bytes& raw) {
 
 	ChannelData::Envelope env;
 	env.sequence = seq;
+	env.msgtype = msgtype;
 	env.raw = Bytes(p + 6, len);   // payload only for RX envelopes
 	if (!channelRxEmplace(d._rx_ring, env, d._next_rx_sequence)) {
 		DEBUGF("Channel: duplicate message (seq %u) received", (unsigned)seq);
@@ -222,9 +225,10 @@ void Channel::_receive(const Bytes& raw) {
 			if (it->sequence == d._next_rx_sequence) break;
 		if (it == d._rx_ring.end()) break;
 		Bytes payload = it->raw;
+		uint16_t mt = it->msgtype;
 		d._rx_ring.erase(it);
 		d._next_rx_sequence = (uint16_t)((d._next_rx_sequence + 1) % Channel::SEQ_MODULUS);
-		if (d._recv_cb) d._recv_cb(d._recv_ctx, payload);
+		if (d._recv_cb) d._recv_cb(d._recv_ctx, mt, payload);
 	}
 }
 

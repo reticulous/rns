@@ -22,6 +22,7 @@
 #include "Packet.h"
 #include "Log.h"
 #include "MsgPack.h"
+#include "Compression.h"
 #include "bzlib.h"
 
 #include <algorithm>
@@ -69,14 +70,17 @@ Bytes rns_full_hash2(const Bytes& a, const uint8_t* b, size_t blen) {
 	return Identity::full_hash(in);
 }
 
-// bz2 (de)compression for Resource payloads — Reticulum/NomadNet compress
-// Resource data with Python bz2; every client speaks it. Buffer-to-buffer
-// only (BZ_NO_STDIO). bzip2's malloc lands in PSRAM on this platform.
+} // namespace
 
-// Decompress `in` into exactly `out_size` bytes (we know the uncompressed
-// size from the advertisement's `d`). small=1 trades speed for ~1/3 the
-// working set so a level-9 stream stays well within PSRAM. false on error.
-bool rns_bz2_decompress(const Bytes& in, size_t out_size, Bytes& out) {
+// bz2 (de)compression — Reticulum/NomadNet compress Resource payloads and rnsh
+// stream chunks with Python bz2; every peer speaks it. Buffer-to-buffer only
+// (BZ_NO_STDIO). bzip2's malloc lands in PSRAM on this platform. Declared in
+// Compression.h for reuse by the rnsh channel protocol.
+namespace RNS {
+
+// small=1 trades speed for ~1/3 the working set so a level-9 stream stays well
+// within PSRAM.
+bool bz2_decompress(const Bytes& in, size_t out_size, Bytes& out) {
 	if (out_size == 0) { out = Bytes(); return true; }
 	std::vector<uint8_t> buf(out_size);
 	unsigned int dlen = static_cast<unsigned int>(out_size);
@@ -89,10 +93,23 @@ bool rns_bz2_decompress(const Bytes& in, size_t out_size, Bytes& out) {
 	return true;
 }
 
-// Compress `in`; fills `out` and returns true only if compression succeeded
-// AND shrank the data (else the caller sends it uncompressed). blockSize100k=1
-// bounds our working set (~1 MB); any bz2 decompressor handles any block size.
-bool rns_bz2_compress(const Bytes& in, Bytes& out) {
+bool bz2_decompress_bounded(const Bytes& in, size_t max_out, Bytes& out) {
+	if (in.size() == 0) { out = Bytes(); return true; }
+	if (max_out == 0) return false;
+	std::vector<uint8_t> buf(max_out);
+	unsigned int dlen = static_cast<unsigned int>(max_out);
+	int r = BZ2_bzBuffToBuffDecompress(
+		reinterpret_cast<char*>(buf.data()), &dlen,
+		reinterpret_cast<char*>(const_cast<uint8_t*>(in.data())),
+		static_cast<unsigned int>(in.size()), /*small=*/1, /*verbosity=*/0);
+	if (r != BZ_OK) return false;   /* BZ_OUTBUFF_FULL if it exceeds max_out */
+	out = Bytes(buf.data(), dlen);
+	return true;
+}
+
+// blockSize100k=1 bounds our working set (~1 MB); any bz2 decompressor handles
+// any block size.
+bool bz2_compress(const Bytes& in, Bytes& out) {
 	if (in.size() == 0) return false;
 	unsigned int cap = static_cast<unsigned int>(in.size() + in.size() / 100 + 600);
 	std::vector<uint8_t> buf(cap);
@@ -107,7 +124,7 @@ bool rns_bz2_compress(const Bytes& in, Bytes& out) {
 	return true;
 }
 
-} // namespace
+} // namespace RNS
 
 void Resource::_init_outbound(const Bytes& plaintext, bool advertise,
                               const Bytes& request_id, bool is_request,
@@ -132,7 +149,7 @@ void Resource::_init_outbound(const Bytes& plaintext, bool advertise,
 	Bytes compressed;
 	d._flags.compressed = (auto_compress &&
 	                       plaintext.size() <= Type::Resource::AUTO_COMPRESS_MAX_SIZE &&
-	                       rns_bz2_compress(plaintext, compressed));
+	                       bz2_compress(plaintext, compressed));
 	const Bytes& on_wire = d._flags.compressed ? compressed : plaintext;
 	if (d._flags.compressed)
 		INFOF("Resource: bz2 %zu -> %zu B", plaintext.size(), on_wire.size());
@@ -619,7 +636,7 @@ bool Resource::receive_part(const Bytes& part_data) {
 				Bytes data;
 				bool data_ok = true;
 				if (d._flags.compressed) {
-					if (!rns_bz2_decompress(onwire, d._total_size, data)) {
+					if (!bz2_decompress(onwire, d._total_size, data)) {
 						WARNING("Resource: bz2 decompress failed — corrupt");
 						data_ok = false;
 					}

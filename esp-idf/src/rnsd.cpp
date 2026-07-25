@@ -39,6 +39,7 @@
 #include "Destination.h"
 #include "Link.h"
 #include "Channel.h"
+#include "Compression.h"
 #include "Resource.h"
 #include "Persistence/DestinationEntry.h"
 #include "Utilities/OS.h"
@@ -5197,27 +5198,62 @@ static chan_conn_t* chanAlloc() {
     return nullptr;
 }
 
+/* The channel ITS pipe frames every message as [msgtype:2 BE][payload], so a
+ * consumer speaking a typed application protocol (rnsh, byte-identical to
+ * upstream Reticulum) chooses the envelope msgtype per message and sees the
+ * peer's. Opaque-bytes consumers simply prefix MSGTYPE_RAW. */
+#define CHAN_MSGTYPE_PREFIX 2
+
+/* bz2-decompress an rnsh stream chunk (it carries no uncompressed length, so
+ * the caller bounds the output). Exposed via rnsd.h so rnsh can read compressed
+ * StreamData frames from stock upstream peers. */
+size_t rnsdBz2Decompress(const uint8_t* in, size_t in_len, uint8_t* out, size_t max_out) {
+    RNS::Bytes decoded;
+    if (!RNS::bz2_decompress_bounded(RNS::Bytes(in, in_len), max_out, decoded)) return 0;
+    if (decoded.size() > max_out) return 0;
+    if (decoded.size()) memcpy(out, decoded.data(), decoded.size());
+    return decoded.size();
+}
+
 /* Delivered Channel message → consumer handle. ctx is the chan_conn_t*; the
  * message layer carries the opaque ctx so this needs no match-by-id. A short
  * itsSend timeout absorbs transient consumer backpressure (the channel already
  * proved+advanced this message, so a hard drop would break in-order delivery). */
-static void onChannelMsgCb(void* ctx, const RNS::Bytes& data) {
+static void onChannelMsgCb(void* ctx, uint16_t msgtype, const RNS::Bytes& data) {
     chan_conn_t* c = (chan_conn_t*)ctx;
     if (!c || !c->used || c->handle < 0) return;
     chanTouch(*c);
-    if (itsSend(c->handle, data.data(), data.size(), pdMS_TO_TICKS(50)) == 0) {
-        warn("chan[%s]: rx overflow (%zuB dropped)", c->tag, data.size());
+    PSRAM_BSS static uint8_t framed[2048];
+    size_t n = data.size();
+    if (n + CHAN_MSGTYPE_PREFIX > sizeof(framed)) {
+        warn("chan[%s]: rx message %zuB too big to frame", c->tag, n);
+        chanSetError(*c, "rx_oversize");
+        return;
+    }
+    framed[0] = (uint8_t)(msgtype >> 8);
+    framed[1] = (uint8_t)(msgtype & 0xFF);
+    if (n) memcpy(framed + CHAN_MSGTYPE_PREFIX, data.data(), n);
+    if (itsSend(c->handle, framed, n + CHAN_MSGTYPE_PREFIX, pdMS_TO_TICKS(50)) == 0) {
+        warn("chan[%s]: rx overflow (%zuB dropped)", c->tag, n);
         chanSetError(*c, "rx_overflow");
     } else {
         chanBumpInt(*c, "rx_msgs");
     }
 }
 
+/* Split a framed [msgtype][payload] consumer message and send it as one typed
+ * Channel envelope. Returns false if the channel is not ready (caller buffers). */
+static bool chanSendFramed(chan_conn_t& c, const uint8_t* p, size_t n) {
+    if (n < CHAN_MSGTYPE_PREFIX) return true;   /* malformed — drop, treat as sent */
+    uint16_t msgtype = (uint16_t)((p[0] << 8) | p[1]);
+    return c.channel.send(msgtype, RNS::Bytes(p + CHAN_MSGTYPE_PREFIX, n - CHAN_MSGTYPE_PREFIX));
+}
+
 /* Flush as many buffered messages as the channel window allows. */
 static void chanFlushOutbox(chan_conn_t& c) {
     while (!c.outbox.empty() && c.channel && c.channel.is_ready_to_send()) {
         std::vector<uint8_t>& m = c.outbox.front();
-        if (!c.channel.send(RNS::Bytes(m.data(), m.size()))) break;
+        if (!chanSendFramed(c, m.data(), m.size())) break;
         c.outbox.erase(c.outbox.begin());
         chanBumpInt(c, "tx_msgs");
     }
@@ -5231,6 +5267,16 @@ static void onChanLinkEstablishedCb(RNS::Link& link) {
     chanTouch(*c);
     c->channel = link.get_channel();
     c->channel.set_receive_callback(onChannelMsgCb, c);
+    /* Reveal our identity to the listener before any channel message, so a
+     * remote that gates on allowed initiator identities accepts the session
+     * (e.g. upstream rnsh's `-a <hash>`). Gated on an identity_key being set. */
+    if (!c->identity_key.empty()) {
+        RNS::Identity id{RNS::Type::NONE};
+        if (linkLoadIdentity(c->identity_key, id)) {
+            try { c->link.identify(id); }
+            catch (const std::exception& e) { warn("chan[%s]: identify threw: %s", c->tag, e.what()); }
+        }
+    }
     storageBegin();
     chanSetStr(*c, "link_id", link.link_id().toHex().c_str());
     chanSetInt(*c, "mtu", (int)link.get_mtu());
@@ -5375,15 +5421,17 @@ static void onChannelRecv(int handle, size_t /*avail*/) {
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n == 0) return;
     chanTouch(*c);
+    if (n < CHAN_MSGTYPE_PREFIX) { warn("chan[%s]: runt send (%zuB)", c->tag, n); return; }
     if (c->state == LST_ACTIVE && c->channel) {
         uint16_t mdu = c->channel.mdu();
-        if (mdu != 0 && n > mdu) {
-            warn("chan[%s]: send %zuB exceeds channel MDU %u", c->tag, n, (unsigned)mdu);
+        size_t payload = n - CHAN_MSGTYPE_PREFIX;   /* MDU bounds the envelope payload */
+        if (mdu != 0 && payload > mdu) {
+            warn("chan[%s]: send %zuB exceeds channel MDU %u", c->tag, payload, (unsigned)mdu);
             chanSetError(*c, "oversize");
             return;
         }
         if (c->outbox.empty() && c->channel.is_ready_to_send() &&
-            c->channel.send(RNS::Bytes(buf, n))) {
+            chanSendFramed(*c, buf, n)) {
             chanBumpInt(*c, "tx_msgs");
             return;
         }

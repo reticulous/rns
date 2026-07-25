@@ -328,6 +328,14 @@ int rnsdLinkOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
  *  `rnsd.chan.<tag>.last_error`). A message must fit the channel MDU (Link MDU
  *  minus 6) — oversize sends are rejected with `last_error`.
  *
+ *  Each ITS message on the returned handle is framed `[msgtype:2 BE][payload]`:
+ *  the 16-bit value is the Channel envelope's message type, so a consumer can
+ *  speak a typed application protocol (rnsh, byte-identical to upstream
+ *  Reticulum) — choosing the msgtype per send and seeing the peer's per recv.
+ *  Opaque-bytes consumers just prefix RNS::Channel::MSGTYPE_RAW (0x0100). When
+ *  `identity_key` is non-empty rnsd identifies the link to the remote once
+ *  active, so a listener that gates on allowed initiator identities admits it.
+ *
  *  `tag`, `aspect`, `identity_key`, `path_timeout_ms`, `link_timeout_ms`, `ref`
  *  and the callbacks all behave as in rnsdLinkOpen(). Returns the ITS handle
  *  (>= 0) on accept, or negative on immediate failure. */
@@ -349,6 +357,13 @@ int rnsdChannelOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
  *  accept incoming shell sessions. Returns true if the request was queued. */
 bool rnsdDestListenChannels(int      dest_handle,
                             uint16_t target_port);
+
+/** bz2-decompress `in_len` bytes at `in` into at most `max_out` bytes at `out`.
+ *  For rnsh StreamData frames whose `compressed` bit is set (upstream peers
+ *  bz2-compress chunks > 32 B); the chunk carries no uncompressed length, so
+ *  the caller bounds the output (RawChannelWriter.MAX_CHUNK_LEN = 16384).
+ *  Returns the decompressed length, or 0 on error / overflow. */
+size_t rnsdBz2Decompress(const uint8_t* in, size_t in_len, uint8_t* out, size_t max_out);
 
 /** Tell rnsd to forward incoming Reticulum Links for the destination
  *  behind `dest_handle` (obtained from rnsdDestOpen) to ITS port
