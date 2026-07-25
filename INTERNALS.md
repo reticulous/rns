@@ -572,14 +572,21 @@ the proof) + remote (the peer's rx of our message) on the DELIVERED `OUT_RESULT`
 signal trailer, keyed by send_id, for lxmf to attach to the outbound message.
 
 *Interop.* The append lengthens the proof, which a vanilla RNS node would
-length-reject (losing its delivered-tick). So `proveInboundWithReport` negotiates
-per peer (`s_peer_caps`, keyed by the sender's LXMF hash = first 16 bytes of the
-decrypted plaintext; RAM-only, reboot-reset): while a peer is unconfirmed it
-sends the **extended proof first, then a plain proof** as the interop-safe
-fallback, for up to `s.rnsd.rx_report_probes` packets; receiving an extended
-proof *back* from a peer confirms it reticulous, after which only the extended
-proof is sent. A vanilla peer thus always validates the plain proof and never
-sees a lone extended one. `0` disables emission entirely.
+length-reject (losing its delivered-tick). So `proveInboundWithReport` emits the
+extended proof **only to a peer known to accept it** — one that advertised the
+rx-report capability (LXMF announce caps bit1). lxmf parses that bit and pushes
+it to rnsd via `rnsdSetRxReportCap(dest_hash, capable)`; rnsd keeps it in
+`s_peer_caps` (keyed by the peer's lxmf.delivery hash; RAM-only, reboot-reset)
+and `proveInboundWithReport` reads it back through `rnsdGetRxReportCap` /
+`peerAcceptsRxReport` when it proves an inbound direct radio packet. The table
+tracks lxmf **contacts**, not every announcer: lxmf preloads it from stored
+contacts at boot and updates it on contact creation (including the first message
+from a new peer) and on each re-announce — so the set stays bounded and matches
+who you actually correspond with. Any other peer — unknown, or advertising no such capability — gets
+a plain proof, so a vanilla node never sees a lone extended one. There is no
+probing (we never send a speculative extended-then-plain pair): capability comes
+from the announce, not from trial. Receiving an rx report is unconditional — we
+accept and process one from anyone; the capability gates only what we emit.
 
 The gateway's *own* remote half (the transport node's rx of us) has no source
 yet — the rx report is endpoint-direct-only — so the gw indicator is single-set
@@ -740,7 +747,7 @@ Because µR's wire is kept byte-identical to upstream RNS, the fastest way to
 exercise Links, Channels, and rnsh end-to-end is against a **host-side reference
 node running stock `rns` from PyPI** — no second device required.
 
-**In-tree peer scripts.** `hw-tdeck/tests/peers/echo_peer.py` (+
+**In-tree peer scripts.** `hw-lilygo-tdeck/tests/peers/echo_peer.py` (+
 `peer-config.template`) is the canonical peer shape: bring up `RNS.Reticulum`,
 host a `Destination(identity, IN, SINGLE, app_name, *aspects)`, call
 `set_proof_strategy(PROVE_ALL)` and `set_link_established_callback(...)`, then
@@ -756,7 +763,7 @@ to `rns.radical.computer:4242`, `rns.birdsnet.com.br:4242`,
 `193.26.158.230:4965`, etc. The container has internet, so a host RNS node that
 dials the **same** testnet TCP node shares the mesh with the device; both end up
 ≤ 2 hops apart and that node's cache already holds the device's announce, so
-path requests resolve fast. `hw-tdeck/scripts/lxmf-stamp-test` is the worked
+path requests resolve fast. `hw-lilygo-tdeck/scripts/lxmf-stamp-test` is the worked
 example (an LXMF node dialing the testnet directly to interop against a device
 already on it — no bridge). Recipe for a bare RNS node:
 

@@ -211,7 +211,6 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.respond_to_probes` | `1` | Host `rnstransport.probe` and answer probes (PROVE_ALL). |
 | `s.rnsd.prove_incoming` | `1` | Emit delivery proofs for inbound packets we receive. |
 | `s.rnsd.proof_timeout_s` | `60` | Deadline for an outbound delivery-proof receipt. |
-| `s.rnsd.rx_report_probes` | `3` | Reticulous rx-signal report: how many delivery proofs to a new direct peer carry our rx signal appended (the "extended" proof), before we give up probing an unconfirmed peer. `0` disables the feature (plain proofs only). See INTERNALS §5.7. |
 | `s.rnsd.link.path_timeout_s` | `30` | Path-request / link-request retry budget. |
 | `s.rnsd.link.request_timeout_s` | `15` | Request/response (page fetch) timeout. |
 | `s.rnsd.link.max_inbound_resources_total` | `4` | Concurrent inbound Resource cap across all links. |
