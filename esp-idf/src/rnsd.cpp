@@ -9,6 +9,7 @@
 #include "mem.h"
 #include "spangap.h"
 #include "ports.h"
+#include "auth.h"
 
 /* mR's Log.h declares free functions `info`, `warn`, `error`, `debug`, ...
  * inside namespace RNS. spangap's log.h defines `info`/`warn`/`err`/etc. as
@@ -59,6 +60,7 @@
 #include <memory>
 #include <vector>
 #include <map>
+#include <mutex>
 #include <algorithm>
 #include <new>
 
@@ -771,45 +773,52 @@ static void ourDestSendOutResult(our_dest_t& c, uint16_t send_id,
         warn("our-dest: OUT_RESULT send dropped (send_id=%u)", (unsigned)send_id);
 }
 
-/* ─────────────── rx-signal-report capability negotiation ───────────────
+/* ─────────────── rx-signal-report capability ───────────────
  *
- * Ephemeral per-peer map keyed by the peer's LXMF dest hash (hex), RAM-only and
- * reset on reboot. `probes_sent` counts the extended (rx-report) proofs we've
- * offered an unconfirmed peer, capped at s.rnsd.rx_report_probes; `confirmed`
- * flips true once we receive an rx-report proof back (the peer is reticulous),
- * after which we send only extended proofs to them. */
-struct peer_cap_t { uint8_t probes_sent = 0; bool confirmed = false; };
-static std::map<std::string, peer_cap_t> s_peer_caps;
+ * Per-peer flag keyed by the peer's LXMF dest hash (hex): does it accept the
+ * extended (rx-report) delivery proof? Set from that peer's announce (LXMF caps
+ * bit1) via rnsdSetRxReportCap — lxmf parses announces, rnsd emits proofs. We
+ * emit an extended proof only to a peer known capable; a vanilla peer would
+ * length-reject it, so it always gets the plain proof. RAM-only, reset on
+ * reboot, refreshed by the next announce. Guarded by s_peer_caps_mtx: the
+ * setter runs on lxmf's task, the reader (proveInboundWithReport) on rnsd's. */
+static std::mutex s_peer_caps_mtx;
+static std::map<std::string, bool> s_peer_caps;
 
-/* Prove an inbound direct packet, optionally appending our rx signal so a
- * reticulous sender learns how we heard them (Packet::prove_report). Sends a
- * plain proof when the feature is off, the packet wasn't a direct radio rx, or
- * the peer is unknown; an extended proof only, once the peer is confirmed
- * reticulous; and both (extended first, plain as the interop-safe fallback)
- * while probing an unconfirmed peer, up to s.rnsd.rx_report_probes packets.
- * peer_hex is the sender's LXMF dest hash (first 16 bytes of the decrypted
- * plaintext). hops<=1 is a direct rx (Transport increments hops on receive). */
+static bool peerAcceptsRxReport(const std::string& peer_hex)
+{
+    std::lock_guard<std::mutex> lk(s_peer_caps_mtx);
+    auto it = s_peer_caps.find(peer_hex);
+    return it != s_peer_caps.end() && it->second;
+}
+
+void rnsdSetRxReportCap(const uint8_t dest_hash[RNSD_DEST_HASH_LEN], bool capable)
+{
+    std::string key = RNS::Bytes(dest_hash, RNSD_DEST_HASH_LEN).toHex();
+    std::lock_guard<std::mutex> lk(s_peer_caps_mtx);
+    s_peer_caps[key] = capable;
+}
+
+bool rnsdGetRxReportCap(const uint8_t dest_hash[RNSD_DEST_HASH_LEN])
+{
+    return peerAcceptsRxReport(RNS::Bytes(dest_hash, RNSD_DEST_HASH_LEN).toHex());
+}
+
+/* Prove an inbound direct packet, appending our rx signal (Packet::prove_report)
+ * only when the sender advertised the rx-report capability — so it learns how we
+ * heard it without ever length-rejecting the proof. A plain proof otherwise: not
+ * a direct radio rx (no signal to report), an unknown peer, or one that hasn't
+ * advertised the capability. peer_hex is the sender's LXMF dest hash (first 16
+ * bytes of the decrypted plaintext). hops<=1 is a direct rx (Transport
+ * increments hops on receive). */
 static void proveInboundWithReport(RNS::Packet& packet, const std::string& peer_hex)
 {
-    int  budget = storageGetInt("s.rnsd.rx_report_probes", 3);
     bool direct = packet.hops() <= 1;
     bool radio  = !RNS::Type::isNan(packet.rssi());
-    if (budget <= 0 || !direct || !radio || peer_hex.empty()) {
-        packet.prove();
-        return;
-    }
-    peer_cap_t& cap = s_peer_caps[peer_hex];
-    if (cap.confirmed) {
-        packet.prove_report();               /* extended only */
-        return;
-    }
-    if (cap.probes_sent < (uint8_t)(budget > 255 ? 255 : budget)) {
-        packet.prove_report();               /* extended first … */
-        packet.prove();                      /* … then the vanilla safety net */
-        cap.probes_sent++;
-        return;
-    }
-    packet.prove();                          /* budget spent, unconfirmed → vanilla */
+    if (direct && radio && !peer_hex.empty() && peerAcceptsRxReport(peer_hex))
+        packet.prove_report();               /* extended */
+    else
+        packet.prove();                      /* plain */
 }
 
 static void ourDestSendOutStatusBare(our_dest_t& c, uint16_t send_id, uint8_t type)
@@ -895,7 +904,6 @@ struct our_dest_receipt_t {
     uint16_t           send_id;
     uint8_t            hops;
     double             deadline;     /* OS::time() backstop */
-    RNS::Bytes         dest_hash;    /* recipient (peer) hash — keys the rx-report cap map */
     RNS::PacketReceipt receipt{RNS::Type::NONE};
 };
 
@@ -953,13 +961,12 @@ static void onOurDestReceiptDelivery(const RNS::PacketReceipt& receipt)
         /* Encode the proof's own rx signal (local: our rx of the proof packet)
          * and, from an rx-report proof, the remote signal (the peer's rx of the
          * message we sent) for the DELIVERED result → lxmf attaches both to the
-         * outbound message. A present remote reading also confirms the peer is
-         * reticulous, so we keep sending them extended proofs. */
+         * outbound message. We accept and process an rx report from any peer;
+         * whether WE emit one back is gated separately on the peer's advertised
+         * capability (rnsdSetRxReportCap), not inferred here. */
         int16_t lr, ls, rr, rs;
         rnsdSignalToInt16(receipt.rssi(),        receipt.snr(),        lr, ls);
         rnsdSignalToInt16(receipt.remote_rssi(), receipt.remote_snr(), rr, rs);
-        if (rr != INT16_MIN && r.dest_hash.size() >= RNSD_DEST_HASH_LEN)
-            s_peer_caps[r.dest_hash.toHex()].confirmed = true;
         bool has_signal = (lr != INT16_MIN) || (rr != INT16_MIN);
         ourDestReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED, rtt_ms,
                              has_signal, lr, ls, rr, rs);
@@ -968,8 +975,7 @@ static void onOurDestReceiptDelivery(const RNS::PacketReceipt& receipt)
 }
 
 static void ourDestReceiptTrack(our_dest_t& c, uint16_t send_id,
-                                RNS::PacketReceipt& receipt, uint8_t hops,
-                                const RNS::Bytes& dest_hash = {})
+                                RNS::PacketReceipt& receipt, uint8_t hops)
 {
     if (!s_our_dest_receipts || !receipt) return;
     our_dest_receipt_t* slot = nullptr;
@@ -991,7 +997,6 @@ static void ourDestReceiptTrack(our_dest_t& c, uint16_t send_id,
     slot->conn_handle = c.handle;
     slot->send_id     = send_id;
     slot->hops        = hops;
-    slot->dest_hash   = dest_hash;
     slot->deadline    = RNS::Utilities::OS::time()
                       + storageGetInt("s.rnsd.proof_timeout_s", 60);
     slot->receipt     = receipt;
@@ -1153,7 +1158,7 @@ static int ourDestTrySend(our_dest_t& c, uint16_t send_id,
          * proof lands, PROOF_TIMEOUT otherwise. */
         ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_SENT, 0, hops,
                              fh, ifn.empty() ? nullptr : ifn.c_str());
-        ourDestReceiptTrack(c, send_id, receipt, hops, dh);
+        ourDestReceiptTrack(c, send_id, receipt, hops);
         info("our-dest: send_id=%u sent to %s via %s (hops=%u, %zuB payload)",
              (unsigned)send_id, dh.toHex().c_str(),
              oif ? oif.toString().c_str() : "<none>",
@@ -1825,7 +1830,7 @@ static std::shared_ptr<AnnounceDebugLogger> s_announce_logger;
  * never block the rnsd task. Same fan-out shape as spangap-core's
  * log :1 consumers (log.cpp logSlots[]). */
 
-#define RNSD_MAX_ANNOUNCE_SUBS 4
+#define RNSD_MAX_ANNOUNCE_SUBS 8
 
 struct announce_sub_t {
     bool used;
@@ -2986,6 +2991,90 @@ bool rnsdIdentityHash(const char* identity_key,
     if (h.size() != RNSD_IDENT_HASH_LEN) return false;
     std::memcpy(out, h.data(), RNSD_IDENT_HASH_LEN);
     return true;
+}
+
+bool rnsdIdentityPubkey(const char* identity_key,
+                        uint8_t out[RNSD_PUBKEY_LEN])
+{
+    RNS::Identity id(RNS::Type::NONE);
+    if (!loadIdentityFromStorage(identity_key, id)) return false;
+    RNS::Bytes pub = id.get_public_key();
+    if (pub.size() != RNSD_PUBKEY_LEN) return false;
+    std::memcpy(out, pub.data(), RNSD_PUBKEY_LEN);
+    return true;
+}
+
+bool rnsdIdentityHashFromPubkey(const uint8_t pubkey[RNSD_PUBKEY_LEN],
+                                uint8_t out[RNSD_IDENT_HASH_LEN])
+{
+    try {
+        RNS::Identity id(false);
+        id.load_public_key(RNS::Bytes(pubkey, RNSD_PUBKEY_LEN));
+        RNS::Bytes h = id.hash();
+        if (h.size() != RNSD_IDENT_HASH_LEN) return false;
+        std::memcpy(out, h.data(), RNSD_IDENT_HASH_LEN);
+        return true;
+    } catch (const std::exception& e) {
+        warn("rnsdIdentityHashFromPubkey: %s", e.what());
+        return false;
+    }
+}
+
+bool rnsdDestinationHashFromPubkey(const uint8_t pubkey[RNSD_PUBKEY_LEN],
+                                   const char* app_name, const char* aspect,
+                                   uint8_t out[RNSD_DEST_HASH_LEN])
+{
+    try {
+        RNS::Identity id(false);
+        id.load_public_key(RNS::Bytes(pubkey, RNSD_PUBKEY_LEN));
+        RNS::Bytes dh = RNS::Destination::hash(id, app_name, aspect);
+        if (dh.size() != RNSD_DEST_HASH_LEN) return false;
+        std::memcpy(out, dh.data(), RNSD_DEST_HASH_LEN);
+        return true;
+    } catch (const std::exception& e) {
+        warn("rnsdDestinationHashFromPubkey: %s", e.what());
+        return false;
+    }
+}
+
+bool rnsdEncryptFor(const uint8_t pubkey[RNSD_PUBKEY_LEN],
+                    const uint8_t* in, size_t in_len,
+                    uint8_t* out, size_t* out_len)
+{
+    if (!in || !out || !out_len) return false;
+    try {
+        RNS::Identity id(false);
+        id.load_public_key(RNS::Bytes(pubkey, RNSD_PUBKEY_LEN));
+        RNS::Bytes token = id.encrypt(RNS::Bytes(in, in_len));
+        if (!token || token.size() == 0) return false;
+        if (token.size() > in_len + RNSD_ENCRYPT_OVERHEAD) return false;
+        std::memcpy(out, token.data(), token.size());
+        *out_len = token.size();
+        return true;
+    } catch (const std::exception& e) {
+        warn("rnsdEncryptFor: %s", e.what());
+        return false;
+    }
+}
+
+bool rnsdDecryptSelf(const char* identity_key,
+                     const uint8_t* in, size_t in_len,
+                     uint8_t* out, size_t* out_len)
+{
+    if (!in || !out || !out_len) return false;
+    RNS::Identity id(RNS::Type::NONE);
+    if (!loadIdentityFromStorage(identity_key, id)) return false;
+    try {
+        RNS::Bytes plain = id.decrypt(RNS::Bytes(in, in_len));
+        if (!plain || plain.size() == 0) return false;
+        if (plain.size() > in_len) return false;
+        std::memcpy(out, plain.data(), plain.size());
+        *out_len = plain.size();
+        return true;
+    } catch (const std::exception& e) {
+        warn("rnsdDecryptSelf: %s", e.what());
+        return false;
+    }
 }
 
 void rnsdIdentityErase(const char* identity_key)
@@ -5780,6 +5869,30 @@ static void rnsdTaskMain(void*)
         storageSet("rnsd.enabled", 0);
         storageEnd();
         for (;;) vTaskDelay(portMAX_DELAY);
+    }
+
+    /* A passwordless node must never join Reticulum. Hold the entire stack here
+     * — publishing a dark state, rns.ready never set — until an admin password
+     * is set (`auth passwd admin <pw>`), then proceed. No timeout: an unprotected
+     * node never engages the mesh. We subscribe to secrets.auth changes and block
+     * in itsPoll rather than spinning; the write that sets the password wakes us,
+     * and we re-check. Dependent ifaces/clients wait on rns.ready with their own
+     * ~120 s budget, so a password set during setup brings the whole stack up
+     * without a reboot; set later, a reboot is needed. */
+    if (authRealmUnset("admin")) {
+        warn("[%s] no device password set — Reticulum held until one is set "
+             "(auth passwd admin <pw>)", TAG);
+        storageBegin();
+        storageSet("rnsd.up", 0);
+        storageSet("rnsd.enabled", 0);
+        storageEnd();
+        /* Subscribe first, then re-check in the loop: a write racing between the
+         * check above and here is already queued to our inbox, so itsPoll returns
+         * immediately and the loop exits — no missed-wakeup deadlock. */
+        storageSubscribeChanges("secrets.auth.", [](const char*, const char*) {});
+        while (authRealmUnset("admin")) itsPoll(portMAX_DELAY);
+        storageUnsubscribe("secrets.auth.");
+        info("[%s] device password set — starting Reticulum", TAG);
     }
 
     /* Gate the entire rnsd ITS/Transport surface on a known-valid clock (or a

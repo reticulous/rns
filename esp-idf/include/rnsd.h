@@ -93,6 +93,54 @@ bool rnsdIdentityHash(const char* identity_key,
 /** Wipe the identity at `identity_key`. */
 void rnsdIdentityErase(const char* identity_key);
 
+/** Export the 64-byte public key blob (X25519 ‖ Ed25519) of the identity
+ *  at `identity_key`. Returns false on missing/malformed identity. */
+bool rnsdIdentityPubkey(const char* identity_key,
+                        uint8_t out[RNSD_PUBKEY_LEN]);
+
+/** Compute the 16-byte truncated identity hash from a raw 64-byte public
+ *  key (X25519 ‖ Ed25519) — no private key or storage involved. This is
+ *  how a consumer checks a pubkey it received against a known identity
+ *  hash (e.g. a link peer's advertised identity). */
+bool rnsdIdentityHashFromPubkey(const uint8_t pubkey[RNSD_PUBKEY_LEN],
+                                uint8_t out[RNSD_IDENT_HASH_LEN]);
+
+/** Compute the conventional destination hash for (pubkey, app, aspect)
+ *  from a raw 64-byte public key — the counterpart of rnsdDestinationHash
+ *  for identities we don't hold. Lets a consumer derive a peer's
+ *  destination on any aspect from a pubkey it received in-band, without
+ *  the peer being in the announce cache. */
+bool rnsdDestinationHashFromPubkey(const uint8_t pubkey[RNSD_PUBKEY_LEN],
+                                   const char* app_name, const char* aspect,
+                                   uint8_t out[RNSD_DEST_HASH_LEN]);
+
+/* ──────────────── payload encryption ────────────────
+ *
+ * mR Identity token encryption (ephemeral X25519 ECDH + HKDF +
+ * AES-128-CBC + HMAC), the same construction RNS uses for opportunistic
+ * packet payloads — so a token encrypted here is decryptable by any RNS
+ * identity holder, and vice versa. Encryption is to the STATIC identity
+ * key (this mR has no ratchets), so no forward secrecy; the intended use
+ * is store-and-forward payloads that must be opaque to the forwarder.
+ * Pure-crypto: runs inline on the caller's task. */
+
+/** Encrypt `in` for the identity whose 64-byte public key is `pubkey`.
+ *  `out` must have room for `in_len + RNSD_ENCRYPT_OVERHEAD` bytes;
+ *  `*out_len` receives the token size. Returns false on malformed key or
+ *  crypto failure. */
+#define RNSD_ENCRYPT_OVERHEAD 96   /* ephemeral pub 32 + IV 16 + pad ≤16 + HMAC 32 */
+bool rnsdEncryptFor(const uint8_t pubkey[RNSD_PUBKEY_LEN],
+                    const uint8_t* in, size_t in_len,
+                    uint8_t* out, size_t* out_len);
+
+/** Decrypt a token produced by rnsdEncryptFor (or any RNS Identity
+ *  encryption) with the private identity at `identity_key`. `out` must
+ *  have room for `in_len` bytes; `*out_len` receives the plaintext size.
+ *  Returns false if the token is malformed or not for this identity. */
+bool rnsdDecryptSelf(const char* identity_key,
+                     const uint8_t* in, size_t in_len,
+                     uint8_t* out, size_t* out_len);
+
 /* ──────────────── recall / path request ──────────────── */
 
 /** Look up the public key for a destination in rnsd's identity cache
@@ -160,6 +208,30 @@ void rnsdRequestPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
  *  lxmf's delivery retry after a proof/response timeout, so the next send
  *  triggers a fresh path lookup instead of reusing a stale/dead route. */
 void rnsdDropPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
+
+/* ──────────────── rx-signal-report capability ────────────────
+ *
+ * A reticulous node can append its own rx signal (rssi/snr) to the delivery
+ * proof it emits for a direct radio message, so the sender learns how well it
+ * was heard (the "extended proof", Packet::prove_report). A vanilla RNS node
+ * would length-reject that longer proof, so rnsd only emits it to peers KNOWN
+ * to accept it — those that advertised the rx-report capability (LXMF announce
+ * caps bit1). lxmf owns that knowledge (it parses announces); rnsd owns the
+ * proof path. These two calls bridge the two: lxmf records the capability per
+ * peer here, rnsd consults it when proving. Receiving an rx report is
+ * unconditional — we accept and process reports from anyone; the capability
+ * gates only what WE emit. */
+
+/** Record whether the peer at `dest_hash` (its lxmf.delivery destination hash)
+ *  accepts rx-signal-report delivery proofs. Set from each parsed announce
+ *  (true when LXMF caps bit1 is present, false otherwise). RAM-only, reset on
+ *  reboot and refreshed by the next announce. Safe from any task. */
+void rnsdSetRxReportCap(const uint8_t dest_hash[RNSD_DEST_HASH_LEN], bool capable);
+
+/** Query the flag set by rnsdSetRxReportCap. Returns false when the peer is
+ *  unknown (no announce with a caps element heard since boot) or not capable.
+ *  Safe from any task. */
+bool rnsdGetRxReportCap(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
 
 /* ──────────────── destination / link client API ────────────────
  *
