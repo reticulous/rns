@@ -6359,9 +6359,6 @@ void RnsdService::onInit()
     cliRegisterCmd("rnpath",   cliRnpath);
     cliRegisterCmd("rnprobe",  cliRnprobe);
 
-    /* Cron line — no-op when transport disabled, hourly otherwise. */
-    cronDefault("0 * * * * N", "rnsd persist if-transport");
-
     /* PSRAM stack, core 0 alongside tcpip_thread, prio 2. */
     s_task = spawnTask(rnsdTaskMain, TAG, 12288, nullptr, 2, 0, STACK_PSRAM);
 
