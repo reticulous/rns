@@ -271,7 +271,7 @@ namespace RNS { namespace Type {
 		// is derived from the measured RTT (Link::update_keepalive), clamped to
 		// this range; KEEPALIVE is the pre-activation placeholder and the ceiling.
 		static const uint16_t KEEPALIVE_MAX = 360;
-		static const uint16_t KEEPALIVE_MIN = 5;
+		static const uint16_t KEEPALIVE_MIN = 120;
 		static const uint16_t KEEPALIVE = KEEPALIVE_MAX;
 		/*
 		If no traffic or keep-alive packets are received within this period, the
