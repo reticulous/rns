@@ -2049,6 +2049,9 @@ static void publishPathTable(void)
 
 static void publishStats(void)
 {
+    /* Skip on a headless, WiFi-down node — nothing reads these keys there. A UI
+     * (web over WiFi, or an LCD build) re-populates them when it appears. */
+    if (!uiTelemetryWanted()) return;
     storageBegin();
     storageSet("rnsd.stats.packets_in",  (int)(s_stats.packets_in  & 0x7fffffff));
     storageSet("rnsd.stats.packets_out", (int)(s_stats.packets_out & 0x7fffffff));
