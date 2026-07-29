@@ -54,6 +54,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/usb_serial_jtag.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -368,6 +369,15 @@ static iface_t* ifaceAlloc(void)
     for (int j = 0; j < RNSD_MAX_IFACES; j++)
         if (!s_ifaces[j].used) return &s_ifaces[j];
     return nullptr;
+}
+
+/* Count registered interfaces. Announces are pointless (and misleading in the
+ * log) with zero interfaces — nothing is on air — so senders gate on this. */
+static int ifaceCount(void)
+{
+    int n = 0;
+    for (int j = 0; j < RNSD_MAX_IFACES; j++) if (s_ifaces[j].used) n++;
+    return n;
 }
 
 /* One-line wire-header summary for the per-iface tx/rx dbg lines below.
@@ -1445,18 +1455,20 @@ static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
             }
             RNS::Bytes app_data;
             if (n > 1) app_data.assign(buf + 1, n - 1);
+            /* Hold until an interface exists — otherwise nothing reaches the air. */
+            if (ifaceCount() == 0) {
+                info("announce held for %s aspect=%s — no interface up yet",
+                     c->listener_hash.toHex().c_str(), c->req.aspect);
+                break;
+            }
+            info("announcing %s aspect=%s app_data %s",
+                 c->listener_hash.toHex().c_str(), c->req.aspect,
+                 formatAnnounceAppData(app_data).c_str());
             try {
                 RNS::Packet ap = c->listener_dest.announce(app_data, /*path_response=*/false);
-                if (ap && ap.sent()) {
-                    info("announced %s aspect=%s app_data %s",
-                         c->listener_hash.toHex().c_str(),
-                         c->req.aspect,
-                         formatAnnounceAppData(app_data).c_str());
-                } else {
-                    warn("announce for %s aspect=%s did NOT transmit — no ready OUT interface; nothing on air",
-                         c->listener_hash.toHex().c_str(),
-                         c->req.aspect);
-                }
+                if (!(ap && ap.sent()))
+                    warn("announce for %s aspect=%s did NOT transmit — no ready OUT interface",
+                         c->listener_hash.toHex().c_str(), c->req.aspect);
             } catch (const std::exception& e) {
                 err("our-dest: announce threw: %s", e.what());
             }
@@ -1936,14 +1948,17 @@ static void rnsdProbeDestDown(void)
 static void sendProbeAnnounce(void)
 {
     if (!s_probe_dest) return;
+    /* Hold announces until at least one interface is up — with none registered
+     * nothing reaches the air, so announcing just churns and logs a false success. */
+    if (ifaceCount() == 0) { verb("probe announce held — no interface up"); return; }
+    RNS::Bytes empty;
+    info("announcing %s aspect=rnstransport.probe app_data %s",
+         s_probe_dest.hash().toHex().c_str(),
+         formatAnnounceAppData(empty).c_str());
     try {
-        RNS::Bytes empty;
         s_probe_dest.announce(empty, /*path_response=*/false);
         TickType_t t = xTaskGetTickCount();
         s_rnsd_last_announce_tick = (t == 0) ? 1 : t;
-        info("announced %s aspect=rnstransport.probe app_data %s",
-             s_probe_dest.hash().toHex().c_str(),
-             formatAnnounceAppData(empty).c_str());
     } catch (const std::exception& e) {
         err("probe announce threw: %s", e.what());
     }
@@ -2212,6 +2227,8 @@ static void cliRnsdMemory(void)
               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 }
 
+static void clinkEnsureTask();   /* defined with clinkTaskMain below */
+
 static void cliRnsd(const char* args)
 {
     if (args && strcmp(args, "help") == 0) {
@@ -2294,6 +2311,7 @@ static void cliRnsd(const char* args)
             cliPrintf("default aspect: lxmf.delivery; watch rnsd.links.* / log\n");
             return;
         }
+        clinkEnsureTask();   /* lazily spawn the test task on first use */
         storageSet("rnsd.cmd.clink", rest);
         cliPrintf("rnsd clink: queued (%s) — watch rnsd.links.clink.* and log\n", rest);
         return;
@@ -2308,6 +2326,7 @@ static void cliRnsd(const char* args)
             cliPrintf("e.g. rnsd creq <hash> /page/index.mu\n");
             return;
         }
+        clinkEnsureTask();   /* lazily spawn the test task on first use */
         storageSet("rnsd.cmd.creq", rest);
         cliPrintf("rnsd creq: queued (%s) — watch log for response\n", rest);
         return;
@@ -3442,8 +3461,8 @@ static void onProbeLinkEstablished(RNS::Link& link)
         static const RNS::Bytes probe_payload =
             RNS::Bytes((const uint8_t*)"reticulous probe", 16);
         RNS::Packet pkt(link, probe_payload);
+        info("rnsd link: sending test packet (16B)");
         pkt.send();
-        info("rnsd link: sent test packet (16B)");
     } catch (const std::exception& e) {
         warn("rnsd link: test send threw: %s", e.what());
     }
@@ -5781,8 +5800,8 @@ static void onCmdClink(const char* key, const char* val)
     if (cmd.rfind("send ", 0) == 0) {
         std::string txt = cmd.substr(5);
         if (s_clink_handle < 0) { warn("clink: no link open"); return; }
+        info("clink: sending %zuB", txt.size());
         itsSend(s_clink_handle, txt.data(), txt.size(), 0);
-        info("clink: sent %zuB", txt.size());
         return;
     }
     if (cmd.rfind("listen", 0) == 0) {
@@ -5845,6 +5864,13 @@ static void onCmdClink(const char* key, const char* val)
          hash_hex.c_str(), aspect.c_str());
 }
 
+/* clink is a test-only scaffold, spawned on demand by clinkEnsureTask() the
+ * first time an `rnsd clink`/`rnsd creq` command is issued, and it deletes
+ * itself once the test is torn down (no hosted dest, no open link) — so a
+ * production node that never runs a clink test carries no clink task at all. */
+static TaskHandle_t s_clink_task = nullptr;
+#define CLINK_IDLE_GRACE_MS 5000   /* linger this long fully idle before self-delete */
+
 static void clinkTaskMain(void*)
 {
     info("[%s] task up", CLINK_TAG);
@@ -5862,12 +5888,22 @@ static void clinkTaskMain(void*)
     itsClientInit(4);
     storageSubscribeChanges("rnsd.cmd.clink", onCmdClink);
     storageSubscribeChanges("rnsd.cmd.creq",  onCmdCreq);
+    /* Apply the command that triggered our spawn: the setter (cliRnsd) only
+     * fires the change, and it may have landed before we subscribed, so read
+     * and process the current value once. Empty → onCmd* early-outs. */
+    onCmdClink("rnsd.cmd.clink", storageGetStr("rnsd.cmd.clink").c_str());
+    onCmdCreq ("rnsd.cmd.creq",  storageGetStr("rnsd.cmd.creq").c_str());
     TickType_t lastAnnounce = 0;
+    TickType_t idleSince    = xTaskGetTickCount();
     for (;;) {
-        while (itsPoll(0)) {}
-        itsPoll(pdMS_TO_TICKS(1000));
-        /* While hosting a test dest, re-announce every 20 s so a
-         * host-side peer's path to it stays fresh across test runs. */
+        bool hosting = s_clink_dest_handle >= 0;
+        bool busy    = hosting || s_clink_handle >= 0;
+        /* Hosting a dest: wake every 20 s to re-announce. Holding an open link
+         * but not hosting: park (link upkeep is rnsd's job, not ours). Fully
+         * idle: a short poll so we can self-delete after the grace window. */
+        itsPoll(hosting ? pdMS_TO_TICKS(20000)
+                        : busy ? portMAX_DELAY
+                               : pdMS_TO_TICKS(CLINK_IDLE_GRACE_MS));
         if (s_clink_dest_handle >= 0) {
             TickType_t now = xTaskGetTickCount();
             if (now - lastAnnounce >= pdMS_TO_TICKS(20000)) {
@@ -5876,7 +5912,57 @@ static void clinkTaskMain(void*)
                 lastAnnounce = now;
             }
         }
+        if (s_clink_dest_handle >= 0 || s_clink_handle >= 0) {
+            idleSince = xTaskGetTickCount();
+        } else if ((int32_t)(xTaskGetTickCount() - idleSince) >=
+                   (int32_t)pdMS_TO_TICKS(CLINK_IDLE_GRACE_MS)) {
+            /* Nothing left to maintain for the grace window — tear down cleanly
+             * so a re-spawn reclaims the port/subscriptions, and exit. */
+            info("[%s] idle, self-terminating", CLINK_TAG);
+            storageUnsubscribe("rnsd.cmd.clink");
+            storageUnsubscribe("rnsd.cmd.creq");
+            itsServerPortClose(CLINK_INBOX_PORT);
+            s_clink_task = nullptr;
+            vTaskDelete(nullptr);
+        }
     }
+}
+
+/* Spawn the clink test task if it isn't already running. Called from the CLI
+ * command handler (cliRnsd) the moment a clink/creq command is issued. */
+static void clinkEnsureTask()
+{
+    if (!s_clink_task)
+        s_clink_task = spawnTask(clinkTaskMain, CLINK_TAG, 6144, nullptr, 1, 0, STACK_PSRAM);
+}
+
+/* Mesh-safety boot window — holds RNS offline before it may first transmit, so a
+ * brownout/boot-looping node can't spam the shared medium with re-announces.
+ * Always serves s.rns.boot_min_s; then holds up to s.rns.boot_max_s (default
+ * 5 min) — the wild-mesh safeguard — but cuts that short the instant a USB-serial
+ * host enumerates, since a developer on a cable isn't a bootloop. Measured from
+ * boot (uptime); delay() light-sleeps between the 1 Hz USB checks, so the wait
+ * itself costs almost nothing. */
+static void rnsBootWindow(void) {
+    uint32_t min_ms = (uint32_t)storageGetInt("s.rns.boot_min_s", 10) * 1000;
+    uint32_t max_ms = (uint32_t)storageGetInt("s.rns.boot_max_s", 300) * 1000;
+    if (max_ms < min_ms) max_ms = min_ms;
+    /* Minimum: always served, USB or not. */
+    while (millis() < min_ms) {
+        uint32_t rem = min_ms - millis();
+        delay(pdMS_TO_TICKS(rem > 1000 ? 1000 : rem));
+    }
+    /* Maximum: the wild-mesh hold, released early by a USB dev. */
+    while (millis() < max_ms) {
+        if (usb_serial_jtag_is_connected()) {
+            info("rns: boot window released early — USB host present (%lu ms)\n",
+                 (unsigned long)millis());
+            return;
+        }
+        uint32_t rem = max_ms - millis();
+        delay(pdMS_TO_TICKS(rem > 1000 ? 1000 : rem));
+    }
+    info("rns: boot window elapsed (%lu ms)\n", (unsigned long)millis());
 }
 
 static void rnsdTaskMain(void*)
@@ -6049,7 +6135,8 @@ static void rnsdTaskMain(void*)
 
     loadOrCreateIdentity();
     storageBegin();
-    storageSet("rnsd.up", 1);
+    /* rnsd.up is the ECOSYSTEM up/down signal, owned by rnsStart()/rnsStop() —
+     * set below once the whole stack is brought up, cleared by `rns stop`. */
     storageSet("rnsd.enabled", 1);
     if (s_identity) storageSet("rnsd.identity_hash", s_identity->hexhash().c_str());
     storageEnd();
@@ -6071,17 +6158,16 @@ static void rnsdTaskMain(void*)
      * All waits are bounded, so rns.ready is guaranteed to fire. */
     if (storageGetInt("net.want", 0))
         waitForFlag("net.up", storageGetInt("s.net.up_wait_s", 20));
-    {
-        /* Hard minimum-settle floor — a brownout/boot-loop node never survives
-         * this long, so it can't reach the transmit phase and spam the mesh.
-         * Hardcoded for now; a per-interface safeguard for dangerous (RF) ifaces
-         * is planned to supersede this blanket delay. */
-        const uint32_t settle_ms = 10000;
-        uint32_t up = millis();
-        if (up < settle_ms) vTaskDelay(pdMS_TO_TICKS(settle_ms - up));
-    }
+    rnsBootWindow();
     storageSet("rns.ready", 1);
+    signalFlag("rns.ready");   /* wake any iface/client still on the legacy barrier */
     info("rns: ready to engage (uptime %lu ms)\n", (unsigned long)millis());
+
+    /* Bring the ecosystem up from one place: rnsStart() walks every registered
+     * iface/client start hook in dependency (registration) order and sets
+     * rnsd.up=1. Registration ran during serviceRunInit, long before the boot
+     * window elapsed, so the list is complete by here. */
+    rnsStart();
 
     /* Runtime-tunable mR caps/TTLs/cadence. Each fires once now (applying the
      * current stored value, or the fallback default if unset) and re-applies
@@ -6242,13 +6328,21 @@ static void rnsdTaskMain(void*)
         bool wakeForPkt = s_tickPeriodMs > s_tickMinMs &&
                           s_stats.packets_in != s_tickPrevPktsIn;
         if (wakeForPkt || now - s_lastPublishTick >= pdMS_TO_TICKS(s_tickPeriodMs)) {
-            /* Did anything happen this tick? Any inbound packet or any
-             * open/pending link keeps us at the fast floor; a fully idle tick
-             * lets the cadence back off (recomputed at the end of the block). */
+            /* Did anything happen this tick that needs the fast floor? Real
+             * packet flow (dinTick) or a link still establishing (pending) —
+             * both want prompt jobs() servicing. An *established, idle* link does
+             * NOT: link keepalive is RTT-derived and clamped to 120–360 s
+             * (Type::Link::KEEPALIVE_MIN/MAX), and stale/timeout detection is
+             * likewise minute-scale, so a 60 s housekeeping tick oversamples them
+             * by 2–6×. Pinning the floor on mere link *existence* meant a single
+             * open link — an idle rnsh session, a telemetry subscriber — held the
+             * whole device at 1 Hz for nothing. Resource transfers stay fast
+             * without the pin: their parts are packets, so dinTick keeps the tick
+             * at the floor while data moves, and every inbound part snaps it back
+             * via wakeForPkt above. */
             uint32_t dinTick = (uint32_t)(s_stats.packets_in - s_tickPrevPktsIn);
             s_tickPrevPktsIn = s_stats.packets_in;
             bool tickBusy = dinTick > 0 ||
-                            RNS::Transport::active_links_count()  > 0 ||
                             RNS::Transport::pending_links_count() > 0;
             /* The 1 Hz block is unyieldy except for publishPathTable's
              * internal yield-every-8. Running Transport::jobs() *and*
@@ -6327,6 +6421,85 @@ static void rnsdTaskMain(void*)
     }
 }
 
+/* ─────────────── RNS ecosystem lifecycle ───────────────
+ *
+ * One place that brings the whole RNS ecosystem (rnsd + every iface and client)
+ * up and down in order. Components register a start/stop hook pair from their
+ * onInit() instead of self-spawning; the orchestrator drives them. `rnsd.up` is
+ * the observable up/down signal (1 = ecosystem up, 0 = stopping/down).
+ *
+ * Registration order IS bring-up order (onInit runs in init_order() — deps before
+ * dependents), so start walks forward and stop walks backward, guaranteeing a
+ * client is torn down before rnsd frees the transport state it referenced. */
+typedef void (*rns_hook_t)(void);
+struct rns_service_t { const char* name; rns_hook_t start; rns_hook_t stop; int phase; };
+#define RNS_MAX_SERVICES 24
+static rns_service_t s_rnsServices[RNS_MAX_SERVICES];
+static int           s_rnsServiceCount = 0;
+
+/* Called from a component's onInit(). `name` must be a static string; either hook
+ * may be null. Not thread-safe (runs single-threaded during serviceRunInit). */
+void rnsServiceRegister(const char* name, rns_hook_t start, rns_hook_t stop, int phase) {
+    if (s_rnsServiceCount < RNS_MAX_SERVICES)
+        s_rnsServices[s_rnsServiceCount++] = { name, start, stop, phase };
+    else
+        warn("rns: service registry full, dropping '%s'\n", name);
+}
+
+void rnsStart(void) {
+    if (storageGetInt("rnsd.up", 0)) { info("rns: already up\n"); return; }
+    info("rns: starting ecosystem (%d services)\n", s_rnsServiceCount);
+    /* Ascending phase: interfaces (RNS_PHASE_IFACE) up before clients, so a
+     * client's first announce has an interface to ride on. Registration order
+     * breaks ties within a phase (deps before dependents). */
+    for (int ph = RNS_PHASE_IFACE; ph <= RNS_PHASE_CLIENT; ph++)
+        for (int i = 0; i < s_rnsServiceCount; i++)
+            if (s_rnsServices[i].phase == ph && s_rnsServices[i].start)
+                s_rnsServices[i].start();
+    storageSet("rnsd.up", 1);
+}
+
+void rnsStop(void) {
+    if (!storageGetInt("rnsd.up", 0)) { info("rns: already down\n"); return; }
+    info("rns: stopping ecosystem\n");
+    /* Publish the down signal first so anything watching rnsd.up stops issuing
+     * new work into the ecosystem while we tear it down. */
+    storageSet("rnsd.up", 0);
+    /* Descending phase, reverse within a phase: clients (and their link/dest
+     * teardowns) go first, while interfaces are still up to carry the teardown
+     * on air; interfaces (RNS_PHASE_IFACE) go LAST. */
+    for (int ph = RNS_PHASE_CLIENT; ph >= RNS_PHASE_IFACE; ph--)
+        for (int i = s_rnsServiceCount - 1; i >= 0; i--)
+            if (s_rnsServices[i].phase == ph && s_rnsServices[i].stop)
+                s_rnsServices[i].stop();
+}
+
+/* `rns [start|stop]` — the whole ecosystem, distinct from `rnsd` (daemon
+ * diagnostics). Bare `rns` reports rnsd.up. */
+static void cliRns(const char* args)
+{
+    if (!args) args = "";
+    while (*args == ' ') args++;
+
+    if (strcmp(args, "-h") == 0 || strcmp(args, "help") == 0 || cliWantsHelp(args)) {
+        cliPrintf("rns              show ecosystem status (rnsd.up)\n");
+        cliPrintf("rns start        bring rnsd + all ifaces/clients up, in order\n");
+        cliPrintf("rns stop         take the whole ecosystem down (frees memory)\n");
+        return;
+    }
+    if (strcmp(args, "start") == 0) { rnsStart(); return; }
+    if (strcmp(args, "stop")  == 0) { rnsStop();  return; }
+    if (*args) { cliPrintf("rns: unknown arg '%s' (try -h)\n", args); return; }
+
+    /* Bare: status. */
+    cliPrintf("rnsd.up:   %d\n", storageGetInt("rnsd.up", 0));
+    cliPrintf("rns.ready: %d\n", storageGetInt("rns.ready", 0));
+    cliPrintf("services:  %d registered\n", s_rnsServiceCount);
+    cliPrintf("links:     pending %u active %u\n",
+              (unsigned)RNS::Transport::pending_links_count(),
+              (unsigned)RNS::Transport::active_links_count());
+}
+
 void RnsdService::onInit()
 {
     /* The iface / packet-connection tables are allocated in rnsdTaskMain (task
@@ -6357,6 +6530,7 @@ void RnsdService::onInit()
     }
 
 
+    cliRegisterCmd("rns",      cliRns);
     cliRegisterCmd("rnsd",     cliRnsd);
     cliRegisterCmd("rnstatus", cliRnstatus);
     cliRegisterCmd("rnpath",   cliRnpath);
@@ -6365,8 +6539,8 @@ void RnsdService::onInit()
     /* PSRAM stack, core 0 alongside tcpip_thread, prio 2. */
     s_task = spawnTask(rnsdTaskMain, TAG, 12288, nullptr, 2, 0, STACK_PSRAM);
 
-    /* clink smoke consumer — its own ITS-client task, idle until
-     * `rnsd clink …`. Core 0 with rnsd (it drives real Link packet work when
-     * active, so it belongs off the UI core), prio 1, modest PSRAM stack. */
-    spawnTask(clinkTaskMain, CLINK_TAG, 6144, nullptr, 1, 0, STACK_PSRAM);
+    /* The clink smoke consumer is a test-only task: it is spawned on demand by
+     * clinkEnsureTask() the first time an `rnsd clink`/`creq` command runs, and
+     * self-deletes when the test is done — so it never exists on a node that
+     * isn't being tested. */
 }

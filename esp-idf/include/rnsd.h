@@ -48,6 +48,33 @@ public:
     void onInit() override;
 };
 
+/* ──────────────── RNS ecosystem lifecycle ────────────────
+ *
+ * The whole RNS ecosystem (rnsd + every iface and client) starts and stops as a
+ * unit, orchestrated in one place. A component registers a start/stop hook pair
+ * from its onInit() — instead of self-spawning a task that waits for rnsd — and
+ * the orchestrator drives them: start walks registration order (deps first),
+ * stop walks it in reverse (dependents first). `rnsd.up` is the observable
+ * up/down signal. A stop hook stops abruptly and frees all held memory. */
+typedef void (*rns_hook_t)(void);
+
+/** Lifecycle phases, low-to-high. Interfaces come up first and go down LAST, so a
+ *  client's link/destination teardown still has an interface to ride on when it
+ *  stops; clients come up after interfaces and stop before them. */
+enum { RNS_PHASE_IFACE = 0, RNS_PHASE_CLIENT = 1 };
+
+/** Register a component in the RNS lifecycle. Call from onInit(). `name` must be
+ *  a static string; either hook may be null. `phase` orders start (ascending) and
+ *  stop (descending) — interfaces pass RNS_PHASE_IFACE, clients take the default.
+ *  Single-threaded (boot) only. */
+void rnsServiceRegister(const char* name, rns_hook_t start, rns_hook_t stop,
+                        int phase = RNS_PHASE_CLIENT);
+
+/** Bring the whole ecosystem up (no-op if already up) / take it down (no-op if
+ *  already down). Also driven by the `rns start` / `rns stop` CLI verbs. */
+void rnsStart(void);
+void rnsStop(void);
+
 /* ──────────────── pure crypto (caller-task safe) ──────────────── */
 
 /** SHA-256 of arbitrary bytes. Output is exactly RNSD_HASH_LEN. */

@@ -610,6 +610,73 @@ changing `s.rnsd.enable` requires a reboot.** This is deliberate: it keeps
 signal everything would have to re-check. (Contrast `s.rnsd.transport_enabled`,
 which *is* live — it's read at runtime for forwarding.)
 
+### 6.1 Ecosystem lifecycle (`rns start`/`rns stop`) and what quiesce leaves behind
+
+The whole RNS ecosystem — rnsd plus every interface and client (iface-lora/tcp/
+auto/espnow, lxmf, nomad, rlpg, rnsh) — starts and stops as a unit, orchestrated
+in one place (`rnsServiceRegister` / `rnsStart` / `rnsStop`, `rnsd.cpp`). A
+component registers a start/stop hook pair from its `onInit()` instead of
+self-spawning a task that waits on `rns.ready`; the rnsd task, once past the boot
+window, calls `rnsStart()` which walks the hooks in registration order (deps
+first). `rns stop` walks them in reverse (dependents first) and publishes
+`rnsd.up = 0`, the observable up/down signal.
+
+**Stop PARKS the task; it does not delete it.** A stop hook sets an `s_stop` flag
+and notifies the task; the task breaks its work loop, tears down its *dynamic*
+state (RF off, sockets closed, and — critically — **`itsDisconnect`s every rnsd
+connection it holds**: our-dest, announce subs, links), then blocks on
+`itsPoll(portMAX_DELAY)` until `rnsStart()` clears `s_stop` and notifies it to
+re-bring-up. The task, its ITS slot, its inbox and its boost lock are **reused,
+not freed** — because ITS task slots are append-only ("never freed, just inert")
+and its task-death hook does **not** reap a dying task's live connections (see
+its.cpp — the design assumes immortal tasks). Deleting a client task each stop
+therefore leaked ~23 KB of ITS state per cycle and stranded rnsd server-port
+slots (an `RNSD_PORT_ANNOUNCES` exhaustion that made rnsd reject reconnects) —
+strictly worse than the ~8 KB of stack it reclaimed. Parking sidesteps all of it
+and matches the platform's immortal-task model (`service.h`).
+
+**What a stop actually reclaims.** The client's *dynamic* heap — radio
+objects/sockets/page-caches that a bring-up reallocates — plus RF and routing:
+each client's teardown disconnects its `RNSD_PORT_IFACE` handle, firing
+`onTransportDisconnect` → `Transport::deregister_interface`, so Transport is left
+with no interfaces to route over. The task stack (bounded, ~6–12 KB) and
+`PSRAM_BSS` working state (lxmf's `s_ids`, etc.) stay resident by design — the
+task is alive, just parked.
+
+**The disconnect is load-bearing.** rnsd frees an announce-sub / our-dest server
+slot only when `onAnnouncesDisconnect` / the our-dest disconnect fires, which
+happens when the client `itsDisconnect`s the connection. A parked client MUST
+disconnect its rnsd handles in teardown (not merely null them), or the slots leak
+across cycles until the port is exhausted.
+
+**What is deliberately NOT reclaimed — the residual.** microReticulum's
+`Transport` is a **construct-once, process-lifetime singleton with no teardown**,
+so a stop can only *quiesce*, never destruct:
+
+- `Transport`'s state is all static class members — `_interfaces`, `_path_table`,
+  `_link_table`/`_pending_links`, `_destinations`, `_control_destinations`,
+  `_packet_hashlist`, `_identity`, and the static `_owner` `Reticulum`. There is
+  **no `Transport::stop`/`deinit`/`reset`**; `detach_interfaces()` and
+  `shared_connection_disappeared()` are commented-out no-op stubs; `exit_handler()`
+  only persists the on-disk cache. These tables stay resident and bounded across a
+  stop — the path/link/hashlist working set is not returned to the heap.
+- `Transport::start()` is **not idempotent** (`// CBA ACCUMULATES` on the control-
+  destination inserts), so it must **never** be called a second time. rnsd's own
+  task, its `s_identity`/`s_reticulum`, and the five PSRAM tables (`s_ifaces`,
+  `s_our_dests`, `s_link_conns`, `s_our_dest_receipts`, `s_chan_conns`) are
+  therefore **kept alive** across a stop — rnsd idles rather than exits. The tables
+  can't be freed anyway: `s_our_dests` holds `Destination` objects registered into
+  `Transport::_destinations`, which has no removal API, so freeing them would leave
+  Transport dereferencing freed memory.
+
+So `rns stop` gives you a node that has genuinely left the mesh (no interfaces, no
+TX, client tasks gone, their stacks back), and `rns start` re-attaches to the
+**same** already-initialized Transport (it does not, and must not, re-`start()`
+it). Fully reclaiming rnsd's core + the Transport tables would require adding a
+real `Transport::deinit()` (clear every static table, a `_destinations` removal
+path) and making `start()` idempotent — surgery inside vendored microReticulum,
+deliberately not attempted here.
+
 ## 7. Persistence
 
 Storage is the source of truth for the durable layer; the `rnsd.*` runtime tree
