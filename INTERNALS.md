@@ -236,6 +236,15 @@ it is now implemented, plus fork-specific behaviour for point-to-point links.
   packet's `receiving_interface()` (carried from the stored announce packet at
   retransmit time), **not** a `next_hop_interface()` path-table lookup — the
   latter misses after path culls or interface reconnects.
+- **Access-point interfaces still announce instance-local destinations.**
+  Upstream blocks *every* unattached announce on a `MODE_ACCESS_POINT`
+  interface — the node's own included — so a radio-edge node whose only
+  interface is an AP is undiscoverable *and* unreachable: its announce enters
+  no cache, so no path request for it can ever be answered. The AP branch in
+  `Transport::outbound` now exempts destinations in `_destinations`, the same
+  instance-local carve-out upstream itself grants on roaming/boundary
+  interfaces. Forwarded announces stay blocked, so the mode's airtime purpose
+  (no transport-network announce flood on the edge link) is untouched.
 - **Path-request handling is mode-aware.** Discovery/forwarding and the
   link-maintenance `request_path` sweep skip `MODE_ACCESS_POINT` interfaces
   (don't spray the radio edge) and honour the point-to-point split horizon. The

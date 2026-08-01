@@ -1223,8 +1223,24 @@ static const Bytes& ifac_salt() {
 					if (!packet.attached_interface()) {
 						TRACE("Transport::outbound: Packet has no attached interface");
 						if (interface.mode() == Type::Interface::MODE_ACCESS_POINT) {
-							TRACEF("Blocking announce broadcast on %s due to AP mode", interface.toString().c_str());
-							should_transmit = false;
+							// Deviation from upstream (which blocks every unattached
+							// announce on an AP interface, own destinations included):
+							// instance-local destinations are allowed out, the same
+							// exemption the roaming/boundary branches below grant. AP
+							// mode's purpose is keeping the transport network's
+							// announce flood off the edge link; this node's own
+							// announces are a trickle, and without them an AP node
+							// whose only interface is the radio can never be
+							// discovered or path-resolved (its announce enters no
+							// cache, so no path request for it can be answered).
+							auto iter = _destinations.find(packet.destination_hash());
+							if (iter != _destinations.end()) {
+								TRACE("Allowing announce broadcast on access-point-mode interface from instance-local destination");
+							}
+							else {
+								TRACEF("Blocking announce broadcast on %s due to AP mode", interface.toString().c_str());
+								should_transmit = false;
+							}
 						}
 						else if (interface.mode() == Type::Interface::MODE_ROAMING) {
 							//local_destination = next((d for d in Transport.destinations if d.hash == packet.destination_hash), None)
