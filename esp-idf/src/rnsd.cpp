@@ -242,8 +242,10 @@ static_assert(sizeof(rnsd_channel_connect_t) <= ITS_MAX_MSG_DATA,
  * full LXM wire, ~≤500B) whose path hasn't resolved yet, so multiple sends to
  * different peers can search for routes concurrently instead of evicting one
  * another. When all slots are full a new send is backpressured (OUT_STATUS
- * QUEUE_FULL) rather than dropped — the app holds it and resends. Kept small:
- * the bytes vectors land on the internal heap, which is scarce on the T-Deck. */
+ * QUEUE_FULL) rather than dropped — the app holds it and resends. The bytes
+ * vectors are PSRAM (operator new → gp_alloc), so the table costs no internal
+ * DRAM; it is kept small to bound how many path-request broadcasts a single
+ * conn can have in rotation on a slow shared air interface. */
 #define RNSD_OUR_DEST_MAX_PENDING  4
 /* Generous — costs only a slot struct + (lazily, PSRAM) ITS buffers each.
  * When the table is full a new open evicts the longest-idle link rather than
