@@ -175,6 +175,31 @@ Our deltas, by category:
   current 16). `Resource::cancel()` on an outbound resource now sends
   `RESOURCE_ICL` so the receiver drops its inbound state instead of waiting
   out its own timeout.
+- `Resource.cpp`/`Compression.h` — **bz2 decode tables sized from the caller's
+  output bound, not from the stream header.** bzip2 sizes the decompressor's
+  working set from the `blockSize100k` digit in the four-byte stream header,
+  before it has looked at a byte of the compressed data behind it. Python's
+  `bz2.compress` defaults to level 9, so every stock peer's compressed Resource
+  — a 2 KB NomadNet page included — asks for ~2.25 MB, 1.8 MB of that a single
+  contiguous block, even with `small=1`. On a 2 MB-PSRAM board that allocation
+  can never succeed, whatever else is resident: the compressed Resource was
+  simply undecompressable, and reported itself as a flat "corrupt".
+  A block can never decode to more bytes than the whole stream does, so the
+  digit is rewritten down to `ceil(cap/100000)` from the output bound the caller
+  already supplies — clamped to the stream's own digit, never raised above it —
+  and a page-sized Resource decodes in a couple of hundred KB. The bound must be
+  a *ceiling*: a digit below what a block genuinely needs is refused as
+  `BZ_DATA_ERROR`, not silently truncated, so an under-estimate fails loudly.
+  Feeding a rewritten header means driving `BZ2_bzDecompress` over the stream
+  API rather than `BZ2_bzBuffToBuffDecompress`, because the input `Bytes` is
+  shared and must not be edited in place. This is the receive-side counterpart
+  of the `blockSize100k=1` we already compress with — both sides now bound their
+  own working set, and neither depends on the peer's choice of level.
+  Alongside it, a failed inbound Resource says which stage failed: the assembled
+  byte count against the advertised transfer size (parts arrived short or long),
+  decryption failure over that count, and the bz2 return code with bytes
+  produced against the cap. Previously every one of these surfaced as the same
+  single "corrupt" line.
 - **Tunable identity-cache size** — `RNS::Identity::known_destinations_maxsize` is
   driven by `s.rnsd.identity.cache_max` (default `1000`, ~200 KiB PSRAM). The
   generous default prevents cache eviction before probes conclude on a busy network.

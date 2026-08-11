@@ -73,38 +73,86 @@ Bytes rns_full_hash2(const Bytes& a, const uint8_t* b, size_t blen) {
 } // namespace
 
 // bz2 (de)compression — Reticulum/NomadNet compress Resource payloads and rnsh
-// stream chunks with Python bz2; every peer speaks it. Buffer-to-buffer only
+// stream chunks with Python bz2; every peer speaks it. No stdio surface
 // (BZ_NO_STDIO). bzip2's malloc lands in PSRAM on this platform. Declared in
 // Compression.h for reuse by the rnsh channel protocol.
 namespace RNS {
 
-// small=1 trades speed for ~1/3 the working set so a level-9 stream stays well
-// within PSRAM.
+// bzip2 sizes its decode tables from the blockSize100k digit in the stream
+// header, not from the data behind it: Python's bz2.compress defaults to level
+// 9, so a 2 KB page costs 2.25 MB of working set (1.8 MB of it one contiguous
+// block) even with small=1. A block can never decode to more bytes than the
+// whole stream does, so lowering the digit to ceil(cap/100000) leaves every
+// stream decodable and drops a page-sized Resource to a couple of hundred KB.
+// The bound must be a ceiling: a digit below what a block actually needs is
+// rejected as BZ_DATA_ERROR, not silently tolerated.
+//
+// Feeding a rewritten header means driving the stream API rather than
+// BZ2_bzBuffToBuffDecompress — the input Bytes is shared and must not be
+// mutated in place. small=1 on top of that trades speed for another ~1/3 off
+// the working set.
+static bool bz2_stream_decompress(const Bytes& in, size_t cap, Bytes& out,
+                                  size_t& produced) {
+	produced = 0;
+	if (in.size() < 4 || in.data()[0] != 'B' || in.data()[1] != 'Z' ||
+	    in.data()[2] != 'h' || in.data()[3] < '1' || in.data()[3] > '9') {
+		WARNING("bz2: not a bzip2 stream");
+		return false;
+	}
+	size_t blocks = (cap + 99999) / 100000;
+	if (blocks < 1) blocks = 1;
+	if (blocks > 9) blocks = 9;
+	char header[4] = {'B', 'Z', 'h', static_cast<char>('0' + (int)blocks)};
+	if (header[3] > (char)in.data()[3]) header[3] = (char)in.data()[3];
+
+	std::vector<uint8_t> buf(cap);
+	bz_stream strm;
+	std::memset(&strm, 0, sizeof(strm));
+	if (BZ2_bzDecompressInit(&strm, /*verbosity=*/0, /*small=*/1) != BZ_OK) {
+		WARNING("bz2: decompressor init failed (out of memory)");
+		return false;
+	}
+	strm.next_out  = reinterpret_cast<char*>(buf.data());
+	strm.avail_out = static_cast<unsigned int>(cap);
+	strm.next_in   = header;
+	strm.avail_in  = sizeof(header);
+	int r = BZ2_bzDecompress(&strm);
+	if (r == BZ_OK) {
+		strm.next_in  = reinterpret_cast<char*>(
+			const_cast<uint8_t*>(in.data()) + sizeof(header));
+		strm.avail_in = static_cast<unsigned int>(in.size() - sizeof(header));
+		r = BZ2_bzDecompress(&strm);
+	}
+	produced = cap - strm.avail_out;
+	BZ2_bzDecompressEnd(&strm);
+	if (r != BZ_STREAM_END) {
+		// rc -3 is BZ_MEM_ERROR (no room for the decode tables), -4/-5 a
+		// malformed stream, and BZ_OK here means the output cap was hit
+		// before the stream ended.
+		WARNINGF("bz2: decompress failed rc=%d after %zu/%zu bytes (level %c→%c, %zu in)",
+		         r, produced, cap, in.data()[3], header[3], in.size());
+		return false;
+	}
+	out = Bytes(buf.data(), produced);
+	return true;
+}
+
 bool bz2_decompress(const Bytes& in, size_t out_size, Bytes& out) {
 	if (out_size == 0) { out = Bytes(); return true; }
-	std::vector<uint8_t> buf(out_size);
-	unsigned int dlen = static_cast<unsigned int>(out_size);
-	int r = BZ2_bzBuffToBuffDecompress(
-		reinterpret_cast<char*>(buf.data()), &dlen,
-		reinterpret_cast<char*>(const_cast<uint8_t*>(in.data())),
-		static_cast<unsigned int>(in.size()), /*small=*/1, /*verbosity=*/0);
-	if (r != BZ_OK || dlen != out_size) return false;
-	out = Bytes(buf.data(), dlen);
+	size_t produced = 0;
+	if (!bz2_stream_decompress(in, out_size, out, produced)) return false;
+	if (produced != out_size) {
+		WARNINGF("bz2: decompressed %zu bytes, advertised %zu", produced, out_size);
+		return false;
+	}
 	return true;
 }
 
 bool bz2_decompress_bounded(const Bytes& in, size_t max_out, Bytes& out) {
 	if (in.size() == 0) { out = Bytes(); return true; }
 	if (max_out == 0) return false;
-	std::vector<uint8_t> buf(max_out);
-	unsigned int dlen = static_cast<unsigned int>(max_out);
-	int r = BZ2_bzBuffToBuffDecompress(
-		reinterpret_cast<char*>(buf.data()), &dlen,
-		reinterpret_cast<char*>(const_cast<uint8_t*>(in.data())),
-		static_cast<unsigned int>(in.size()), /*small=*/1, /*verbosity=*/0);
-	if (r != BZ_OK) return false;   /* BZ_OUTBUFF_FULL if it exceeds max_out */
-	out = Bytes(buf.data(), dlen);
-	return true;
+	size_t produced = 0;
+	return bz2_stream_decompress(in, max_out, out, produced);
 }
 
 // blockSize100k=1 bounds our working set (~1 MB); any bz2 decompressor handles
@@ -618,9 +666,19 @@ bool Resource::receive_part(const Bytes& part_data) {
 			d._status = Type::Resource::CORRUPT;
 		}
 		else {
+			// The advertised transfer size is the whole encrypted stream. A
+			// mismatch here means the parts themselves arrived short or long,
+			// which the stream HMAC below would otherwise report only as a
+			// flat decryption failure.
+			if (assembled.size() != d._transfer_size) {
+				WARNINGF("Resource: assembled %zu bytes, advertised %zu",
+				         assembled.size(), (size_t)d._transfer_size);
+			}
 			const Bytes decrypted = d._link.decrypt(assembled);
 			if (!decrypted ||
 			    decrypted.size() <= Type::Resource::RANDOM_HASH_SIZE) {
+				WARNINGF("Resource: decryption failed over %zu assembled bytes",
+				         assembled.size());
 				d._status = Type::Resource::CORRUPT;
 			}
 			else {
@@ -637,7 +695,6 @@ bool Resource::receive_part(const Bytes& part_data) {
 				bool data_ok = true;
 				if (d._flags.compressed) {
 					if (!bz2_decompress(onwire, d._total_size, data)) {
-						WARNING("Resource: bz2 decompress failed — corrupt");
 						data_ok = false;
 					}
 				} else {

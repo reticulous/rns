@@ -4,8 +4,9 @@
  * Reticulum compresses two things with Python's bz2: Resource payloads
  * (Resource.cpp) and rnsh stream chunks (StreamDataMessage.compressed).
  * Every peer speaks it, so both a client reading a stock listener and a
- * listener reading a stock client must decompress. Buffer-to-buffer only
- * (BZ_NO_STDIO); bzip2's malloc lands in PSRAM on this platform.
+ * listener reading a stock client must decompress. No stdio surface
+ * (BZ_NO_STDIO); bzip2's malloc lands in PSRAM on this platform, and the
+ * decompressors cap its working set against the caller's output bound.
  */
 #pragma once
 
