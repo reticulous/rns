@@ -68,6 +68,22 @@ using namespace RNS::Persistence;
 #define RNS_ANNOUNCE_TABLE_MAX 100
 #endif
 
+/* Announce emissions per jobs() pass. The whole ring coming due at once is one
+ * uninterrupted run of pack + per-interface decision + transmit on the rnsd
+ * task, with no yield in it; this bounds that run. The pass repeats at least
+ * once a second and the re-arm interval is seconds, so the table still drains
+ * as fast as it is allowed to. */
+#ifndef ANNOUNCE_EMITS_PER_PASS
+#define ANNOUNCE_EMITS_PER_PASS 8
+#endif
+
+/* Entries removed per table-cull sweep. Expiry is not urgent — an entry a pass
+ * late is still expired — but the sweep runs on the rnsd task, and while it
+ * runs nothing drains the ITS inbox. */
+#ifndef CULL_PER_PASS
+#define CULL_PER_PASS 32
+#endif
+
 #ifndef RNS_HASHLIST_MAX
 #define RNS_HASHLIST_MAX 100
 #endif
@@ -88,11 +104,11 @@ using namespace RNS::Persistence;
 /*static*/ std::set<Bytes> Transport::_packet_hashlist;
 /*static*/ std::list<PacketReceipt> Transport::_receipts;
 
-/*static*/ Transport::AnnounceTable Transport::_announce_table;
+/*static*/ Transport::AnnounceRec* Transport::_announce_ring = nullptr;
+/*static*/ uint16_t Transport::_announce_slots = 0;
 /*static*/ PathTable Transport::_path_table;
 /*static*/ std::map<Bytes, Transport::ReverseEntry> Transport::_reverse_table;
 /*static*/ std::map<Bytes, Transport::LinkEntry> Transport::_link_table;
-/*static*/ Transport::AnnounceTable Transport::_held_announces;
 /*static*/ std::set<HAnnounceHandler> Transport::_announce_handlers;
 /*static*/ std::map<Bytes, Transport::TunnelEntry> Transport::_tunnels;
 /*static*/ std::map<Bytes, Transport::RateEntry> Transport::_announce_rate_table;
@@ -150,6 +166,10 @@ using namespace RNS::Persistence;
 // Spangap: runtime-tunable path TTLs, seeded from the Type::Transport defaults.
 /*static*/ uint32_t Transport::_destination_timeout	= Type::Transport::DESTINATION_TIMEOUT;
 /*static*/ uint32_t Transport::_ap_path_time		= Type::Transport::AP_PATH_TIME;
+/*static*/ uint32_t Transport::_custody_path_time	= 86400;   /* s.rnsd.path.ttl_custody */
+/*static*/ Transport::PathEscalation Transport::_path_escalations[Transport::PATH_ESCALATIONS_MAX] = {};
+/*static*/ uint32_t Transport::_path_escalate_time	= 3;       /* s.rnsd.path.escalate_s */
+/*static*/ uint32_t Transport::_path_cheap_bitrate	= 50000;   /* s.rnsd.path.cheap_bps  */
 /*static*/ uint32_t Transport::_roaming_path_time	= Type::Transport::ROAMING_PATH_TIME;
 
 /*static*/ Reticulum Transport::_owner({Type::NONE});
@@ -168,17 +188,19 @@ using namespace RNS::Persistence;
 
 /*static*/ bool Transport::cleaning_caches = false;
 
-// CBA microStore
-/*static*/ uint32_t Transport::_path_store_segment_size = 0;
-/*static*/ uint8_t Transport::_path_store_segment_count = 0;
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-/*static*/ PathStore Transport::_path_store(RNS_PATH_TABLE_SEGMENT_SIZE, RNS_PATH_TABLE_SEGMENT_COUNT);
-#else
-/*static*/ PathStore Transport::_path_store;
-#endif
-/*static*/ NewPathTable Transport::_new_path_table(Transport::_path_store);
-
-DestinationEntry empty_destination_entry;
+/* The aspect filter is compiled to its name hash here, once. Destination
+ * splits an aspect string at the first dot into µR's app_name + aspects ctor
+ * args, and name_hash() is computed with a NONE identity — so it is a pure
+ * function of the aspect text, and every announce for that aspect carries the
+ * same ten bytes whoever sent it. */
+AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
+	if (aspect_filter == nullptr) return;
+	_aspect_filter = aspect_filter;
+	auto dot = _aspect_filter.find('.');
+	std::string app = (dot == std::string::npos) ? _aspect_filter : _aspect_filter.substr(0, dot);
+	std::string asp = (dot == std::string::npos) ? std::string()  : _aspect_filter.substr(dot + 1);
+	_name_hash_filter = Destination::name_hash(app.c_str(), asp.c_str());
+}
 
 /*static*/ void Transport::start(const Reticulum& reticulum_instance) {
 	INFO("Transport starting...");
@@ -246,6 +268,23 @@ DestinationEntry empty_destination_entry;
 	}
 */
 
+	/* One allocation for the whole retransmission queue, sized from the cap in
+	 * force now (rnsd applies s.rnsd.announce.table_max before start()). Raising
+	 * the cap later clamps to this ring rather than growing it — the queue is
+	 * bounded work, not a cache, and a live resize would buy nothing. */
+	if (!_announce_ring) {
+		_announce_slots = _announce_table_maxsize > 0 ? _announce_table_maxsize : 1;
+		_announce_ring = new (std::nothrow) AnnounceRec[_announce_slots];
+		if (!_announce_ring) {
+			ERRORF("Could not allocate the %u-slot announce queue", (unsigned)_announce_slots);
+			_announce_slots = 0;
+		}
+		else {
+			memset(_announce_ring, 0, (size_t)_announce_slots * sizeof(AnnounceRec));
+			VERBOSEF("Announce queue: %u slots x %u B", (unsigned)_announce_slots, (unsigned)sizeof(AnnounceRec));
+		}
+	}
+
 	// Create transport-specific destination for path request
 	Destination path_request_destination({Type::NONE}, Type::Destination::IN, Type::Destination::PLAIN, APP_NAME, "path.request");
 	path_request_destination.set_packet_callback(path_request_handler);
@@ -276,26 +315,9 @@ DestinationEntry empty_destination_entry;
 	if (Reticulum::transport_enabled()) {
 		INFO("Transport mode is enabled");
 
-		// Read in path table
-		//read_path_table();
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-		// CBA microStore
-		if (Utilities::OS::get_filesystem()) {
-			INFOF("FileSystem available: %lu", Utilities::OS::get_filesystem().storageAvailable());
-			// CBA Must pass time offset into microStore for accurate timestamps on devices without a real-time clock
-#if defined(ARDUINO)
-			microStore::set_time_offset(Utilities::OS::getTimeOffset() / 1000);
-			_path_store.init(Utilities::OS::get_filesystem(), "/path_store", false, _path_store_segment_size, _path_store_segment_count);
-#else
-			_path_store.init(Utilities::OS::get_filesystem(), "path_store", false, _path_store_segment_size, _path_store_segment_count);
-#endif
-			// If the filesystem is full then clear the path store since it's of no use full anyway
-			if (Utilities::OS::get_filesystem().storageAvailable() > 0 && Utilities::OS::get_filesystem().storageAvailable() < 1024) {
-				WARNING("FileSystem is full, clearing existing path store");
-				_path_store.clear();
-			}
-		}
-#endif // RNS_USE_FS && RNS_PERSIST_PATHS
+		/* Routing state comes back from the arena image, which the embedder
+		 * loads through the store's platform hooks before Transport starts —
+		 * there is nothing to read here. */
 
 		// CBA The following write and clean is very resource intensive so skip at startup
 		// and let a later (optimized) scheduled write and clean take care of it.
@@ -487,117 +509,113 @@ DestinationEntry empty_destination_entry;
 				// trickling out for minutes (looking like the toggle did nothing
 				// until a reboot cleared them).
 				if (!Reticulum::transport_enabled()) {
-					if (!_announce_table.empty()) {
-						_announce_table.clear();
-					}
+					for (uint16_t i = 0; i < _announce_slots; i++)
+						memset(&_announce_ring[i], 0, sizeof(AnnounceRec));
 					drop_announce_queues();
 				}
-				else
-				//p for destination_hash in Transport.announce_table:
-				for (auto& [destination_hash, announce_entry] : _announce_table) {
-				//for (auto& pair : _announce_table) {
-				//	const auto& destination_hash = pair.first;
-				//	auto& announce_entry = pair.second;
-//TRACEF("[0] announce entry data size: %u", announce_entry._packet.data().size());
-					//p announce_entry = Transport.announce_table[destination_hash]
-					if (announce_entry._retries > 0 && announce_entry._retries >= Type::Transport::LOCAL_REBROADCASTS_MAX) {
+				else {
+				/* Spangap deviation: bounded work per pass, round-robin.
+				 *
+				 * The walk emits through the whole outbound path — pack,
+				 * per-interface decision, transmit — and nothing in it yields.
+				 * A full ring coming due together therefore ran ~100 emissions
+				 * back to back on the rnsd task, which starved IDLE0 into the
+				 * task watchdog and dropped ITS sends underneath it. Emitting a
+				 * few per pass and resuming at the cursor next tick keeps the
+				 * table draining (the re-arm interval is seconds, the tick is
+				 * at most one) with a hard ceiling on time spent per pass. */
+				static uint16_t announce_cursor = 0;
+				uint8_t emit_budget = ANNOUNCE_EMITS_PER_PASS;
+				for (uint16_t step = 0; step < _announce_slots && emit_budget > 0; step++) {
+					uint16_t slot = (uint16_t)((announce_cursor + step) % _announce_slots);
+					AnnounceRec& rec = _announce_ring[slot];
+					if (!(rec.flags & ANNOUNCE_F_USED)) continue;
+					/* A held entry is waiting for the path response ahead of it
+					 * to go out; it is re-armed below, not emitted here. */
+					if (rec.flags & ANNOUNCE_F_HELD) continue;
+
+					Bytes destination_hash(rec.dest, Type::Reticulum::DESTINATION_LENGTH);
+
+					if (rec.retries > 0 && rec.retries >= Type::Transport::LOCAL_REBROADCASTS_MAX) {
 						TRACEF("Completed announce processing for %s, local rebroadcast limit reached", destination_hash.toHex().c_str());
-						// CBA OK to modify collection here since we're immediately exiting iteration
-						_announce_table.erase(destination_hash);
-						break;
+						memset(&rec, 0, sizeof(rec));
+						continue;
 					}
-					else if (announce_entry._retries > Type::Transport::PATHFINDER_R) {
+					if (rec.retries > Type::Transport::PATHFINDER_R) {
 						TRACEF("Completed announce processing for %s, retry limit reached", destination_hash.toHex().c_str());
-						// CBA OK to modify collection here since we're immediately exiting iteration
-						_announce_table.erase(destination_hash);
-						break;
+						memset(&rec, 0, sizeof(rec));
+						continue;
+					}
+					if (OS::time() <= rec.retransmit_at) continue;
+
+					/* An emission is the expensive step, so it is what the
+					 * budget counts; the skips and expiries above are free.
+					 * Resume past this slot next pass so a ring that is always
+					 * over budget still serves every entry in turn. */
+					emit_budget--;
+					announce_cursor = (uint16_t)((slot + 1) % _announce_slots);
+
+					TRACEF("Performing announce processing for %s...", destination_hash.toHex().c_str());
+					rec.retransmit_at = OS::time() + Type::Transport::PATHFINDER_G + Type::Transport::PATHFINDER_RW;
+					rec.retries += 1;
+
+					bool block_rebroadcasts = (rec.flags & ANNOUNCE_F_BLOCK) != 0;
+					Type::Packet::context_types announce_context =
+						block_rebroadcasts ? Type::Packet::PATH_RESPONSE : Type::Packet::CONTEXT_NONE;
+					Interface attached_interface = (rec.flags & ANNOUNCE_F_ATTACHED)
+						? find_interface_from_hash_prefix(rec.attached_iface) : Interface({Type::NONE});
+
+					Identity announce_identity(Identity::recall(destination_hash));
+					Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, destination_hash);
+
+					Packet new_packet(
+						announce_destination,
+						attached_interface,
+						Bytes(rec.data, rec.data_len),
+						Type::Packet::ANNOUNCE,
+						announce_context,
+						Type::Transport::TRANSPORT,
+						Type::Packet::HEADER_2,
+						Transport::_identity.hash(),
+						true,
+						(Type::Packet::context_flags)rec.context_flag
+					);
+
+					new_packet.hops(rec.hops);
+					// Carry the interface this announce arrived on onto the
+					// rebroadcast, so outbound()'s point-to-point split horizon
+					// can suppress echoing it back out that same interface. This
+					// is the reliable source signal — the interface the original
+					// packet was received on — as opposed to a path lookup that
+					// can miss after evictions or interface reconnects.
+					new_packet.receiving_interface(find_interface_from_hash_prefix(rec.recv_iface));
+					if (block_rebroadcasts) {
+						/* Serving someone else's route request — verbose, like
+						 * the rest of the path-request processing. */
+						VERBOSEF("Sent requested route for %s to transport %s (hop count %d)",
+							announce_destination.hash().toHex().c_str(),
+							attached_interface ? attached_interface.toString().c_str() : "<all>",
+							new_packet.hops());
 					}
 					else {
-						if (OS::time() > announce_entry._retransmit_timeout) {
-							TRACEF("Performing announce processing for %s...", destination_hash.toHex().c_str());
-							announce_entry._retransmit_timeout = OS::time() + Type::Transport::PATHFINDER_G + Type::Transport::PATHFINDER_RW;
-							announce_entry._retries += 1;
-							//p packet = announce_entry[5]
-							//p block_rebroadcasts = announce_entry[7]
-							//p attached_interface = announce_entry[8]
-							Type::Packet::context_types announce_context = Type::Packet::CONTEXT_NONE;
-							if (announce_entry._block_rebroadcasts) {
-								announce_context = Type::Packet::PATH_RESPONSE;
-							}
-							//p announce_data = packet.data
-							Identity announce_identity(Identity::recall(announce_entry._packet.destination_hash()));
-							//Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, "unknown", "unknown");
-							//announce_destination.hash(announce_entry._packet.destination_hash());
-							Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, announce_entry._packet.destination_hash());
-							//P announce_destination.hexhash = announce_destination.hash.hex()
-
-//if (announce_entry._attached_interface) {
-//TRACE("[1] interface is valid");
-//TRACEF("[1] interface: %s", announce_entry._attached_interface.debugString().c_str());
-//TRACEF("[1] interface: %s", announce_entry._attached_interface.toString().c_str());
-//}
-							Packet new_packet(
-								announce_destination,
-								//{Type::NONE},
-								announce_entry._attached_interface,
-								//{Type::NONE},
-								announce_entry._packet.data(),
-								Type::Packet::ANNOUNCE,
-								announce_context,
-								Type::Transport::TRANSPORT,
-								Type::Packet::HEADER_2,
-								Transport::_identity.hash(),
-								true,
-								announce_entry._packet.context_flag()
-							);
-
-							new_packet.hops(announce_entry._hops);
-							// Carry the interface this announce arrived on onto the
-							// rebroadcast, so outbound()'s point-to-point split
-							// horizon can suppress echoing it back out that same
-							// interface. This is the reliable source signal — the
-							// original packet's receiving_interface, set at receive
-							// time — as opposed to a path-table lookup that can miss
-							// after culls or interface reconnects.
-							new_packet.receiving_interface(announce_entry._packet.receiving_interface());
-							if (announce_entry._block_rebroadcasts) {
-								/* Serving someone else's route request — verbose,
-								 * like the rest of the path-request processing. */
-								VERBOSEF("Sent requested route for %s to transport %s (hop count %d)",
-									announce_destination.hash().toHex().c_str(),
-									announce_entry._attached_interface ? announce_entry._attached_interface.toString().c_str() : "<all>",
-									new_packet.hops());
-							}
-							else {
-								DBGF_DEMOTE("Rebroadcasting announce for %s with hop count %d", announce_destination.hash().toHex().c_str(), new_packet.hops());
-							}
-							
-							outgoing.push_back(new_packet);
-
-							// This handles an edge case where a peer sends a past
-							// request for a destination just after an announce for
-							// said destination has arrived, but before it has been
-							// rebroadcast locally. In such a case the actual announce
-							// is temporarily held, and then reinserted when the path
-							// request has been served to the peer.
-							//p if destination_hash in Transport.held_announces:
-							auto iter =_held_announces.find(destination_hash);
-							if (iter != _held_announces.end()) {
-								//p held_entry = Transport.held_announces.pop(destination_hash)
-								auto held_entry = (*iter).second;
-								_held_announces.erase(iter);
-								//p Transport.announce_table[destination_hash] = held_entry
-								//_announce_table[destination_hash] = held_entry;
-								//_announce_table.insert_or_assign({destination_hash, held_entry});
-								_announce_table.erase(destination_hash);
-								// CBA ACCUMULATES
-								_announce_table.insert({destination_hash, held_entry});
-								DBG_DEMOTE("Reinserting held announce into table");
-								// CBA IMMEDIATE CULL
-								cull_announce_table();
-							}
-						}
+						DBGF_DEMOTE("Rebroadcasting announce for %s with hop count %d", announce_destination.hash().toHex().c_str(), new_packet.hops());
 					}
+
+					outgoing.push_back(new_packet);
+
+					// This handles an edge case where a peer sends a path
+					// request for a destination just after an announce for said
+					// destination has arrived, but before it has been
+					// rebroadcast locally. In such a case the actual announce is
+					// temporarily held, and re-armed once the path request has
+					// been served to the peer.
+					AnnounceRec* held = announce_find(destination_hash, /*held=*/true);
+					if (held) {
+						memset(&rec, 0, sizeof(rec));
+						held->flags &= (uint8_t)~ANNOUNCE_F_HELD;
+						DBG_DEMOTE("Re-arming held announce");
+					}
+				}
 				}
 
 				_announces_last_checked = OS::time();
@@ -743,16 +761,12 @@ DestinationEntry empty_destination_entry;
 					ERRORF("jobs: failed to cull link table: %s", e.what());
 				}
 
-				/* Spangap: periodic path-table cull removed — it iterated the
-				 * legacy in-memory _path_table, which is never populated in
-				 * the microStore build (the announce handler puts straight
-				 * into _new_path_table), so it was a no-op. Age expiry lives
-				 * in the store itself (per-record TTL, checked on get() and
-				 * swept on put()); cap eviction is cull_path_table(), called
-				 * use-aware from the announce-insert site. The old
-				 * vanished-interface check is covered at decode time: a stale
-				 * interface hash yields a null receiving_interface, which
-				 * call sites handle.
+				/* Spangap: no periodic path sweep. Both checks the old one did
+				 * are now lazy and per-lookup, in peek_live_route(): an expired
+				 * record and one naming an interface that no longer exists both
+				 * clear their routing fields and report a miss on first use, so
+				 * the caller path-requests instead of black-holing. Cap
+				 * eviction is cull_path_table() at the announce-insert site.
 				 *
 				VERBOSE("Culling path table...");
 				try {
@@ -790,17 +804,38 @@ DestinationEntry empty_destination_entry;
 				}
 				*/
 
-				// Cull the pending discovery path requests table
+				/* Escalate our own unanswered path requests to the expensive
+				 * interfaces. Ahead of the culls: an entry that resolved should
+				 * clear on the same pass it resolved. */
+				escalate_path_requests(OS::time());
+
+				// Cull the pending discovery path requests table.
+				//
+				// Spangap deviation: one line for the sweep, not one per entry.
+				// A busy peer leaves hundreds of these pending at once, and
+				// they expire together — the per-entry line made an expiry a
+				// burst of blocking log writes on the rnsd task, long enough
+				// that nothing drained the ITS inbox and interfaces logged
+				// `ITS send dropped` underneath it. The removals are bounded
+				// per sweep for the same reason; whatever is left is expired
+				// just as much on the next pass. `OS::time()` is hoisted: it
+				// was a call per entry to compare against a value that cannot
+				// change during the walk.
 				try {
+					double cull_now = OS::time();
 					std::vector<Bytes> stale_discovery_path_requests;
-					stale_discovery_path_requests.reserve(_discovery_path_requests.size());
 					for (const auto& [destination_hash, path_entry] : _discovery_path_requests) {
-						if (OS::time() > path_entry._timeout) {
+						if (cull_now > path_entry._timeout) {
 							stale_discovery_path_requests.push_back(destination_hash);
-							DBGF_DEMOTE("Waiting path request for %s timed out and was removed", destination_hash.toString().c_str());
+							if (stale_discovery_path_requests.size() >= CULL_PER_PASS) break;
 						}
 					}
-					remove_discovery_path_requests(stale_discovery_path_requests);
+					if (!stale_discovery_path_requests.empty()) {
+						DBGF_DEMOTE("Expired %u waiting path requests (%u still pending)",
+							(unsigned)stale_discovery_path_requests.size(),
+							(unsigned)(_discovery_path_requests.size() - stale_discovery_path_requests.size()));
+						remove_discovery_path_requests(stale_discovery_path_requests);
+					}
 				}
 				catch (const std::bad_alloc&) {
 					ERROR("jobs: bad_alloc - out of memory culling discovery path requests");
@@ -809,12 +844,14 @@ DestinationEntry empty_destination_entry;
 					ERRORF("jobs: failed to cull discovery path requests: %s", e.what());
 				}
 
-				// Cull the path requests table
+				// Cull the path requests table (bounded per sweep, as above).
 				try {
+					double cull_now = OS::time();
 					std::vector<Bytes> stale_path_requests;
 					for (const auto& [destination_hash, timestamp] : _path_requests) {
-						if (OS::time() > (timestamp + DESTINATION_TIMEOUT)) {
+						if (cull_now > (timestamp + DESTINATION_TIMEOUT)) {
 							stale_path_requests.push_back(destination_hash);
+							if (stale_path_requests.size() >= CULL_PER_PASS) break;
 						}
 					}
 					for (const Bytes& destination_hash : stale_path_requests) {
@@ -1051,14 +1088,19 @@ static const Bytes& ifac_salt() {
 
 	// Check if we have a known path for the destination in the path table
     //if packet.packet_type != RNS.Packet.ANNOUNCE and packet.destination.type != RNS.Destination.PLAIN and packet.destination.type != RNS.Destination.GROUP and packet.destination_hash in Transport.destination_table:
-	// CBA microStore
-	//auto& destination_entry = get_path(packet.destination_hash());
-	DestinationEntry destination_entry;
-	_new_path_table.get(packet.destination_hash(), destination_entry);
-	if (packet.packet_type() != Type::Packet::ANNOUNCE && packet.destination().type() != Type::Destination::PLAIN && packet.destination().type() != Type::Destination::GROUP && destination_entry) {
+	/* This is the per-packet path. It copies a fixed-size route out of the
+	 * directory pool and resolves one interface — it allocates nothing and
+	 * constructs no Packet. */
+	rdir_route_t route;
+	Interface outbound_interface = {Type::NONE};
+	bool have_route = false;
+	if (packet.packet_type() != Type::Packet::ANNOUNCE && packet.destination().type() != Type::Destination::PLAIN && packet.destination().type() != Type::Destination::GROUP) {
+		have_route = peek_live_route(packet.destination_hash(), route, outbound_interface);
+	}
+	if (have_route) {
 		TRACE("Transport::outbound: Path to destination is known");
         //outbound_interface = Transport.destination_table[packet.destination_hash][5]
-		Interface outbound_interface = destination_entry.receiving_interface();
+		Bytes received_from(route.received_from, RDIR_DEST_LEN);
 
 		// If there's more than one hop to the destination, and we know
 		// a path, we insert the packet into transport by adding the next
@@ -1066,7 +1108,7 @@ static const Bytes& ifac_salt() {
 		// This rule applies both for "normal" transport, and when connected
 		// to a local shared Reticulum instance.
         //if Transport.destination_table[packet.destination_hash][2] > 1:
-		if (destination_entry._hops > 1) {
+		if (route.hops > 1) {
 			TRACE("Forwarding packet to next closest interface...");
 			if (packet.header_type() == Type::Packet::HEADER_1) {
 				// Insert packet into transport
@@ -1080,15 +1122,14 @@ static const Bytes& ifac_salt() {
 				//new_raw += packet.raw[1:2]
 				new_raw << packet.raw().mid(1,1);
 				//new_raw += Transport.destination_table[packet.destination_hash][1]
-				new_raw << destination_entry._received_from;
+				new_raw << received_from;
 				//new_raw += packet.raw[2:]
 				new_raw << packet.raw().mid(2);
 				transmit(outbound_interface, new_raw);
 				//_path_table[packet.destination_hash][0] = time.time()
-				/* Upstream refreshes the path timestamp here; destination_entry
-				 * is a decoded copy so that write never stuck. We keep
-				 * _timestamp as the announce time and stamp _last_used on the
-				 * stored record below instead. */
+				/* Upstream refreshes the path timestamp here; `timestamp` stays
+				 * the announce time and outbound use is stamped on the stored
+				 * record below instead. */
 				sent = true;
 			}
 		}
@@ -1101,7 +1142,7 @@ static const Bytes& ifac_salt() {
 		// are "behind" a shared instance, we need to get that instance
 		// to transport it onto the network.
         //elif Transport.destination_table[packet.destination_hash][2] == 1 and Transport.owner.is_connected_to_shared_instance:
-		else if (destination_entry._hops == 1 && _owner.is_connected_to_shared_instance()) {
+		else if (route.hops == 1 && _owner.is_connected_to_shared_instance()) {
 			TRACE("Transport::outbound: Sending packet for directly connected interface to shared instance...");
 			if (packet.header_type() == Type::Packet::HEADER_1) {
 				// Insert packet into transport
@@ -1115,12 +1156,12 @@ static const Bytes& ifac_salt() {
 				//new_raw += packet.raw[1:2]
 				new_raw << packet.raw().mid(1, 1);
 				//new_raw += Transport.destination_table[packet.destination_hash][1]
-				new_raw << destination_entry._received_from;
+				new_raw << received_from;
 				//new_raw += packet.raw[2:]
 				new_raw << packet.raw().mid(2);
 				transmit(outbound_interface, new_raw);
 				//Transport.destination_table[packet.destination_hash][0] = time.time()
-				/* See the transport case above: _last_used is stamped on the
+				/* See the transport case above: outbound use is stamped on the
 				 * stored record below instead. */
 				sent = true;
 			}
@@ -1135,31 +1176,14 @@ static const Bytes& ifac_salt() {
 			sent = true;
 		}
 
-		/* Spangap: record outbound use on the stored path entry so
-		 * cull_path_table() evicts announce-only paths before ones we
-		 * actively send to. Patched at its fixed offset in the raw record: a
-		 * decode/re-encode round trip is heavier and would bump the cached
-		 * announce packet's hop count each time (decode() increments hops to
-		 * mirror receiving it again). The re-put also refreshes the store
-		 * timestamp, so the TTL window slides while a path is in use;
-		 * _timestamp inside the record stays the announce time. */
-		if (sent && (outbound_time - destination_entry._last_used) >= Type::Transport::PATH_LAST_USED_GRANULARITY) {
-			uint32_t ttl;
-			if (outbound_interface && outbound_interface.mode() == Type::Interface::MODE_ACCESS_POINT) {
-				ttl = _ap_path_time;
-			}
-			else if (outbound_interface && outbound_interface.mode() == Type::Interface::MODE_ROAMING) {
-				ttl = _roaming_path_time;
-			}
-			else {
-				ttl = _destination_timeout;
-			}
-			std::vector<uint8_t> raw_entry;
-			if (_path_store.get(packet.destination_hash().collection(), raw_entry)
-			    && raw_entry.size() >= DestinationEntry::OFFSET_LAST_USED + sizeof(double)) {
-				memcpy(&raw_entry[DestinationEntry::OFFSET_LAST_USED], &outbound_time, sizeof(double));
-				_path_store.put(packet.destination_hash().collection(), raw_entry, ttl);
-			}
+		/* Record outbound use on the stored record, so eviction ranks a route
+		 * we actively send to above one we merely heard announced. Coarse on
+		 * purpose (PATH_LAST_USED_GRANULARITY): only eviction ordering and the
+		 * in-use test read it, and it saves a write per packet. */
+		uint32_t now_s = (uint32_t)outbound_time;
+		if (sent && (uint32_t)(now_s - route.last_used) >= Type::Transport::PATH_LAST_USED_GRANULARITY) {
+			rdirTouchUsed(packet.destination_hash().data(),
+			              now_s + path_ttl_for(outbound_interface));
 		}
 	}
 	// If we don't have a known path for the destination, we'll
@@ -1477,7 +1501,12 @@ static const Bytes& ifac_salt() {
 	// routing decision, not a delivery failure. Treat it as handled so
 	// Packet::send doesn't log "No interfaces could process" for it. Own
 	// announces (hops==0) that reach no interface are still reported honestly.
+	// Say so in one line rather than leaving the caller to claim it was sent:
+	// "handled" is not "transmitted", and a log that conflates them is how a
+	// node that relayed nothing for hours still read as working.
 	if (!sent && !deferred && packet.packet_type() == Type::Packet::ANNOUNCE && packet.hops() > 0) {
+		VERBOSEF("Transport::outbound: announce %s hops=%d not relayed on any interface",
+			packet.destination_hash().toHex().c_str(), (int)packet.hops());
 		deferred = true;
 	}
 
@@ -1851,15 +1880,10 @@ static const Bytes& ifac_salt() {
 		bool for_local_client = false;
 		bool for_local_client_link = false;
 		if (packet.packet_type() != Type::Packet::ANNOUNCE) {
-			// CBA microStore
-			//auto& destination_entry = get_path(packet.destination_hash());
-			DestinationEntry destination_entry;
-			_new_path_table.get(packet.destination_hash(), destination_entry);
-			if (destination_entry) {
-			 	if (destination_entry._hops == 0) {
-					// Destined for a local destination
-					for_local_client = true;
-				}
+			rdir_route_t route;
+			if (rdirPeekRoute(packet.destination_hash().data(), &route) && route.hops == 0) {
+				// Destined for a local destination
+				for_local_client = true;
 			}
 			auto link_iter = _link_table.find(packet.destination_hash());
 			if (link_iter != _link_table.end()) {
@@ -1954,15 +1978,13 @@ static const Bytes& ifac_salt() {
 				TRACE("Transport::inbound: Packet is in transport...");
 				if (packet.transport_id() == _identity.hash()) {
 					TRACE("Transport::inbound: We are designated next-hop");
-					// CBA microStore
-					//auto& destination_entry = get_path(packet.destination_hash());
-					DestinationEntry destination_entry;
-					_new_path_table.get(packet.destination_hash(), destination_entry);
-					if (destination_entry) {
+					rdir_route_t fwd_route;
+					Interface fwd_interface = {Type::NONE};
+					if (peek_live_route(packet.destination_hash(), fwd_route, fwd_interface)) {
 						TRACE("Transport::inbound: Found next-hop path to destination");
-						Bytes next_hop = destination_entry._received_from;
-						uint8_t remaining_hops = destination_entry._hops;
-						
+						Bytes next_hop(fwd_route.received_from, RDIR_DEST_LEN);
+						uint8_t remaining_hops = fwd_route.hops;
+
 						// CBA RESERVE
 						//Bytes new_raw;
 						Bytes new_raw(512);
@@ -1998,7 +2020,7 @@ static const Bytes& ifac_salt() {
 							new_raw << packet.raw().mid(2);
 						}
 
-						Interface outbound_interface = destination_entry.receiving_interface();
+						Interface outbound_interface = fwd_interface;
 
 						if (packet.packet_type() == Type::Packet::LINKREQUEST) {
 							TRACE("Transport::inbound: Packet is next-hop LINKREQUEST");
@@ -2064,7 +2086,10 @@ static const Bytes& ifac_salt() {
 						}
 						TRACE("Transport::outbound: Sending packet to next hop...");
 						transmit(outbound_interface, new_raw);
-						destination_entry._timestamp = OS::time();
+						/* Transiting for someone else still counts as use: it
+						 * is what makes this record worth keeping. */
+						rdirTouchUsed(packet.destination_hash().data(),
+						              (uint32_t)OS::time() + path_ttl_for(fwd_interface));
 					}
 					else {
 						// TODO: There should probably be some kind of REJECT
@@ -2164,28 +2189,25 @@ static const Bytes& ifac_salt() {
 					// Check if this is a next retransmission from
 					// another node. If it is, we're removing the
 					// announce in question from our pending table
-					if (Reticulum::transport_enabled() && _announce_table.count(packet.destination_hash()) > 0) {
-						//AnnounceEntry& announce_entry = _announce_table[packet.destination_hash()];
-						AnnounceEntry& announce_entry = (*_announce_table.find(packet.destination_hash())).second;
-
+					AnnounceRec* queued = Reticulum::transport_enabled()
+						? announce_find(packet.destination_hash(), /*held=*/false) : nullptr;
+					if (queued) {
 						bool announce_erased = false;
-						if ((packet.hops() - 1) == announce_entry._hops) {
+						if ((packet.hops() - 1) == queued->hops) {
 							DBGF_DEMOTE("Heard a local rebroadcast of announce for %s", packet.destination_hash().toHex().c_str());
-							announce_entry._local_rebroadcasts += 1;
-							if (announce_entry._local_rebroadcasts >= LOCAL_REBROADCASTS_MAX) {
-								DBGF_DEMOTE("Max local rebroadcasts of announce for %s reached, dropping announce from our table", packet.destination_hash().toHex().c_str());
-								_announce_table.erase(packet.destination_hash());
+							queued->local_rebroadcasts += 1;
+							if (queued->local_rebroadcasts >= LOCAL_REBROADCASTS_MAX) {
+								DBGF_DEMOTE("Max local rebroadcasts of announce for %s reached, dropping announce from our queue", packet.destination_hash().toHex().c_str());
+								memset(queued, 0, sizeof(*queued));
 								announce_erased = true;
 							}
 						}
 
-						// CBA Checking announce_erased so we don't access announce_entry if it's already been freed!
-						if (!announce_erased && (packet.hops() - 1) == (announce_entry._hops + 1) && announce_entry._retries > 0) {
+						if (!announce_erased && (packet.hops() - 1) == (queued->hops + 1) && queued->retries > 0) {
 							double now = OS::time();
-							if (now < announce_entry._timestamp) {
+							if (now < queued->timestamp) {
 								DBGF_DEMOTE("Rebroadcasted announce for %s has been passed on to another node, no further tries needed", packet.destination_hash().toHex().c_str());
-								_announce_table.erase(packet.destination_hash());
-								announce_erased = true;
+								memset(queued, 0, sizeof(*queued));
 							}
 						}
 					}
@@ -2194,9 +2216,15 @@ static const Bytes& ifac_salt() {
 					received_from = packet.destination_hash();
 				}
 
-				// Check if this announce should be inserted into
-				// announce and destination tables
-				bool should_add = false;
+				/* The single test that used to gate the retransmission
+				 * queue, the immediate rebroadcasts and the path-table insert
+				 * splits in two. `fresh` is a forwarding input, computed over
+				 * every announce we have ever validated — the guard pool —
+				 * rather than over whatever we happened to retain. `retain` is
+				 * a storage decision, taken per ingress interface plus
+				 * whatever we have been asked to keep. */
+				bool fresh  = false;
+				bool retain = false;
 
 				// First, check that the announce is not for a destination
 				// local to this system, and that hops are less than the max
@@ -2208,111 +2236,53 @@ static const Bytes& ifac_salt() {
 
 					//p random_blob = packet.data[RNS.Identity.KEYSIZE//8+RNS.Identity.NAME_HASH_LENGTH//8:RNS.Identity.KEYSIZE//8+RNS.Identity.NAME_HASH_LENGTH//8+10]
 					Bytes random_blob = packet.data().mid(Type::Identity::KEYSIZE/8 + Type::Identity::NAME_HASH_LENGTH/8, Type::Identity::RANDOM_HASH_LENGTH/8);
-					//p random_blobs = []
-					std::set<Bytes> empty_random_blobs;
-					std::set<Bytes>& random_blobs = empty_random_blobs;
-					TRACEF("Checking for existing path to %s", packet.destination_hash().toHex().c_str());
-					// CBA microStore
-					//auto& destination_entry = get_path(packet.destination_hash());
-					DestinationEntry destination_entry;
-					_new_path_table.get(packet.destination_hash(), destination_entry);
-					if (destination_entry) {
-						//p random_blobs = Transport.destination_table[packet.destination_hash][4]
-						random_blobs = destination_entry._random_blobs;
 
-						// An explicitly requested path response is answered
-						// by the relay from its *cached* announce, so the
-						// random_blob is necessarily one we've already heard.
-						// The loop-prevention replay guard below would then
-						// reject it forever, silently starving a path we
-						// asked for (works once, then nothing). Upstream RNS
-						// escapes this via path_is_unresponsive; this port
-						// lacks that, so key on the outstanding request: if
-						// we have a pending path request for this dest and
-						// this is the PATH_RESPONSE, accept it regardless of
-						// blob replay.
-						bool requested_path_response =
-							packet.context() == Type::Packet::PATH_RESPONSE &&
-							_path_requests.find(packet.destination_hash()) != _path_requests.end();
+					/* A relay answers an explicit path request from its own
+					 * cached announce, so a requested PATH_RESPONSE always
+					 * carries a random blob we have already heard. Treating it
+					 * as a replay makes path discovery work exactly once and
+					 * then go silent; upstream escapes via
+					 * path_is_unresponsive, which this port lacks, so we key on
+					 * the outstanding request instead. Scoped to paths no worse
+					 * than what we hold — a looped longer copy arrives as a
+					 * requested PATH_RESPONSE too, and must not displace a good
+					 * direct one. */
+					rdir_route_t known;
+					bool have_known  = rdirPeekRoute(packet.destination_hash().data(), &known);
+					bool have_record = rdirPeekEntry(packet.destination_hash().data(), nullptr);
+					bool requested =
+						packet.context() == Type::Packet::PATH_RESPONSE &&
+						_path_requests.find(packet.destination_hash()) != _path_requests.end();
+					bool bypass = requested && (!have_known || packet.hops() <= known.hops);
 
-						// Scope the bypass to paths no worse than what we hold.
-						// A relay answers from its cached announce, so a
-						// *looped* longer copy can arrive as a requested
-						// PATH_RESPONSE too — without this hop guard it would
-						// overwrite a good direct (e.g. 1-hop) path with the
-						// loop.
-						if (requested_path_response && packet.hops() <= destination_entry._hops) {
-							DBGF_DEMOTE("Accepting requested path response for %s (%u hops <= known %u) despite seen random_blob", packet.destination_hash().toHex().c_str(), (unsigned)packet.hops(), (unsigned)destination_entry._hops);
-							should_add = true;
-						}
-						// If we already have a path to the announced
-						// destination, but the hop count is equal or
-						// less, we'll update our tables.
-						else if (packet.hops() <= destination_entry._hops) {
-							// Make sure we haven't heard the random
-							// blob before, so announces can't be
-							// replayed to forge paths.
-							// TODO: Check whether this approach works
-							// under all circumstances
-							//p if not random_blob in random_blobs:
-							if (random_blobs.find(random_blob) == random_blobs.end()) {
-								should_add = true;
-							}
-							else {
-								should_add = false;
-							}
-						}
-						else {
-							// If an announce arrives with a larger hop
-							// count than we already have in the table,
-							// ignore it, unless the path is expired, or
-							// the emission timestamp is more recent.
-							double now = OS::time();
-							double path_expires = destination_entry._expires;
-							
-							uint64_t path_announce_emitted = 0;
-							for (const Bytes& path_random_blob : random_blobs) {
-								//p path_announce_emitted = max(path_announce_emitted, int.from_bytes(path_random_blob[5:10], "big"))
-								path_announce_emitted = std::max(path_announce_emitted, OS::from_bytes_big_endian(path_random_blob.data() + 5, 5));
-								if (path_announce_emitted >= announce_emitted) {
-									break;
-								}
-							}
+					fresh = random_blob.size() == Type::Identity::RANDOM_HASH_LENGTH/8 &&
+					        rdirGuardFresh(packet.destination_hash().data(), random_blob.data(),
+					                       (uint32_t)announce_emitted, bypass);
 
-							if (now >= path_expires) {
-								// We also check that the announce is
-								// different from ones we've already heard,
-								// to avoid loops in the network
-								if (random_blobs.find(random_blob) == random_blobs.end()) {
-									// TODO: Check that this ^ approach actually
-									// works under all circumstances
-									DBGF_DEMOTE("Replacing destination table entry for %s with new announce due to expired path", packet.destination_hash().toHex().c_str());
-									should_add = true;
-								}
-								else {
-									should_add = false;
-								}
-							}
-							else {
-								if (announce_emitted > path_announce_emitted) {
-									if (random_blobs.find(random_blob) == random_blobs.end()) {
-										DBGF_DEMOTE("Replacing destination table entry for %s with new announce, since it was more recently emitted", packet.destination_hash().toHex().c_str());
-										should_add = true;
-									}
-									else {
-										should_add = false;
-									}
-								}
-							}
-						}
-					}
-					else {
-						// If this destination is unknown in our table
-						// we should add it
-						should_add = true;
-					}
+					/* A longer path never displaces a shorter one while the
+					 * shorter one is still valid. Once it expires the freshest
+					 * announce wins, whatever its hop count — that is how a
+					 * destination that moved gets rediscovered. */
+					bool route_better = !have_known || packet.hops() <= known.hops ||
+					                    (known.expires != 0 && (uint32_t)OS::time() >= known.expires);
 
-					if (should_add) {
+					/* `requested` is the "resolved on demand" arm, and it is what
+					 * keeps a non-retaining interface usable at all: without it a
+					 * node whose only link is a cheap one would discard the very
+					 * path response it just asked for, and could never send. */
+					/* Re-storing an announce we have already seen and already
+					 * hold buys nothing and costs a record write — which on a
+					 * mesh where several neighbours rebroadcast the same
+					 * announce is most of the traffic. Store when the announce
+					 * is new to us, or when we hold nothing for the
+					 * destination (the record was evicted since). */
+					retain = route_better && (fresh || !have_record) &&
+					         (requested ||
+					          (packet.receiving_interface() && packet.receiving_interface().retain_on_announce()) ||
+					          rdirHasClaim(packet.destination_hash().data()) ||
+					          rdirInUse(packet.destination_hash().data()));
+
+					if (fresh || retain) {
 						double now = OS::time();
 
 						bool rate_blocked = false;
@@ -2355,57 +2325,35 @@ static const Bytes& ifac_salt() {
 
 						uint8_t retries = 0;
 						uint8_t announce_hops = packet.hops();
-						uint8_t local_rebroadcasts = 0;
+						/* Why this announce will or will not be re-broadcast,
+						 * reported as a clause on the line below rather than
+						 * as a line of its own. */
+						const char* relay_note = "";
 						bool block_rebroadcasts = false;
 						Interface attached_interface = {Type::NONE};
 						
 						double retransmit_timeout = now + (Cryptography::random() * PATHFINDER_RW);
 
-						double expires;
-						if (packet.receiving_interface().mode() == Type::Interface::MODE_ACCESS_POINT) {
-							expires = now + AP_PATH_TIME;
-						}
-						else if (packet.receiving_interface().mode() == Type::Interface::MODE_ROAMING) {
-							expires = now + ROAMING_PATH_TIME;
-						}
-						else {
-							expires = now + PATHFINDER_E;
-						}
+						/* Path lifetime, from the runtime-tunable TTLs. The
+						 * blob ring that used to live beside it is now the
+						 * guard pool, which every announce updates whether or
+						 * not we retain anything else about the destination. */
+						uint32_t path_ttl = path_ttl_for(packet.receiving_interface());
 
-						random_blobs.insert(random_blob);
-
-						// Spangap fork: upstream RNS caps random_blobs to the
-						// most recent MAX_RANDOM_BLOBS per destination
-						// (Transport.py: `random_blobs = random_blobs[-MAX:]`).
-						// That cap was lost in the std::set port, so a
-						// frequently-announcing destination accumulated blobs
-						// without bound until the serialised DestinationEntry
-						// exceeded microStore's 1024-byte value limit and
-						// _new_path_table.put() failed on every subsequent
-						// announce ("Failed to add destination ... to path
-						// table!"), permanently freezing that path. std::set
-						// orders by blob content, not arrival, so drop the
-						// entries with the lowest emission timebase (bytes
-						// 5..10) — keep the most recently emitted blobs,
-						// matching upstream intent.
-						while (random_blobs.size() > MAX_RANDOM_BLOBS) {
-							auto oldest = random_blobs.begin();
-							uint64_t oldest_emitted = OS::from_bytes_big_endian(oldest->data() + 5, 5);
-							for (auto it = std::next(random_blobs.begin()); it != random_blobs.end(); ++it) {
-								uint64_t emitted = OS::from_bytes_big_endian(it->data() + 5, 5);
-								if (emitted < oldest_emitted) {
-									oldest_emitted = emitted;
-									oldest = it;
-								}
-							}
-							random_blobs.erase(oldest);
-						}
-
-						if ((Reticulum::transport_enabled() || Transport::from_local_client(packet)) && packet.context() != Type::Packet::PATH_RESPONSE) {
+						if (fresh && (Reticulum::transport_enabled() || Transport::from_local_client(packet)) && packet.context() != Type::Packet::PATH_RESPONSE) {
 							// Insert announce into announce table for retransmission
 
 							if (rate_blocked) {
 								DBGF_DEMOTE("Blocking rebroadcast of announce from %s due to excessive announce rate", packet.destination_hash().toHex().c_str());
+							}
+							/* Nothing could carry a re-broadcast — don't take a
+							 * table slot and PATHFINDER_R emission attempts to
+							 * discover that once per announce. The decision is
+							 * a clause on the announce's own line below, not a
+							 * line of its own: one announce, one line. */
+							else if (!announce_relay_possible(packet.destination_hash(),
+							                                  packet.receiving_interface())) {
+								relay_note = ", not relayed (no egress)";
 							}
 							else {
 								if (Transport::from_local_client(packet)) {
@@ -2414,25 +2362,16 @@ static const Bytes& ifac_salt() {
 									retransmit_timeout = now;
 									retries = PATHFINDER_R;
 								}
-								AnnounceEntry announce_entry(
-									now,
-									retransmit_timeout,
-									retries,
-									received_from,
-									announce_hops,
-									packet,
-									local_rebroadcasts,
-									block_rebroadcasts,
-									attached_interface
-								);
-								// CBA ACCUMULATES
-								_announce_table.insert({packet.destination_hash(), announce_entry});
-								// CBA IMMEDIATE CULL
+								AnnounceRec* slot = announce_find(packet.destination_hash(), /*held=*/false);
+								if (!slot) slot = announce_alloc();
+								announce_store(slot, packet.destination_hash(), packet, now,
+								               retransmit_timeout, retries, announce_hops,
+								               block_rebroadcasts, attached_interface);
 								cull_announce_table();
 							}
 						}
 						// TODO: Check from_local_client once and store result
-						else if (Transport::from_local_client(packet) && packet.context() == Type::Packet::PATH_RESPONSE) {
+						else if (fresh && Transport::from_local_client(packet) && packet.context() == Type::Packet::PATH_RESPONSE) {
 							// If this is a path response from a local client,
 							// check if any external interfaces have pending
 							// path requests.
@@ -2445,27 +2384,18 @@ static const Bytes& ifac_salt() {
 								retransmit_timeout = now;
 								retries = PATHFINDER_R;
 
-								AnnounceEntry announce_entry(
-									now,
-									retransmit_timeout,
-									retries,
-									received_from,
-									announce_hops,
-									packet,
-									local_rebroadcasts,
-									block_rebroadcasts,
-									attached_interface
-								);
-								// CBA ACCUMULATES
-								_announce_table.insert({packet.destination_hash(), announce_entry});
-								// CBA IMMEDIATE CULL
+								AnnounceRec* slot = announce_find(packet.destination_hash(), /*held=*/false);
+								if (!slot) slot = announce_alloc();
+								announce_store(slot, packet.destination_hash(), packet, now,
+								               retransmit_timeout, retries, announce_hops,
+								               block_rebroadcasts, attached_interface);
 								cull_announce_table();
 							}
 						}
 
 						// If we have any local clients connected, we re-
 						// transmit the announce to them immediately
-						if (_local_client_interfaces.size() > 0) {
+						if (fresh && _local_client_interfaces.size() > 0) {
 							Identity announce_identity(Identity::recall(packet.destination_hash()));
 							//Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, "unknown", "unknown");
 							//announce_destination.hash(packet.destination_hash());
@@ -2523,7 +2453,7 @@ static const Bytes& ifac_salt() {
 						// for this destination, we retransmit to that
 						// interface immediately
 						auto iter = _discovery_path_requests.find(packet.destination_hash());
-						if (iter != _discovery_path_requests.end()) {
+						if (fresh && iter != _discovery_path_requests.end()) {
 							PathRequestEntry& pr_entry = (*iter).second;
 							attached_interface = pr_entry._requesting_interface;
 
@@ -2552,92 +2482,49 @@ static const Bytes& ifac_salt() {
 							new_announce.send();
 						}
 
-// CBA microStore
-/*
-						// CBA ACCUMULATES
-						// CBA Culling before adding to esnure table does not exceed maxsize
-						TRACEF("Caching packet %s", packet.get_hash().toHex().c_str());
-						// CBA Currently this is the ONLY place that packets get cached
-						if (RNS::Transport::cache_packet(packet, true)) {
-							packet.cached(true);
-						}
-						//TRACEF("Adding packet %s to packet table", packet.get_hash().toHex().c_str());
-						//PacketEntry packet_entry(packet);
-*/
+						/* Storage decision. The guard pool already recorded
+						 * that we saw this announce; what lands here is the
+						 * directory record — identity, name, routing — and,
+						 * when it fits a blob slot, the raw signed announce we
+						 * would need to answer a path request for this
+						 * destination. Nothing is retained per-consumer: one
+						 * record serves everyone. */
+						if (retain) {
+							TRACEF("Adding destination %s to directory", packet.destination_hash().toHex().c_str());
+							const Bytes& adata = packet.data();
+							/* Truncated to the record's 16-byte field; resolved back
+							 * with find_interface_from_hash_prefix(). */
+							Bytes iface_hash;
+							if (packet.receiving_interface()) iface_hash = packet.receiving_interface().get_hash();
 
-						// CBA ACCUMULATES
-						//_packet_table.insert({packet.get_hash(), packet_entry});
-						TRACEF("Adding destination %s to path table", packet.destination_hash().toHex().c_str());
-						DestinationEntry destination_table_entry(
-							now,
-							received_from,
-							announce_hops,
-							expires,
-							random_blobs,
-							//packet.receiving_interface(),
-							const_cast<Interface&>(packet.receiving_interface()),
-							//packet.receiving_interface().get_hash(),
-							packet
-							//packet.get_hash()
-						);
-						// CBA ACCUMULATES
-						try {
+							rdir_announce_t ann = {};
+							if (adata.size() >= (size_t)(Type::Identity::KEYSIZE/8 + Type::Identity::NAME_HASH_LENGTH/8)) {
+								ann.pubkey    = adata.data();
+								ann.name_hash = adata.data() + Type::Identity::KEYSIZE/8;
+							}
+							ann.received_from = received_from.size() == RDIR_DEST_LEN ? received_from.data() : nullptr;
+							ann.iface_hash    = iface_hash.size()    >= RDIR_DEST_LEN ? iface_hash.data()    : nullptr;
+							ann.raw           = packet.raw().data();
+							ann.raw_len       = (uint16_t)packet.raw().size();
+							ann.hops          = announce_hops;
+							ann.edge          = packet.receiving_interface() && packet.receiving_interface().retain_on_announce();
+							/* Reached via an interface we route for → we answer
+							 * path requests for it, so it must outrank the churn
+							 * of everything we merely overhear. Auto keeps the
+							 * mode inference, so nothing is claimed until an
+							 * operator says what this node is. */
+							ann.answer_for    = packet.receiving_interface() &&
+							                    packet.receiving_interface().policy_manual() &&
+							                    packet.receiving_interface().route_for();
+							ann.timestamp     = (uint32_t)now;
+							ann.expires       = (uint32_t)now + path_ttl;
 
-// CBA microStore
-/*
-							// CBA First remove any existing path before inserting new one
-							remove_path(packet.destination_hash());
-							if (_path_table.insert({packet.destination_hash(), destination_table_entry}).second) {
-								TRACEF("Added destination %s to path table!", packet.destination_hash().toHex().c_str());
-								++_destinations_added;
-								// CBA IMMEDIATE CULL
-								cull_path_table();
-							}
-							else {
-								ERRORF("Failed to add destination %s to path table!", packet.destination_hash().toHex().c_str());
-							}
-*/
-							// CBA microStore
-							uint32_t ttl = 0;
-							if (packet.receiving_interface().mode() == Type::Interface::MODE_ACCESS_POINT) {
-								ttl = _ap_path_time;
-							}
-							else if (packet.receiving_interface().mode() == Type::Interface::MODE_ROAMING) {
-								ttl = _roaming_path_time;
-							}
-							else {
-								ttl = _destination_timeout;
-							}
-							/* Spangap: carry outbound-use recency across announce
-							 * refreshes — the fresh entry defaults _last_used to
-							 * 0, which would turn an in-use path back into
-							 * eviction bait for cull_path_table(). */
-							{
-								std::vector<uint8_t> prev_raw;
-								if (_path_store.get(packet.destination_hash().collection(), prev_raw)
-								    && prev_raw.size() >= DestinationEntry::OFFSET_LAST_USED + sizeof(double)) {
-									memcpy(&destination_table_entry._last_used, &prev_raw[DestinationEntry::OFFSET_LAST_USED], sizeof(double));
-								}
-							}
-							if (_new_path_table.put(packet.destination_hash().collection(), destination_table_entry, ttl)) {
-								TRACEF("Added destination %s to path table!", packet.destination_hash().toHex().c_str());
-								++_destinations_added;
-								/* Spangap: cap enforcement lives here (use-aware),
-								 * not in the store's set_max_recs eviction. */
-								cull_path_table();
-							}
-							else {
-								ERRORF("Failed to add destination %s to path table!", packet.destination_hash().toHex().c_str());
-							}
-						}
-						catch (const std::bad_alloc&) {
-							ERROR("inbound: bad_alloc - out of memory storing destination entry");
-						}
-						catch (const std::exception& e) {
-							ERRORF("inbound: exception storing destination entry: %s", e.what());
+							rdirIngest(packet.destination_hash().data(), &ann, RDIR_LAYER_DIR_BLOB);
+							++_destinations_added;
+							cull_path_table();
 						}
 
-						DBGF_DEMOTE("Destination %s is now %d hops away via %s on %s", packet.destination_hash().toHex().c_str(), announce_hops, received_from.toHex().c_str(), packet.receiving_interface().toString().c_str());
+						DBGF_DEMOTE("Destination %s is now %d hops away via %s on %s%s", packet.destination_hash().toHex().c_str(), announce_hops, received_from.toHex().c_str(), packet.receiving_interface().toString().c_str(), relay_note);
 						//TRACEF("Transport::inbound: Destination %s has data: %s", packet.destination_hash().toHex().c_str(), packet.data().toHex().c_str());
 						//TRACEF("Transport::inbound: Destination %s has text: %s", packet.destination_hash().toHex().c_str(), packet.data().toString().c_str());
 
@@ -2657,32 +2544,49 @@ static const Bytes& ifac_salt() {
 
 						// Call externally registered callbacks from apps
 						// wanting to know when an announce arrives
-						if (packet.context() != Type::Packet::PATH_RESPONSE) {
+						if (fresh && packet.context() != Type::Packet::PATH_RESPONSE) {
 							TRACE("Transport::inbound: Not path response, sending to announce handler...");
+							/* Everything a handler needs is in the announce we are
+							 * holding: recalling it back out of a store would
+							 * depend on having retained it, and would hash the
+							 * destination once per subscriber per announce —
+							 * which is what stalled the browser transport during
+							 * announce bursts. */
+							const Bytes& announce_data = packet.data();
+							const size_t announce_prefix = Type::Identity::KEYSIZE/8 +
+							                               Type::Identity::NAME_HASH_LENGTH/8 +
+							                               Type::Identity::RANDOM_HASH_LENGTH/8 +
+							                               Type::Identity::SIGLENGTH/8;
+							Identity announce_identity(false);
+							Bytes announce_name_hash;
+							Bytes announce_app_data;
+							if (announce_data.size() >= announce_prefix) {
+								announce_identity.load_public_key(announce_data.left(Type::Identity::KEYSIZE/8));
+								announce_name_hash = announce_data.mid(Type::Identity::KEYSIZE/8, Type::Identity::NAME_HASH_LENGTH/8);
+								if (announce_data.size() > announce_prefix)
+									announce_app_data = announce_data.mid(announce_prefix);
+							}
 							for (auto& handler : _announce_handlers) {
 								TRACE("Transport::inbound: Checking filter of announce handler...");
 								try {
 									// Check that the announced destination matches
-									// the handlers aspect filter
-									bool execute_callback = false;
-									Identity announce_identity(Identity::recall(packet.destination_hash()));
-									if (handler->aspect_filter().empty()) {
-										// If the handlers aspect filter is set to
-										// None, we execute the callback in all cases
-										execute_callback = true;
-									}
-									else {
-										Bytes handler_expected_hash = Destination::hash_from_name_and_identity(handler->aspect_filter().c_str(), announce_identity);
-										if (packet.destination_hash() == handler_expected_hash) {
-											execute_callback = true;
-										}
-									}
+									// the handlers aspect filter. validate_announce
+									// has already proven dest_hash ==
+									// full_hash(carried_name_hash ‖ identity)[:16],
+									// so matching the carried name hash against the
+									// precompiled filter is exactly equivalent to
+									// recomputing the destination hash — at the cost
+									// of a ten-byte comparison.
+									bool execute_callback =
+										handler->aspect_filter().empty() ||
+										handler->name_hash_filter() == announce_name_hash;
 									if (execute_callback) {
-										// CBA TODO Why does app data come from recall instead of from this announce packet?
 										handler->received_announce(
 											packet.destination_hash(),
 											announce_identity,
-											Identity::recall_app_data(packet.destination_hash())
+											announce_app_data,
+											announce_name_hash,
+											packet.hops()
 										);
 									}
 								}
@@ -2762,7 +2666,7 @@ static const Bytes& ifac_salt() {
 					 * path request and is just path-request scaffolding,
 					 * so route it through DBGF_DEMOTE. */
 					if (_control_hashes.find(packet.destination_hash()) != _control_hashes.end()) {
-						DBGF_DEMOTE("Packet destination %s found, destination is local (control)", packet.destination_hash().toHex().c_str());
+						TRACEF("Packet destination %s found, destination is local (control)", packet.destination_hash().toHex().c_str());
 					} else {
 						INFOF("Packet destination %s found, destination is local", packet.destination_hash().toHex().c_str());
 					}
@@ -3191,6 +3095,15 @@ Deregisters an announce handler.
 	return {Type::NONE};
 }
 
+/*static*/ Interface Transport::find_interface_from_hash_prefix(const uint8_t prefix[RDIR_DEST_LEN]) {
+	for (auto& [hash, interface] : _interfaces) {
+		if (hash.size() >= RDIR_DEST_LEN && memcmp(hash.data(), prefix, RDIR_DEST_LEN) == 0) {
+			return interface;
+		}
+	}
+	return {Type::NONE};
+}
+
 /*static*/ bool Transport::should_cache_packet(const Packet& packet) {
 	// TODO: Rework the caching system. It's currently
 	// not very useful to even cache Resource proofs,
@@ -3317,42 +3230,47 @@ Deregisters an announce handler.
 	}
 }
 
-/*static*/ DestinationEntry& Transport::get_path(const Bytes& destination_hash) {
-	auto iter = _path_table.find(destination_hash);
-	if (iter == _path_table.end()) return empty_destination_entry;
-	DestinationEntry& destination_entry = (*iter).second;
-	if (!destination_entry.announce_packet()) {
-		DBGF_DEMOTE("Entry for destination %s found but is missing announce packet, discarding", destination_hash.toHex().c_str());
-		remove_path(destination_hash);
-		return empty_destination_entry;
-	}
-	if (!destination_entry.receiving_interface()) {
-		DEBUGF("Entry for destination %s found but is missing receiving interface, discarding", destination_hash.toHex().c_str());
-		remove_path(destination_hash);
-		return empty_destination_entry;
-	}
-	return destination_entry;
+/*static*/ uint32_t Transport::path_ttl_for(const Interface& interface) {
+	/* A destination we are custodian of outlives one we merely heard about.
+	 * Mode gets this backwards for a gateway: it hands the SHORTEST lifetime
+	 * to the access-point radio, whose destinations are the most expensive to
+	 * re-acquire and the ones we are obliged to answer for. */
+	if (interface && interface.policy_manual() && interface.route_for())
+		return _custody_path_time;
+	if (interface && interface.mode() == Type::Interface::MODE_ACCESS_POINT) return _ap_path_time;
+	if (interface && interface.mode() == Type::Interface::MODE_ROAMING)      return _roaming_path_time;
+	return _destination_timeout;
 }
 
-/*static*/ bool Transport::remove_path(const Bytes& destination_hash) {
-// CBA microStore
-/*
-	auto iter = _path_table.find(destination_hash);
-	if (iter == _path_table.end()) return false;
-	// Remove cached packet file associated with this destination
-	char packet_cache_path[Type::Reticulum::FILEPATH_MAXSIZE];
-	snprintf(packet_cache_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/%s", Reticulum::_cachepath, iter->second.announce_packet_hash().toHex().c_str());
-	if (OS::file_exists(packet_cache_path)) {
-		OS::remove_file(packet_cache_path);
+/* The one place a stored route becomes usable. A loaded image — or a live
+ * table across an interface reconnect — can name an iface_hash that no longer
+ * resolves, which would leave has_path() true while every send silently
+ * dropped. Clearing the record's routing fields on the first failed resolve
+ * turns that black hole into a path request. Writer-task only. */
+/*static*/ bool Transport::peek_live_route(const Bytes& destination_hash, rdir_route_t& route, Interface& outbound_interface) {
+	outbound_interface = {Type::NONE};
+	if (!rdirPeekRoute(destination_hash.data(), &route)) return false;
+
+	if (route.expires != 0 && (uint32_t)OS::time() >= route.expires) {
+		DBGF_DEMOTE("Path to %s has expired, dropping route", destination_hash.toHex().c_str());
+		rdirClearRoute(destination_hash.data());
+		return false;
 	}
-	if (_path_table.erase(destination_hash) < 1) {
-		WARNINGF("Failed to remove destination %s from path table", destination_hash.toHex().c_str());
+
+	outbound_interface = find_interface_from_hash_prefix(route.iface_hash);
+	if (!outbound_interface) {
+		DBGF_DEMOTE("Path to %s names an interface that no longer exists, dropping route", destination_hash.toHex().c_str());
+		rdirClearRoute(destination_hash.data());
 		return false;
 	}
 	return true;
-*/
-	// CBA microStore
-	return _new_path_table.remove(destination_hash.collection());
+}
+
+/* "Forget the path" now means dropping the routing layer, not the record: we
+ * may still know who the destination is, and the identity is what makes the
+ * next path response cheap. */
+/*static*/ bool Transport::remove_path(const Bytes& destination_hash) {
+	return rdirClearRoute(destination_hash.data());
 }
 
 /*
@@ -3360,12 +3278,9 @@ Deregisters an announce handler.
 :returns: *True* if a path to the destination is known, otherwise *False*.
 */
 /*static*/ bool Transport::has_path(const Bytes& destination_hash) {
-// CBA microStore
-/*
-	return (_path_table.find(destination_hash) != _path_table.end());
-*/
-	// CBA microStore
-	return _new_path_table.exists(destination_hash.collection());
+	rdir_route_t route;
+	Interface iface = {Type::NONE};
+	return peek_live_route(destination_hash, route, iface);
 }
 
 /*
@@ -3373,12 +3288,9 @@ Deregisters an announce handler.
 :returns: The number of hops to the specified destination, or ``RNS.Transport.PATHFINDER_M`` if the number of hops is unknown.
 */
 /*static*/ uint8_t Transport::hops_to(const Bytes& destination_hash) {
-	// CBA microStore
-	//auto& destination_entry = get_path(destination_hash);
-	DestinationEntry destination_entry;
-	_new_path_table.get(destination_hash, destination_entry);
-	if (destination_entry) {
-		return destination_entry._hops;
+	rdir_route_t route;
+	if (rdirPeekRoute(destination_hash.data(), &route)) {
+		return route.hops;
 	}
 	else {
 		return PATHFINDER_M;
@@ -3390,12 +3302,9 @@ Deregisters an announce handler.
 :returns: The destination hash as *bytes* for the next hop to the specified destination, or *None* if the next hop is unknown.
 */
 /*static*/ Bytes Transport::next_hop(const Bytes& destination_hash) {
-	// CBA microStore
-	//auto& destination_entry = get_path(destination_hash);
-	DestinationEntry destination_entry;
-	_new_path_table.get(destination_hash, destination_entry);
-	if (destination_entry) {
-		return destination_entry._received_from;
+	rdir_route_t route;
+	if (rdirPeekRoute(destination_hash.data(), &route)) {
+		return Bytes(route.received_from, RDIR_DEST_LEN);
 	}
 	else {
 		return {};
@@ -3407,16 +3316,10 @@ Deregisters an announce handler.
 :returns: The interface for the next hop to the specified destination, or *None* if the interface is unknown.
 */
 /*static*/ Interface Transport::next_hop_interface(const Bytes& destination_hash) {
-	// CBA microStore
-	//auto& destination_entry = get_path(destination_hash);
-	DestinationEntry destination_entry;
-	_new_path_table.get(destination_hash, destination_entry);
-	if (destination_entry) {
-		return destination_entry.receiving_interface();
-	}
-	else {
-		return {Type::NONE};
-	}
+	rdir_route_t route;
+	Interface iface = {Type::NONE};
+	peek_live_route(destination_hash, route, iface);
+	return iface;
 }
 
 /*static*/ uint32_t Transport::next_hop_interface_bitrate(const Bytes& destination_hash) {
@@ -3480,14 +3383,8 @@ Deregisters an announce handler.
 }
 
 /*static*/ bool Transport::expire_path(const Bytes& destination_hash) {
-	/* Spangap: upstream zeroes the entry timestamp and lets the next jobs()
-	 * cull sweep it. Here get() returns a decoded copy, so the zeroed
-	 * timestamp was never written back and this was a no-op (the jobs() path
-	 * cull it relied on iterated the never-populated legacy table anyway,
-	 * and is now commented out). Drop the entry directly instead. */
-	if (!_new_path_table.exists(destination_hash)) {
-		return false;
-	}
+	/* Upstream zeroes the entry timestamp and lets the next jobs() cull sweep
+	 * it; there is no such sweep here, so drop the routing layer directly. */
 	return remove_path(destination_hash);
 }
 
@@ -3612,8 +3509,90 @@ will announce it.
 	_path_requests[destination_hash] = OS::time();
 }
 
+/* Spangap deviation: cheapest-first discovery, with escalation.
+ *
+ * A path request we originate is our own errand — no transit policy suppresses
+ * it, and outbound()'s access-point block covers announces only, so this used
+ * to broadcast onto every interface including the radio. But nearly every
+ * answer comes back over the cheap link, and the airtime was spent before we
+ * knew that. So ask the cheap interfaces first and register the destination;
+ * the sweep below either finds the path arrived — the radio never touched — or
+ * escalates once the grace elapses. The cost of being wrong is that a
+ * genuinely radio-only destination resolves `escalate_s` later.
+ *
+ * Cheap is bitrate against a threshold, not interface type: a metered or slow
+ * uplink gets the same treatment as a radio without naming either, and rnsd
+ * stays medium-agnostic. */
+/*static*/ bool Transport::interface_is_cheap(const Interface& interface) {
+	/* An interface that never declared a bitrate is treated as cheap: an
+	 * unknown cost must not become a reason to delay discovery. */
+	if (interface.bitrate() == 0) return true;
+	return (uint32_t)interface.bitrate() >= _path_cheap_bitrate;
+}
+
 /*static*/ void Transport::request_path(const Bytes& destination_hash) {
-	return request_path(destination_hash, {Type::NONE});
+	bool asked_cheap = false;
+	bool have_expensive = false;
+	for (auto& [hash, interface] : _interfaces) {
+		if (!interface.OUT()) continue;
+		if (interface_is_cheap(interface)) {
+			request_path(destination_hash, interface);
+			asked_cheap = true;
+		}
+		else have_expensive = true;
+	}
+
+	/* Nothing cheap to ask, or nothing expensive to protect: the tiering has
+	 * no work to do and the request goes out as it always did. A radio-only
+	 * node lands here, and pays no grace period. */
+	if (!asked_cheap || !have_expensive) {
+		if (!asked_cheap) request_path(destination_hash, {Type::NONE});
+		return;
+	}
+
+	double due = OS::time() + _path_escalate_time;
+	PathEscalation* free_slot = nullptr;
+	for (uint16_t i = 0; i < PATH_ESCALATIONS_MAX; i++) {
+		PathEscalation& e = _path_escalations[i];
+		if (!e.used) { if (!free_slot) free_slot = &e; continue; }
+		if (memcmp(e.dest, destination_hash.data(), Type::Reticulum::DESTINATION_LENGTH) == 0) {
+			e.due = due;      /* re-asked before the grace ran out — restart it */
+			return;
+		}
+	}
+	if (!free_slot) {
+		/* Table full. Fail OPEN: ask everything now rather than silently
+		 * dropping the expensive half of a request we were asked to make. */
+		for (auto& [hash, interface] : _interfaces)
+			if (interface.OUT() && !interface_is_cheap(interface))
+				request_path(destination_hash, interface);
+		return;
+	}
+	memcpy(free_slot->dest, destination_hash.data(), Type::Reticulum::DESTINATION_LENGTH);
+	free_slot->due  = due;
+	free_slot->used = true;
+}
+
+/* Runs on the jobs() sweep. Bounded by construction — the table is a fixed 16
+ * slots, and only requests we originated ever enter it. */
+/*static*/ void Transport::escalate_path_requests(double now) {
+	for (uint16_t i = 0; i < PATH_ESCALATIONS_MAX; i++) {
+		PathEscalation& e = _path_escalations[i];
+		if (!e.used) continue;
+		Bytes destination_hash(e.dest, Type::Reticulum::DESTINATION_LENGTH);
+		if (has_path(destination_hash)) {
+			/* The cheap link answered. This is the whole point. */
+			e.used = false;
+			continue;
+		}
+		if (now < e.due) continue;
+		e.used = false;
+		DBGF_DEMOTE("path request %s: no answer in %us, escalating to expensive interfaces",
+			destination_hash.toHex().c_str(), (unsigned)_path_escalate_time);
+		for (auto& [hash, interface] : _interfaces)
+			if (interface.OUT() && !interface_is_cheap(interface))
+				request_path(destination_hash, interface);
+	}
 }
 
 /*static*/ void Transport::path_request_handler(const Bytes& data, const Packet& packet) {
@@ -3693,18 +3672,18 @@ will announce it.
 		interface_str = " on " + attached_interface.toString();
 	}
 
-	DBGF_DEMOTE("Path request for destination %s%s", destination_hash.toHex().c_str(), interface_str.c_str());
+	TRACEF("Transport::path_request: for destination %s%s", destination_hash.toHex().c_str(), interface_str.c_str());
 
 	bool destination_exists_on_local_client = false;
 	(void)destination_exists_on_local_client;	// set for future use; not yet consumed
+	rdir_route_t route;
+	Interface receiving_interface = {Type::NONE};
+	bool have_route = peek_live_route(destination_hash, route, receiving_interface);
+
 	if (_local_client_interfaces.size() > 0) {
-		// CBA microStore
-		//auto& destination_entry = get_path(destination_hash);
-		DestinationEntry destination_entry;
-		_new_path_table.get(destination_hash, destination_entry);
-		if (destination_entry) {
+		if (have_route) {
 			TRACEF("Transport::path_request_handler: entry found for destination %s", destination_hash.toHex().c_str());
-			if (is_local_client_interface(destination_entry.receiving_interface())) {
+			if (is_local_client_interface(receiving_interface)) {
 				destination_exists_on_local_client = true;
 				// CBA ACCUMULATES
 				_pending_local_path_requests.insert({destination_hash, attached_interface});
@@ -3715,10 +3694,6 @@ will announce it.
 		}
 	}
 
-	// CBA microStore
-	//DestinationEntry& destination_entry = get_path(destination_hash);
-	DestinationEntry destination_entry;
-	_new_path_table.get(destination_hash, destination_entry);
 	//local_destination = next((d for d in Transport.destinations if d.hash == destination_hash), None)
 	auto destinations_iter = _destinations.find(destination_hash);
 	if (destinations_iter != _destinations.end()) {
@@ -3727,21 +3702,37 @@ will announce it.
 		INFOF("Answering path request for destination %s%s, destination is local to this system", destination_hash.toHex().c_str(), interface_str.c_str());
 	}
     //p elif (RNS.Reticulum.transport_enabled() or is_from_local_client) and (destination_hash in Transport.destination_table):
-	else if ((Reticulum::transport_enabled() || is_from_local_client) && destination_entry) {
+	else if ((Reticulum::transport_enabled() || is_from_local_client) && have_route) {
 		TRACEF("Transport::path_request_handler: entry found for destination %s", destination_hash.toHex().c_str());
-		const Packet announce_packet = destination_entry.announce_packet();
+		/* A path response IS the original signed announce, so only a node
+		 * still holding those bytes can answer one. That is what the blob pool
+		 * is for; a destination whose blob has been evicted (or whose announce
+		 * never fitted a slot) falls through to normal discovery. */
+		uint8_t blob_raw[Type::Reticulum::MTU];
+		size_t blob_n = rdirCopyBlob(destination_hash.data(), blob_raw, sizeof(blob_raw));
+		if (blob_n == 0) {
+			DBGF_DEMOTE("No retained announce for %s, not answering path request", destination_hash.toHex().c_str());
+			return;
+		}
+		Packet announce_packet(Bytes(blob_raw, blob_n));
+		if (!announce_packet.unpack()) {
+			DBGF_DEMOTE("Retained announce for %s is unusable, not answering path request", destination_hash.toHex().c_str());
+			return;
+		}
+		/* Replaying a cached announce is equivalent to receiving it again over
+		 * an interface, so the hop count advances; it is stored with its
+		 * non-increased count. */
+		announce_packet.hops(announce_packet.hops() + 1);
 TRACEF("announce_packet destination_hash: %s", announce_packet.destination_hash().toHex().c_str());
 TRACEF("announce_packet hops: %u", announce_packet.hops());
 TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
-		const Bytes& next_hop = destination_entry._received_from;
-		(void)next_hop;	// referenced only by disabled-log diagnostics below
-		const Interface& receiving_interface = destination_entry.receiving_interface();
+		Bytes next_hop(route.received_from, RDIR_DEST_LEN);
 
 		if (attached_interface.mode() == Type::Interface::MODE_ROAMING && attached_interface == receiving_interface) {
 			DBG_DEMOTE("Not answering path request on roaming-mode interface, since next hop is on same roaming-mode interface");
 		}
 		else {
-			if (requestor_transport_id && destination_entry._received_from == requestor_transport_id) {
+			if (requestor_transport_id && next_hop == requestor_transport_id) {
 				// TODO: Find a bandwidth efficient way to invalidate our
 				// known path on this signal. The obvious way of signing
 				// path requests with transport instance keys is quite
@@ -3761,8 +3752,8 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 			// p2p echo without needing to tag interface kinds.
 			// Cross-interface answering (learned on iface A, answer on B) is
 			// legitimate transport bridging and is unaffected.
-			else if (attached_interface == receiving_interface && destination_entry._hops > 1) {
-				DBGF_DEMOTE("Not answering path request for destination %s%s back out its own interface: path is %u hops, not a direct neighbor on that medium", destination_hash.toHex().c_str(), interface_str.c_str(), (unsigned)destination_entry._hops);
+			else if (attached_interface == receiving_interface && route.hops > 1) {
+				DBGF_DEMOTE("Not answering path request for destination %s%s back out its own interface: path is %u hops, not a direct neighbor on that medium", destination_hash.toHex().c_str(), interface_str.c_str(), (unsigned)route.hops);
 			}
 			else {
 				/* Transporting on behalf of others — verbose, like the rest
@@ -3772,7 +3763,6 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 
 				double now = OS::time();
 				uint8_t retries = Type::Transport::PATHFINDER_R;
-				uint8_t local_rebroadcasts = 0;
 				bool block_rebroadcasts = true;
 				// CBA TODO Determine if okay to take hops directly from DestinationEntry
 				uint8_t announce_hops = announce_packet.hops();
@@ -3786,51 +3776,24 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 					retransmit_timeout = now + Type::Transport::PATH_REQUEST_GRACE /*+ (RNS.rand() * Transport.PATHFINDER_RW)*/;
 				}
 
-				// This handles an edge case where a peer sends a past
-				// request for a destination just after an announce for
-				// said destination has arrived, but before it has been
-				// rebroadcast locally. In such a case the actual announce
-				// is temporarily held, and then reinserted when the path
-				// request has been served to the peer.
-				auto announce_iter = _announce_table.find(announce_packet.destination_hash());
-				if (announce_iter != _announce_table.end()) {
-					AnnounceEntry& held_entry = (*announce_iter).second;
-					// CBA ACCUMULATES
-					_held_announces.insert({announce_packet.destination_hash(), held_entry});
+				// This handles an edge case where a peer sends a path request
+				// for a destination just after an announce for said destination
+				// has arrived, but before it has been rebroadcast locally. In
+				// such a case the actual announce is marked held and re-armed
+				// once the path request has been served to the peer.
+				AnnounceRec* pending = announce_find(announce_packet.destination_hash(), /*held=*/false);
+				if (pending) {
+					/* Only one can wait: a second path request while one is
+					 * already held would otherwise strand the first. */
+					AnnounceRec* stale = announce_find(announce_packet.destination_hash(), /*held=*/true);
+					if (stale) memset(stale, 0, sizeof(*stale));
+					pending->flags |= ANNOUNCE_F_HELD;
 				}
 
-/*
-				// CBA ACCUMULATES
-				_announce_table.insert({announce_packet.destination_hash(), {
-					now,
-					retransmit_timeout,
-					retries,
-					// BUG?
-					//destination_entry.receiving_interface,
-					destination_entry._received_from,
-					announce_hops,
-					announce_packet,
-					local_rebroadcasts,
-					block_rebroadcasts,
-					attached_interface
-				}});
-*/
-				AnnounceEntry announce_entry(
-					now,
-					retransmit_timeout,
-					retries,
-					// BUG?
-					//destination_entry.receiving_interface,
-					destination_entry._received_from,
-					announce_hops,
-					announce_packet,
-					local_rebroadcasts,
-					block_rebroadcasts,
-					attached_interface
-				);
-				// CBA ACCUMULATES
-				_announce_table.insert({announce_packet.destination_hash(), announce_entry});
-				// CBA IMMEDIATE CULL
+				AnnounceRec* slot = announce_alloc();
+				announce_store(slot, announce_packet.destination_hash(), announce_packet, now,
+				               retransmit_timeout, retries, announce_hops,
+				               block_rebroadcasts, attached_interface);
 				cull_announce_table();
 
 				// Send PATH_RESPONSE immediately for local client requests
@@ -3856,7 +3819,8 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 						);
 						imm_packet.hops(announce_hops);
 						imm_packet.send();
-						_announce_table.erase(announce_packet.destination_hash());
+						AnnounceRec* sent = announce_find(announce_packet.destination_hash(), /*held=*/false);
+						if (sent) memset(sent, 0, sizeof(*sent));
 					}
 				}
 			}
@@ -3865,7 +3829,11 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 	else if (is_from_local_client) {
 		// Forward path request on all interfaces
 		// except the local client
-		DBGF_DEMOTE("Forwarding path request from local client for destination %s%s to all other interfaces", destination_hash.toHex().c_str(), interface_str.c_str());
+		if (!path_search_possible(attached_interface)) {
+			DBGF_DEMOTE("path request %s%s from local client: nowhere to forward", destination_hash.toHex().c_str(), interface_str.c_str());
+			return;
+		}
+		DBGF_DEMOTE("path request %s%s from local client: forwarding", destination_hash.toHex().c_str(), interface_str.c_str());
 		Bytes request_tag = Identity::get_random_hash();
 		for (auto& [hash, interface] : _interfaces) {
 			// Don't propagate path requests onto access-point interfaces. Like
@@ -3882,12 +3850,15 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 	else if (should_search_for_unknown) {
 		TRACEF("Transport::path_request_handler: searching for unknown path to %s", destination_hash.toHex().c_str());
 		if (_discovery_path_requests.find(destination_hash) != _discovery_path_requests.end()) {
-			DBGF_DEMOTE("There is already a waiting path request for destination %s on behalf of path request%s", destination_hash.toHex().c_str(), interface_str.c_str());
+			DBGF_DEMOTE("path request %s%s: already searching", destination_hash.toHex().c_str(), interface_str.c_str());
+		}
+		else if (!path_search_possible(attached_interface)) {
+			DBGF_DEMOTE("path request %s%s: not searched, nowhere to forward", destination_hash.toHex().c_str(), interface_str.c_str());
 		}
 		else {
 			// Forward path request on all interfaces
 			// except the requestor interface
-			DBGF_DEMOTE("Attempting to discover unknown path to destination %s on behalf of path request%s", destination_hash.toHex().c_str(), interface_str.c_str());
+			DBGF_DEMOTE("path request %s%s: searching", destination_hash.toHex().c_str(), interface_str.c_str());
 			//p pr_entry = { "destination_hash": destination_hash, "timeout": time.time()+Transport.PATH_REQUEST_TIMEOUT, "requesting_interface": attached_interface }
 			//p _discovery_path_requests[destination_hash] = pr_entry;
 			// CBA ACCUMULATES
@@ -4557,9 +4528,7 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 	// _destinations
 	// _path_table
 	// _reverse_table
-	// _announce_table
-	// _held_announces
-	HEADF(LOG_VERBOSE, "sram: %u (%u%%) [%d] psram: %u (%u%%) [%d] flash: %u (%u%%) [%d] paths: %u dsts: %u revr: %u annc: %u held: %u", memory, memory_pct, memory - _last_memory, psram, psram_pct, psram - _last_psram, flash, flash_pct, flash - _last_flash, _new_path_table.size(), _destinations.size(), _reverse_table.size(), _announce_table.size(), _held_announces.size());
+	HEADF(LOG_VERBOSE, "sram: %u (%u%%) [%d] psram: %u (%u%%) [%d] flash: %u (%u%%) [%d] paths: %u dsts: %u revr: %u annc: %u held: %u", memory, memory_pct, memory - _last_memory, psram, psram_pct, psram - _last_psram, flash, flash_pct, flash - _last_flash, rdirCount(), _destinations.size(), _reverse_table.size(), announce_count(false), announce_count(true));
 
 	// _path_requests
 	// _discovery_path_requests
@@ -4584,17 +4553,15 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 		interface_announces += interface.announce_queue().size();
 	}
 	VERBOSEF("phl: %u rcp: %u lt: %u pl: %u al: %u tun: %u", _packet_hashlist.size(), _receipts.size(), _link_table.size(), _pending_links.size(), _active_links.size(), _tunnels.size());
-	VERBOSEF("pin: %u pout: %u padd: %u dpr: %u ikd: %u ia: %u\r\n", _packets_received, _packets_sent, _destinations_added, destination_path_responses, Identity::_known_destinations.size(), interface_announces);
+	VERBOSEF("pin: %u pout: %u padd: %u dpr: %u ia: %u\r\n", _packets_received, _packets_sent, _destinations_added, destination_path_responses, interface_announces);
 
 	_last_memory = memory;
 	_last_psram = psram;
 	_last_flash = flash;
 
-	if (_path_store) {
-		HEAD("Path Store Stats", LOG_TRACE);
-		_path_store.dumpInfo();
-	}
-
+	VERBOSEF("dir: %u/%u guard: %u/%u blob: %u/%u\r\n",
+	         rdirCount(), rdirSlots(), rdirGuardCount(), rdirGuardSlots(),
+	         rdirBlobCount(), rdirBlobSlots());
 }
 
 /*static*/ void Transport::exit_handler() {
@@ -4615,110 +4582,187 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 	return {Type::NONE};
 }
 
-/* Spangap: rewritten against the live microStore-backed table (_path_store /
- * _new_path_table); the legacy in-memory _path_table this used to iterate is
- * never populated in the microStore build. Eviction ordering is use-aware:
- * sorted ascending by (_last_used, _timestamp), so paths never used for
- * outbound go first (oldest announce first), then least-recently-used. Both
- * doubles are peeked at their fixed offsets in the raw record — a full decode
- * per entry would unpack the cached announce packet each time.
- * Note for persist-enabled builds (RNS_USE_FS + RNS_PERSIST_PATHS, not defined
- * in this project): the old code also unlinked the cached announce packet file
- * of each evicted entry; that cleanup would need to be reinstated here. */
+/* The directory pool's slot count is the hard bound; this enforces the softer
+ * `s.rnsd.path.max` on top of it. Ordering, budgeting and the blob demotion all
+ * live in the store — it reads only in-record data, so the claim vocabulary can
+ * stay outside µR entirely. */
 /*static*/ void Transport::cull_path_table() {
 	TRACE("Transport::cull_path_table()");
-	if (_new_path_table.size() > _path_table_maxsize) {
-		try {
-			std::vector<std::tuple<double, double, std::vector<uint8_t>>> sorted_keys;
-			sorted_keys.reserve(_new_path_table.size());
-			double stale_before = OS::time() - Type::Transport::PATH_LAST_USED_STALE;
-			for (auto iter = _path_store.begin(); iter != _path_store.end(); ++iter) {
-				const auto& record = *iter;
-				double last_used = 0.0;
-				double timestamp = 0.0;
-				if (record.value.size() >= DestinationEntry::OFFSET_LAST_USED + sizeof(double)) {
-					memcpy(&timestamp, &record.value[DestinationEntry::OFFSET_TIMESTAMP], sizeof(double));
-					memcpy(&last_used, &record.value[DestinationEntry::OFFSET_LAST_USED], sizeof(double));
-				}
-				// Outbound use older than PATH_LAST_USED_STALE counts as never
-				// used, so it competes on announce age with the round-1 pool
-				// instead of outranking fresh announce-only paths.
-				if (last_used < stale_before) {
-					last_used = 0.0;
-				}
-				sorted_keys.emplace_back(last_used, timestamp, record.key);
-			}
-			std::sort(sorted_keys.begin(), sorted_keys.end());
+	size_t dir_target = _path_table_maxsize;
+	if (dir_target > rdirSlots()) dir_target = rdirSlots();
+	rdirEvictTo(dir_target, rdirBlobSlots());
+}
 
-			uint16_t count = 0;
-			for (const auto& [last_used, timestamp, destination_hash] : sorted_keys) {
-				if (_new_path_table.size() <= _path_table_maxsize) {
-					break;
-				}
-				TRACEF("Transport::cull_path_table: Removing destination %s from path table", Bytes(destination_hash.data(), destination_hash.size()).toHex().c_str());
-				_path_store.remove(destination_hash);
-				++count;
-			}
-			DBGF_DEMOTE("Removed %d path(s) from path table", count);
-		}
-		catch (const std::bad_alloc&) {
-			/* Building the sort index copies each record's value; under OOM
-			 * we just leave the table over cap until memory recovers — the
-			 * next announce insert retries. */
-			ERROR("cull_path_table: bad_alloc - out of memory building sort index, leaving table over cap");
-		}
-		catch (const std::exception& e) {
-			ERRORF("cull_path_table: exception: %s", e.what());
+/*static*/ size_t Transport::announce_count(bool held) {
+	size_t n = 0;
+	for (uint16_t i = 0; i < _announce_slots; i++) {
+		const AnnounceRec& r = _announce_ring[i];
+		if (!(r.flags & ANNOUNCE_F_USED)) continue;
+		if (((r.flags & ANNOUNCE_F_HELD) != 0) == held) n++;
+	}
+	return n;
+}
+
+/*static*/ Transport::AnnounceRec* Transport::announce_find(const Bytes& destination_hash, bool held) {
+	if (destination_hash.size() != Type::Reticulum::DESTINATION_LENGTH) return nullptr;
+	for (uint16_t i = 0; i < _announce_slots; i++) {
+		AnnounceRec& r = _announce_ring[i];
+		if (!(r.flags & ANNOUNCE_F_USED)) continue;
+		if (((r.flags & ANNOUNCE_F_HELD) != 0) != held) continue;
+		if (memcmp(r.dest, destination_hash.data(), Type::Reticulum::DESTINATION_LENGTH) == 0) return &r;
+	}
+	return nullptr;
+}
+
+/* A full ring evicts its oldest entry rather than refusing the new one: the
+ * newest announce is the one worth propagating. */
+/*static*/ Transport::AnnounceRec* Transport::announce_alloc() {
+	for (uint16_t i = 0; i < _announce_slots; i++)
+		if (!(_announce_ring[i].flags & ANNOUNCE_F_USED)) return &_announce_ring[i];
+	AnnounceRec* oldest = nullptr;
+	for (uint16_t i = 0; i < _announce_slots; i++) {
+		AnnounceRec& r = _announce_ring[i];
+		if (!(r.flags & ANNOUNCE_F_USED)) continue;
+		if (!oldest || r.timestamp < oldest->timestamp) oldest = &r;
+	}
+	if (!oldest) return nullptr;
+	memset(oldest, 0, sizeof(*oldest));
+	return oldest;
+}
+
+/*static*/ void Transport::announce_store(AnnounceRec* rec, const Bytes& destination_hash,
+                                          const Packet& packet, double timestamp, double retransmit_at,
+                                          uint8_t retries, uint8_t hops, bool block_rebroadcasts,
+                                          const Interface& attached_interface) {
+	if (!rec) return;
+	memset(rec, 0, sizeof(*rec));
+	memcpy(rec->dest, destination_hash.data(), Type::Reticulum::DESTINATION_LENGTH);
+	const Bytes& data = packet.data();
+	uint16_t n = (uint16_t)(data.size() > ANNOUNCE_DATA_MAX ? ANNOUNCE_DATA_MAX : data.size());
+	if (n > 0) memcpy(rec->data, data.data(), n);
+	rec->data_len      = n;
+	rec->timestamp     = timestamp;
+	rec->retransmit_at = retransmit_at;
+	rec->retries       = retries;
+	rec->hops          = hops;
+	rec->context_flag  = (uint8_t)packet.context_flag();
+	rec->flags         = ANNOUNCE_F_USED | (block_rebroadcasts ? ANNOUNCE_F_BLOCK : 0);
+	/* Interfaces are named by hash prefix, not held: a handle would pin a dead
+	 * impl across a reconnect, and the emitting side has to resolve by name
+	 * anyway. */
+	if (packet.receiving_interface()) {
+		Bytes h = packet.receiving_interface().get_hash();
+		if (h.size() >= Type::Reticulum::DESTINATION_LENGTH)
+			memcpy(rec->recv_iface, h.data(), Type::Reticulum::DESTINATION_LENGTH);
+	}
+	if (attached_interface) {
+		Bytes h = attached_interface.get_hash();
+		if (h.size() >= Type::Reticulum::DESTINATION_LENGTH) {
+			memcpy(rec->attached_iface, h.data(), Type::Reticulum::DESTINATION_LENGTH);
+			rec->flags |= ANNOUNCE_F_ATTACHED;
 		}
 	}
 }
 
+/* Spangap deviation: a necessary condition for relaying, checked at ingress.
+ *
+ * A node can be structurally unable to re-broadcast anything it hears — an
+ * access-point radio blocks the transport flood by design, and the interface
+ * an announce arrived on is excluded by split horizon. On such a node every
+ * heard announce was still stored in the announce table and retried until its
+ * retry limit, walking the full outbound path each time and refusing on every
+ * interface: pure churn, refilled from the ingress faster than it drained,
+ * with no yield in the walk. Suppressing the *duplicates* cannot fix that —
+ * on a node bridged to a large network the announce population is orders of
+ * magnitude past any pool we could hold, so essentially every announce is
+ * novel and the work is proportional to the whole network's announce rate.
+ * The fix has to be "do not take on work that cannot produce a packet".
+ *
+ * This is a NECESSARY condition, not the whole rule: it tests only the two
+ * structural blocks that no later state can lift (OUT, AP mode, split
+ * horizon). Rate caps, queue depth, and the roaming/boundary next-hop rules
+ * stay where they were — they depend on state at emission time, and the
+ * authoritative decision remains outbound()'s. So this never admits an
+ * announce outbound() would drop for a structural reason, and never rejects
+ * one outbound() might have sent. */
+/*static*/ bool Transport::announce_relay_possible(const Bytes& destination_hash,
+                                                   const Interface& received_on) {
+	/* Our own destinations are exempt from the AP-mode block (see outbound), so
+	 * they are always relayable — and they are a trickle, not a flood. */
+	if (_destinations.find(destination_hash) != _destinations.end()) return true;
+
+	for (auto& [hash, interface] : _interfaces) {
+		if (!interface.OUT()) continue;
+		/* On AUTO: AP mode exists to keep the transport network's announce
+		 * flood off the edge link, and for a destination that is not ours it
+		 * never lifts. On MANUAL: route_for decides, and an operator who says
+		 * "I am this segment's transport" gets to relay onto their own radio. */
+		if (!interface.routes_for(interface.mode() != Type::Interface::MODE_ACCESS_POINT))
+			continue;
+		/* Split horizon on a point-to-point link: echoing the announce back out
+		 * the interface it came in on returns it to the one peer that has it.
+		 * A medium fact, not policy — route_for has no vote here. */
+		if (interface.point_to_point() && received_on &&
+		    received_on.get_hash() == interface.get_hash()) continue;
+		return true;
+	}
+	return false;
+}
+
+/* Spangap deviation: the same necessary condition, for path discovery.
+ *
+ * Searching on someone's behalf means forwarding their request onward, and the
+ * forwarding loop excludes the interface it came in on (split horizon) and
+ * access-point interfaces. When those are all of them the search reaches
+ * nobody — but a `_discovery_path_requests` entry was still booked, logged,
+ * and later expired, once per request, for a search that never left the node.
+ * A TCP-fed node with one AP radio does this for every path request the wider
+ * network asks it, which is where the expiry storm came from: the cleanup was
+ * rate-limited, the work never should have existed.
+ *
+ * Mirrors the forwarding loop's own exclusions, and nothing else — the rest of
+ * request_path()'s decisions (its point-to-point learned-on check) still apply
+ * per interface at send time. */
+/*static*/ bool Transport::path_search_possible(const Interface& requestor) {
+	/* Searching is asymmetric with relaying, and the asymmetry is the point.
+	 * Relaying is about the destination side — if it can reach a segment we
+	 * serve, carry it. Searching is about the REQUESTOR side: we look things
+	 * up on behalf of the nodes we are custodian of. A request from an
+	 * interface we do not route for is not our errand, however well we could
+	 * run it — otherwise the wider network's discovery load lands on our
+	 * radio, which is exactly what asking to be a gateway must not mean. */
+	if (requestor && requestor.policy_manual() && !requestor.route_for()) return false;
+
+	for (auto& [hash, interface] : _interfaces) {
+		if (!interface.OUT()) continue;
+		if (requestor && interface == requestor) continue;
+		if (!interface.routes_for(interface.mode() != Type::Interface::MODE_ACCESS_POINT))
+			continue;
+		return true;
+	}
+	return false;
+}
+
 /*static*/ void Transport::cull_announce_table() {
 	TRACE("Transport::cull_announce_table()");
-	if (_announce_table.size() > _announce_table_maxsize) {
-		try {
-			// Build lightweight (timestamp, key) index to avoid copying full AnnounceEntry
-			// objects (which contain nested std::set<Bytes>) — prevents OOM on heap-constrained
-			// devices when the table hits max capacity.
-			std::vector<std::pair<double, Bytes>> sorted_keys;
-			sorted_keys.reserve(_announce_table.size());
-			for (const auto& [key, entry] : _announce_table) {
-				sorted_keys.emplace_back(entry._timestamp, key);
-			}
-			// Sort ascending by timestamp so oldest entries are removed first
-			std::sort(sorted_keys.begin(), sorted_keys.end());
-
-			uint16_t count = 0;
-			for (const auto& [timestamp, destination_hash] : sorted_keys) {
-				TRACEF("Transport::cull_announce_table: Removing destination %s from path table", destination_hash.toHex().c_str());
-				if (_announce_table.erase(destination_hash) < 1) {
-					WARNINGF("Failed to remove destination %s from path table", destination_hash.toHex().c_str());
-				}
-				++count;
-				if (_announce_table.size() <= _announce_table_maxsize) {
-					break;
-				}
-			}
-			DBGF_DEMOTE("Removed %d path(s) from path table", count);
+	/* The ring is the hard bound; this enforces the softer s.rnsd.announce.table_max
+	 * on top of it, oldest first. Allocation-free by construction — the sort
+	 * index this used to build was itself an OOM risk at exactly the moment the
+	 * table was full. */
+	size_t target = _announce_table_maxsize;
+	uint16_t count = 0;
+	for (size_t n = announce_count(false) + announce_count(true); n > target; n--) {
+		AnnounceRec* oldest = nullptr;
+		for (uint16_t i = 0; i < _announce_slots; i++) {
+			AnnounceRec& r = _announce_ring[i];
+			if (!(r.flags & ANNOUNCE_F_USED)) continue;
+			if (!oldest || r.timestamp < oldest->timestamp) oldest = &r;
 		}
-		catch (const std::bad_alloc& e) {
-			ERROR("cull_announce_table: bad_alloc - out of memory building sort index, falling back to single erase");
-			// Fallback: std::min_element does no heap allocation — erase one oldest entry
-			auto oldest = std::min_element(
-				_announce_table.begin(), _announce_table.end(),
-				[](const std::pair<const Bytes, AnnounceEntry>& a,
-			   const std::pair<const Bytes, AnnounceEntry>& b) {
-				return a.second._timestamp < b.second._timestamp;
-			}
-			);
-			if (oldest != _announce_table.end()) {
-				_announce_table.erase(oldest);
-			}
-		}
-		catch (const std::exception& e) {
-			ERRORF("cull_announce_table: exception: %s", e.what());
-		}
+		if (!oldest) break;
+		memset(oldest, 0, sizeof(*oldest));
+		++count;
 	}
+	if (count > 0) DBGF_DEMOTE("Removed %d announce(s) from the retransmission queue", count);
 }
 
 /*static*/ uint16_t Transport::remove_reverse_entries(const std::vector<Bytes>& hashes) {

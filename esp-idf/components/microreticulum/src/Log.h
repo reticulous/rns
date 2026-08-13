@@ -46,8 +46,15 @@
 #ifndef NDEBUG
 	#define DEBUG(msg) (RNS::log(msg, RNS::LOG_DEBUG))
 	#define DEBUGF(msg, ...) (RNS::logf(RNS::LOG_DEBUG, msg, __VA_ARGS__))
-	#define TRACE(msg) (RNS::log(msg, RNS::LOG_TRACE))
-	#define TRACEF(msg, ...) (RNS::logf(RNS::LOG_TRACE, msg, __VA_ARGS__))
+	/* TRACE is per-call step narration — a dozen lines per packet, and the
+	 * dominant cost of running rnsd at verbose on a busy link. It is gated on
+	 * its own runtime switch rather than on a log level, because the level set
+	 * is coarser than the distinction that matters: VERBOSE carries one line
+	 * per event, TRACE narrates the steps inside it, and both map to
+	 * ESP_LOGV. The test is a plain load-and-branch ahead of any formatting,
+	 * so a suppressed TRACEF costs no vsnprintf. */
+	#define TRACE(msg) do { if (RNS::trace_enabled()) RNS::log(msg, RNS::LOG_TRACE); } while (0)
+	#define TRACEF(msg, ...) do { if (RNS::trace_enabled()) RNS::logf(RNS::LOG_TRACE, msg, __VA_ARGS__); } while (0)
 	#if defined(RNS_MEM_LOG)
 		#define MEM(msg) (RNS::log(msg, RNS::LOG_MEM))
 		#define MEMF(msg, ...) (RNS::logf(RNS::LOG_MEM, msg, __VA_ARGS__))
@@ -88,6 +95,12 @@ namespace RNS {
 
 	void loglevel(LogLevel level);
 	LogLevel loglevel();
+
+	/* Step-narration switch — see the TRACE macro. Read on every TRACE, so the
+	 * getter is inline over a plain bool rather than a call. */
+	extern bool _trace_enabled;
+	inline bool trace_enabled() { return _trace_enabled; }
+	void trace_enabled(bool enable);
 
 	void set_log_callback(log_callback on_log = nullptr);
 

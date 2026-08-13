@@ -208,14 +208,21 @@ Int32 BZ2_decompress ( DState* s )
           s->blockSize100k > (BZ_HDR_0 + 9)) RETURN(BZ_DATA_ERROR_MAGIC);
       s->blockSize100k -= BZ_HDR_0;
 
+      /* Spangap: the tables cover a block of at most nblockLimit bytes, which
+         is the header's blockSize100k unless the caller gave a smaller output
+         bound to BZ2_bzDecompressInitBounded. */
+      s->nblockLimit = s->blockSize100k * 100000;
+      if (s->maxOutBound > 0 && s->maxOutBound < s->nblockLimit)
+         s->nblockLimit = s->maxOutBound;
+
       if (s->smallDecompress) {
-         s->ll16 = BZALLOC( s->blockSize100k * 100000 * sizeof(UInt16) );
+         s->ll16 = BZALLOC( s->nblockLimit * sizeof(UInt16) );
          s->ll4  = BZALLOC(
-                      ((1 + s->blockSize100k * 100000) >> 1) * sizeof(UChar)
+                      ((1 + s->nblockLimit) >> 1) * sizeof(UChar)
                    );
          if (s->ll16 == NULL || s->ll4 == NULL) RETURN(BZ_MEM_ERROR);
       } else {
-         s->tt  = BZALLOC( s->blockSize100k * 100000 * sizeof(Int32) );
+         s->tt  = BZALLOC( s->nblockLimit * sizeof(Int32) );
          if (s->tt == NULL) RETURN(BZ_MEM_ERROR);
       }
 
@@ -260,7 +267,7 @@ Int32 BZ2_decompress ( DState* s )
 
       if (s->origPtr < 0)
          RETURN(BZ_DATA_ERROR);
-      if (s->origPtr > 10 + 100000*s->blockSize100k)
+      if (s->origPtr > 10 + s->nblockLimit)
          RETURN(BZ_DATA_ERROR);
 
       /*--- Receive the mapping table ---*/
@@ -355,7 +362,7 @@ Int32 BZ2_decompress ( DState* s )
       /*--- Now the MTF values ---*/
 
       EOB      = s->nInUse+1;
-      nblockMAX = 100000 * s->blockSize100k;
+      nblockMAX = s->nblockLimit;
       groupNo  = -1;
       groupPos = 0;
 

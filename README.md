@@ -2,7 +2,7 @@
 
 **rns** brings the [Reticulum](https://reticulum.network) network stack to the
 device. Its core is **`rnsd`**, a single FreeRTOS task that owns the entire RNS
-protocol state — identity, destinations, the path table, the Transport state
+protocol state — identity, destinations, the directory, the Transport state
 machine, Links, and Resources — and exposes it to the rest of the device. Other
 straddles ([iface-tcp](../iface-tcp), [iface-auto](../iface-auto),
 [iface-lora](../iface-lora), [iface-espnow](../iface-espnow)) plug their
@@ -177,11 +177,108 @@ themselves at runtime, so it has zero compile-time knowledge of which exist.
 | 6 | `RNSD_PORT_ANNOUNCES` | Announce fan-out to subscribers, with an optional aspect filter. |
 | 10 | `RNSD_PORT_LINK` | Outbound links (`rnsdLinkOpen`) + request/Resource aux. |
 | 11 | `RNSD_PORT_CHANNEL` | Outbound reliable channels (`rnsdChannelOpen`); inbound via `rnsdDestListenChannels`. |
+| 12 | `RNSD_PORT_DIR` | Directory claims + out-of-band key seeding (aux only; `rnsdClaim` / `rnsdSeedPubkey`). |
 
 (`lxmf` reserves internal ports 100/101 for rnsd→lxmf inbound-link and Resource
 hand-offs; these are not client-facing.) Opcode tables for the framed ports
 (`RNSD_DEST_*`, link aux, resource aux) are in
 [`include/ports.h`](esp-idf/include/ports.h).
+
+## Transit policy — who we work for
+
+Every interface answers one question: **are the nodes reachable through it our
+responsibility?** By default it is answered by inference — access-point
+interfaces are kept out of announce relaying and out of path discovery, which
+is stock behaviour and what this build has always done. Set
+`…policy_manual = 1` on an interface and you answer it yourself with
+`…route_for`; until you do, `route_for` is not read at all.
+
+`route_for = 1` means we relay announces towards that interface's nodes, we
+search on their behalf, and their paths get `s.rnsd.path.ttl_custody`.
+`route_for = 0` means their traffic is not our business — we still talk to them
+as an endpoint, we just don't work for them.
+
+Two things it deliberately does **not** govern. **Answering** a path request
+for a destination we already know is never gated: that is custody, not transit,
+and refusing it is what would stop a gateway being a gateway — a request
+arriving from an interface we don't route for, asking after a node we *do*
+route for, is still answered. And **split horizon** (`point_to_point`) is a
+fact about the medium rather than a policy, so it always applies.
+
+Searching is the asymmetric one. Relaying is decided on the destination side —
+if it can reach a segment we serve, carry it. Searching is decided on the
+**requestor** side: we look things up for the nodes we are custodian of, so a
+request from an interface we don't route for is not our errand however well we
+could run it. Otherwise the wider network's discovery load lands on our radio,
+which is exactly what asking to be a gateway must not mean.
+
+Custody also decides what survives memory pressure. A destination reached via
+an interface we route for carries `RDIR_CLAIM_ANSWER_FOR`, which ranks it with
+the persistent claims — above everything the node merely overheard. Without it
+a gateway's own segment competes for the same directory slots as a large
+network's announce churn and loses continuously, because the churn is what
+keeps arriving. The claim is re-evaluated on every announce rather than
+latched, so a destination that moves to an interface we don't route for stops
+being our obligation.
+
+A LoRa gateway with an internet uplink is therefore two settings — route for
+the radio, don't route for the uplink:
+
+```
+s.lora.0.policy_manual = 1     s.lora.0.route_for = 1
+s.tcp.peers.0.policy_manual = 1  s.tcp.peers.0.route_for = 0
+```
+
+## The directory
+
+Everything `rnsd` knows about *other* destinations lives in one arena of packed
+fixed-size records, sized from a byte budget at boot and persisted as an image
+of the live records (`<state>/rnsd/dir.img`). There is no separate identity
+cache: the public key, the aspect hash, and the route to a destination are
+fields of the same record, so they are acquired together, evicted together, and
+cannot disagree.
+
+The image holds what the node currently knows, not the arena it knows it in:
+records go out in eviction order (most valuable first) and the file is bounded
+by `s.rnsd.dir.img_max_kb`, so a 256 KB-`/state` board writes a few KB rather
+than its whole arena. The guard depth is never written — its ages are on the
+uptime clock, which restarts at boot.
+
+Three depths, each dropped before the one under it when memory runs short:
+
+| depth | means | per record |
+|---|---|---|
+| guard | "I have seen this announce" | 28 B |
+| + directory | "I know who this is" | 188 B |
+| + blob | "I can answer a path request for this" | 508 B |
+
+The ordering is the point: losing the ability to serve a path request for a
+destination degrades a network service, while losing the ability to say who it
+is degrades information — so the former goes first.
+
+**What gets kept is a per-interface decision.** Every announce updates the guard
+(replay and recency suppression, which is what stops a repeat announce
+re-entering the retransmission queue at ~1.5 s of LoRa airtime). Whether
+anything deeper is *retained* depends on where it arrived: an expensive or edge
+interface keeps what it hears, because we are the custodian of the mesh behind
+it and re-acquiring a neighbour costs airtime; a cheap or vast one keeps only
+what was resolved on demand, claimed, or is in active use. Each interface
+straddle exposes this as its own `retain_announces` setting — on by default for
+LoRa, ESP-NOW and the LAN interface, off for TCP peers.
+
+**Claims** are how an application says a destination matters to it, so that the
+records `rnsd` drops under pressure are the ones nobody asked for. lxmf claims
+your contacts, nomad claims your bookmarked nodes. A claim is a preference, not
+a lifetime: retention is the maximum over all claims on a record, and `rnsd` may
+still break any of them. The invariant that keeps that safe is that an unbounded
+claim population may not carry a long duration — contacts are bounded by the
+address book, mesh neighbours by the mesh, and network-at-large announces carry
+no claim at all. See `rnsdClaim` in [`rnsd.h`](esp-idf/include/rnsd.h).
+
+`rnsd.dir.<hex32>.{pubkey,name_hash,hops,last_heard,claims,route}` reads a
+single record on demand (a storage provider, not a mirrored subtree);
+`rnsd memory` shows pool occupancy and `rnpath` lists the records carrying a
+route.
 
 ## Storage variables
 
@@ -196,18 +293,25 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.enable` | `1` | Master switch — is this node on the mesh at all. **Read once at boot**: when `0`, rnsd brings up no Transport/ports and never sets `rns.ready`, so interfaces and clients never start. **Changing it requires a reboot.** |
 | `s.rnsd.transport_enabled` | `0` | Act as a Reticulum transport node (forward for others). Live (no reboot). |
 | `s.rnsd.announce.interval` | `1800` | Seconds between periodic destination announces. |
-| `s.rnsd.announce.table_max` | `100` | Announce-table capacity cap (`Transport::announce_table_maxsize`). |
+| `s.rnsd.announce.table_max` | `100` | Slots in the announce retransmission queue. Read once at Transport start: the queue is one fixed ring, so raising it later clamps rather than growing. |
 | `s.rnsd.hashlist_max` | `100` | Packet-hashlist (dedup) capacity cap (`Transport::hashlist_maxsize`). |
-| `s.rnsd.path.max` | `100` | Path-table capacity cap (`Transport::path_table_maxsize`). |
+| `s.rnsd.path.max` | `100` | Soft cap on resident directory records with a route. The directory's own slot count is the hard bound; this holds the resident set below it. |
 | `s.rnsd.path.request_tags_max` | `32` | Pending path-request tag cap (`Transport::max_pr_tags`). |
 | `s.rnsd.path.ttl` | `86400` | Path-entry age-out, seconds (`Transport::destination_timeout`). |
 | `s.rnsd.path.ttl_ap` | `21600` | Access-point path lifetime, seconds (`Transport::ap_path_time`). |
 | `s.rnsd.path.ttl_roaming` | `3600` | Roaming path lifetime, seconds (`Transport::roaming_path_time`). |
-| `s.rnsd.identity.cache_max` | `1000` | Known-destination (identity) cache capacity (`Identity::known_destinations_maxsize`). |
+| `s.rnsd.path.escalate_s` | `3` | Cheapest-first discovery: seconds a path request we originate waits on the fast interfaces before it is also asked of the slow ones. Nearly every answer arrives over the cheap link, so the radio is usually never asked at all; the cost of being wrong is that a radio-only destination resolves this many seconds later. A node with no fast interface skips the grace entirely. |
+| `s.rnsd.path.cheap_bps` | `50000` | Bits/sec at or above which an interface counts as cheap for the above. Bitrate rather than interface type, so a metered or slow uplink is treated like a radio without naming either. An interface that declares no bitrate counts as cheap — an unknown cost must not delay discovery. |
+| `s.rnsd.path.ttl_custody` | `86400` | Lifetime for destinations reached via an interface whose policy says we route for it. Mode gets this backwards for a gateway — it hands the *shortest* lifetime (`ttl_ap`) to the access-point radio, whose destinations cost the most to re-acquire and are the ones we answer for. |
+| `s.rnsd.dir.budget_kb` | `0` | Directory arena size in KiB. `0` derives it from free PSRAM at boot, clamped to 40–96 KiB. Boot-time value: pools do not resize live. |
+| `s.rnsd.dir.blob_slot` | `320` | Bytes per retained-announce slot. An announce whose raw form exceeds it is not retained, and a path request for that destination falls through to normal discovery. Changing it discards the stored image (it is a structural property). |
+| `s.rnsd.dir.persist_s` | `900` | Seconds between directory image writes, when anything changed. The contents are a cache, so a crash costs at most one interval; the interval is minutes rather than the 60 s storage class because the directory changes on every retained announce. `0` = never persist (every destination is re-learned by path request after a reboot). |
+| `s.rnsd.dir.img_max_kb` | `0` | Ceiling on the image file. `0` = an eighth of the `/state` partition, which is what a small-flash board needs: the image is rewritten through a temp file, so the partition must hold two copies. Above the ceiling the most valuable records are kept and the rest are re-learned by path request. |
 | `s.rnsd.jobs_interval_ms` | `250` | Transport `jobs()` cadence, milliseconds (`Transport::job_interval`). Only consulted by `Transport::loop()`, which rnsd does not drive — inert on the rnsd path; the real cadence is `s.rnsd.tick_min_ms`/`tick_max_ms` below. |
 | `s.rnsd.cull_interval_s` | `60` | Table-cull cadence, seconds (`Transport::tables_cull_interval`). |
 | `s.rnsd.tick_min_ms` | `1000` | Busy floor for the main-loop housekeeping tick, milliseconds — the wake period while packets flow or links are up. Keep at `1000` to preserve the burst load-shed tuning; drop toward `250` only for faster housekeeping under load. |
 | `s.rnsd.tick_max_ms` | `60000` | Idle ceiling the tick backs off to (×2 per idle tick) on a silent LoRa-only node. Any inbound packet or open/pending link snaps the cadence back to `tick_min_ms`. |
+| `s.rnsd.log.trace` | `0` | Add microReticulum's per-call step narration to `log rnsd verbose`. Off, verbose gives one line per event; on, it narrates the steps inside each one — a dozen lines per packet, which on a busy TCP link is the load rather than a description of it. Flips live. |
 | `s.rnsd.respond_to_probes` | `1` | Host `rnstransport.probe` and answer probes (PROVE_ALL). |
 | `s.rnsd.prove_incoming` | `1` | Emit delivery proofs for inbound packets we receive. |
 | `s.rnsd.proof_timeout_s` | `60` | Deadline for an outbound delivery-proof receipt. |
@@ -228,6 +332,9 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.identity_hash` | Hex hash of rnsd's default identity. |
 | `rnsd.iface_event_seq` | Monotonic counter bumped on interface up/down. |
 | `rnsd.stats.{packets_in,packets_out,bytes_in,bytes_out,ifaces_up}` | Traffic counters. |
+| `rnsd.stats.dir.{entries,blobs,guards}` | Directory pool occupancy. |
+| `rnsd.stats.dir.{guard_drops,evictions,recall_miss,seq_retries}` | Announces suppressed as replays, records evicted, public keys asked for and not held, and reader/writer races on a record. |
+| `rnsd.dir.{slots,bytes}` | Directory pool capacity and arena size, published once at boot. |
 | `rnsd.gw.{rssi,snr,timestamp}` | Gateway/infrastructure signal — the received quality (rssi dBm, snr dB) of the transport node that last relayed a packet to us: the last packet addressed to one of our destinations/links that arrived on a signal-capable interface with more than one hop. `timestamp` is device unix-seconds of that sample (UIs fade the indicator out over ~30 min from it). Kept as the last qualifying sample; not cleared on a direct packet. |
 | `rnsd.links.<tag>.{state,direction,aspect,remote_hash,opened_s,last_error,…}` | Per-link state tree, keyed by the caller's `tag` — observable before the link_id exists. |
 | `rnsd.links.byid.<link_id>` | Reverse index: link_id → tag. |
@@ -252,7 +359,7 @@ Single-shot debug triggers — write a value and rnsd consumes it on its own tas
 ```
 rnsd                              identity + link summary, slot usage
 rnsd identity                     identity hash + public key
-rnsd persist [if-transport]       persist transport / path state
+rnsd persist [if-transport]       persist transport state
 rnsd reload                       reload or create the identity
 rnsd memory                       heap usage breakdown
 rnsd link <dest_hash> [aspect]    one-shot outbound Link probe

@@ -366,6 +366,14 @@ typedef
       Int32    currBlockNo;
       Int32    verbosity;
 
+      /* Spangap addition: the decoder's block-length ceiling, in bytes of
+         Burrows-Wheeler data. nblockLimit is what ll16/ll4/tt are sized to
+         and what every nblock/tPos bound is tested against; it is
+         100000 * blockSize100k unless maxOutBound (set by
+         BZ2_bzDecompressInitBounded, 0 = unbounded) is smaller. */
+      Int32    maxOutBound;
+      Int32    nblockLimit;
+
       /* for undoing the Burrows-Wheeler transform */
       Int32    origPtr;
       UInt32   tPos;
@@ -441,14 +449,14 @@ typedef
 
 #define BZ_GET_FAST(cccc)                     \
     /* c_tPos is unsigned, hence test < 0 is pointless. */ \
-    if (s->tPos >= (UInt32)100000 * (UInt32)s->blockSize100k) return True; \
+    if (s->tPos >= (UInt32)s->nblockLimit) return True; \
     s->tPos = s->tt[s->tPos];                 \
     cccc = (UChar)(s->tPos & 0xff);           \
     s->tPos >>= 8;
 
 #define BZ_GET_FAST_C(cccc)                   \
     /* c_tPos is unsigned, hence test < 0 is pointless. */ \
-    if (c_tPos >= (UInt32)100000 * (UInt32)ro_blockSize100k) return True; \
+    if (c_tPos >= (UInt32)ro_nblockLimit) return True; \
     c_tPos = c_tt[c_tPos];                    \
     cccc = (UChar)(c_tPos & 0xff);            \
     c_tPos >>= 8;
@@ -472,7 +480,7 @@ typedef
 
 #define BZ_GET_SMALL(cccc)                            \
     /* c_tPos is unsigned, hence test < 0 is pointless. */ \
-    if (s->tPos >= (UInt32)100000 * (UInt32)s->blockSize100k) return True; \
+    if (s->tPos >= (UInt32)s->nblockLimit) return True; \
     cccc = BZ2_indexIntoF ( s->tPos, s->cftab );    \
     s->tPos = GET_LL(s->tPos);
 

@@ -37,6 +37,9 @@ using namespace RNS;
 LogLevel _level = LOG_TRACE;
 //LogLevel _level = LOG_MEM;
 RNS::log_callback _on_log = nullptr;
+/* Off by default: a build that never sets it gets one line per event, not a
+ * dozen per packet. rnsd drives it from s.rnsd.log.trace. */
+bool RNS::_trace_enabled = false;
 
 const char* RNS::getLevelName(LogLevel level) {
 	switch (level) {
@@ -62,6 +65,8 @@ const char* RNS::getTimeString() {
 
 void RNS::loglevel(LogLevel level) { _level = level; }
 LogLevel RNS::loglevel() { return _level; }
+
+void RNS::trace_enabled(bool enable) { _trace_enabled = enable; }
 
 void RNS::set_log_callback(log_callback on_log) { _on_log = on_log; }
 

@@ -74,6 +74,37 @@ constexpr uint16_t RNSD_PORT_CHANNEL = 11;
  * Inbound channels reuse rnsd_link_incoming_t as the per-channel connect
  * payload. */
 
+/** Directory claims + out-of-band key seeding (aux-only, no connection).
+ *
+ *  Every write to the directory store must happen on the rnsd task — the store
+ *  is single-writer by construction, which is what lets every other task read
+ *  it lock-free. Claims originate on an app task (lxmf/nomad/rlpg observe a
+ *  storage write and react on their own task), so they are marshalled here as
+ *  one `rnsd_dir_aux_t` and applied by rnsd's aux handler.
+ *
+ *  Fire-and-forget: a claim is advisory — an ordering preference for eviction,
+ *  never a lifetime guarantee — so there is no reply to wait for. */
+constexpr uint16_t RNSD_PORT_DIR = 12;
+
+enum : uint8_t {
+    RNSD_DIR_OP_CLAIM       = 0x00,  /* assert/refresh a claim */
+    RNSD_DIR_OP_CLAIM_TOUCH = 0x01,  /* restamp an existing claim */
+    RNSD_DIR_OP_CLAIM_DROP  = 0x02,  /* release this consumer's claim */
+    RNSD_DIR_OP_SEED_PUBKEY = 0x03,  /* key learned off-network */
+};
+
+typedef struct {
+    uint8_t  op;             /* RNSD_DIR_OP_* */
+    uint8_t  consumer;       /* RNSD_CLAIM_* (rnsd.h) */
+    uint8_t  klass;          /* RNSD_CLAIM_PERSIST | _EPHEMERAL */
+    uint8_t  layers;         /* RNSD_CLAIM_LAYER_* */
+    uint32_t decay_s;        /* ordering scale since last touch; 0 = default */
+    uint8_t  dest[16];
+    uint8_t  pubkey[64];     /* SEED_PUBKEY only */
+} rnsd_dir_aux_t;
+static_assert(sizeof(rnsd_dir_aux_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_dir_aux_t must fit ITS_MAX_MSG_DATA");
+
 enum : uint8_t {
     /* 0x01 was RNSD_LINK_AUX_TEARDOWN — removed; itsDisconnect tears down. */
     RNSD_LINK_AUX_SEND_RESOURCE = 0x02, /* payload: rnsd_link_send_resource_t —
@@ -227,6 +258,40 @@ typedef struct {
                                interface they arrived on. 0 (default) => shared
                                radio medium; keep re-broadcasting for hidden
                                nodes (LoRa, ESP-NOW). */
+    uint8_t  retain_announces; /* 1 => an announce heard here is worth KEEPING,
+                               not merely forwarding. The asymmetry: on an
+                               expensive or edge interface we are the
+                               destination's custodian and re-acquiring it costs
+                               airtime, so we keep what we hear (LoRa, ESP-NOW);
+                               on a cheap or vast one we keep only what was
+                               resolved on demand, claimed, or is in active use
+                               (TCP into the wider network). Set from the
+                               interface's own `retain_announces` setting; the
+                               struct default of 0 means "don't retain", so a
+                               registering interface states its intent. */
+    uint8_t  policy_manual; /* 0 (default) => AUTO: this interface's transit
+                               policy is inferred, as it always was — mode-derived
+                               (access-point interfaces are excluded from relaying
+                               and from discovery) — and `route_for` below is NOT
+                               read. 1 => the operator owns the policy fields and
+                               they are read as given.
+                               NOTE the polarity, which is deliberately the
+                               opposite of `retain_announces` above: zero here
+                               must mean "behave as this build always did", so an
+                               interface straddle that predates the field, or one
+                               that simply doesn't set it, keeps stock behaviour.
+                               A straddle states its INTENT in retain_announces;
+                               it states the operator's OVERRIDE here. */
+    uint8_t  route_for;     /* Only read when policy_manual = 1. 1 => we provide
+                               transport for the nodes reachable through this
+                               interface: we relay announces towards them, we
+                               search on their behalf, and their paths get the
+                               custody lifetime. 0 => their traffic is not our
+                               business — we still talk to them as an endpoint,
+                               we just don't work for them. Answering a path
+                               request for a destination we already know is NOT
+                               gated by this: that is custody, not transit, and
+                               it is what makes a gateway a gateway. */
     uint8_t  rx_signal;     /* 1 => each inbound data frame is prefixed with a
                                4-byte signal header int16 rssi_dBm | int16 snr_dB*10
                                (both BE, INT16_MIN = absent). Set by radio ifaces

@@ -34,7 +34,7 @@ pinned at upstream commit `5642ae7fe17de6a8be9dc4891e95cf8a47c6ebe9`
 
 | Sub-path | Origin | License |
 |---|---|---|
-| `src/blocksort.c`, `bzlib.c`, `compress.c`, `crctable.c`, `decompress.c`, `huffman.c`, `randtable.c`, `include/bzlib.h`, `bzlib_private.h`, `bz_version.h` | © 1996–2010 Julian Seward `<jseward@acm.org>` — bzip2/libbzip2 1.1.0 of 6 September 2010 | **bzip2 license** (4-clause BSD-style; full text in `bzip2/LICENSE`) |
+| `src/blocksort.c`, `bzlib.c`, `compress.c`, `crctable.c`, `decompress.c`, `huffman.c`, `randtable.c`, `include/bzlib.h`, `bzlib_private.h`, `bz_version.h` | © 1996–2010 Julian Seward `<jseward@acm.org>` — bzip2/libbzip2 1.1.0 of 6 September 2010, with Spangap modifications to `bzlib.{c,h}`, `bzlib_private.h` and `decompress.c` (the `BZ2_bzDecompressInitBounded` entry point and the `nblockLimit` block ceiling it derives; each marked in-file) | **bzip2 license** (4-clause BSD-style; full text in `bzip2/LICENSE`) |
 | `src/bz_stub.c` | Spangap fork (this project) — `bz_internal_error()` panic adapter | Apache-2.0 |
 
 ### Build-time dependencies

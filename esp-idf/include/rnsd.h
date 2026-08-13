@@ -19,7 +19,7 @@
  * Threading: every function in this header is safe to call from any
  * task. Pure-crypto helpers (sha256/sign/verify/dest_hash) execute
  * inline on the caller's task. The mR-state functions (`recall*`)
- * take a recursive mutex around mR's `_known_destinations` table.
+ * read rnsd's directory lock-free from any task.
  * `rnsdRequestPath` writes a storage sentinel; the work runs on
  * rnsd's task asynchronously.
  */
@@ -55,7 +55,19 @@ public:
  * from its onInit() — instead of self-spawning a task that waits for rnsd — and
  * the orchestrator drives them: start walks registration order (deps first),
  * stop walks it in reverse (dependents first). `rnsd.up` is the observable
- * up/down signal. A stop hook stops abruptly and frees all held memory. */
+ * up/down signal. A stop hook stops abruptly and frees all held memory.
+ *
+ * Every task an ecosystem component spawns runs at FreeRTOS priority 1. The
+ * ecosystem is a pipeline — an interface produces what rnsd consumes, rnsd
+ * produces what a client consumes — and FreeRTOS does not time-slice across
+ * priorities: a producer placed above its consumer owns the core outright
+ * whenever it has work, and the consumer never runs to drain it. Backpressure
+ * then feeds itself, because the fuller the consumer's link is the more work
+ * the producer has failing to fill it, and the condition can only clear on the
+ * CPU the producer is holding. One level for the whole ecosystem makes the
+ * scheduler round-robin them instead, which is the only arrangement where that
+ * resolves. A higher priority is for work that should genuinely starve while
+ * the device is busy; nothing that carries packets qualifies. */
 typedef void (*rns_hook_t)(void);
 
 /** Lifecycle phases, low-to-high. Interfaces come up first and go down LAST, so a
@@ -170,28 +182,23 @@ bool rnsdDecryptSelf(const char* identity_key,
 
 /* ──────────────── recall / path request ──────────────── */
 
-/** Look up the public key for a destination in rnsd's identity cache
- *  (populated by mR as announces arrive). Takes a recursive mutex
- *  around mR's `_known_destinations` table — safe from any task.
- *  Returns true if known and populates `out_pubkey`; false if not
- *  yet heard. The standard recovery pattern on false is to call
- *  rnsdRequestPath(dest_hash) and retry later. */
+/** Look up the public key for a destination in rnsd's directory, populated by
+ *  mR as announces arrive. Lock-free from any task — the directory is
+ *  single-writer with a per-record sequence counter, and this copies out.
+ *  Returns true if known and populates `out_pubkey`; false if not yet heard.
+ *  The standard recovery pattern on false is to call rnsdRequestPath(dest_hash)
+ *  and retry later. */
 bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                       uint8_t out_pubkey[RNSD_PUBKEY_LEN]);
 
-/** Insert a (dest_hash → public_key) mapping into rnsd's identity cache — the
- *  same process-global `_known_destinations` table that inbound announces
- *  populate and rnsdRecallPubkey reads. This is the write counterpart to
- *  rnsdRecallPubkey; rnsd owns the table, this shim is how a consumer seeds it.
+/** Seed a (dest_hash → public_key) mapping learned OFF the network.
  *
- *  Ownership / who calls it: rnsd owns the cache. The intended caller is lxmf's
- *  contact-identity persistence: it stores each contact's public key in the
- *  contact record (rnsd's cache is RAM-only and self-culls, so the key is lost
- *  on reboot or when the cache fills with announces), and re-seeds it here at
- *  comms-initiate. That makes the peer recallable again so an outbound link /
- *  inbound-signature verification can proceed WITHOUT waiting for a fresh
- *  announce. Note it seeds only the identity, not a path — the caller still
- *  needs a route (has_path / rnsdRequestPath) before a link will establish.
+ *  Everything reachable by announce arrives on its own; this exists for the
+ *  one case that cannot: a key that came in over an authenticated side
+ *  channel, such as a mailbox owner's key carried in a signed authentication
+ *  frame. Nothing else should call it — a key cached without a path saves no
+ *  work, because acquiring a path means a path request and the path response
+ *  *is* an announce carrying the key.
  *
  *  Arguments:
  *    dest_hash  the peer's RNS destination hash — RNSD_DEST_HASH_LEN (16) bytes,
@@ -199,24 +206,70 @@ bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
  *    pubkey     the peer's public key — RNSD_PUBKEY_LEN (64) bytes, X25519(32) ‖
  *               Ed25519(32), exactly the layout rnsdRecallPubkey returns.
  *
- *  Semantics: idempotent and non-destructive — a hash already cached is left
- *  unchanged (mR's insert does not overwrite), so re-seeding never clobbers a
- *  live entry; a freshly inserted entry is timestamped now, so it is not the
- *  one the immediate cull drops. packet_hash / app_data are stored empty (unused
- *  by recall). Returns true if the mapping is present after the call (inserted
- *  or already there), false only if `pubkey` is malformed (wrong length).
- *
- *  Threading: takes the recursive mutex around `_known_destinations` internally
- *  — safe from any task, same as rnsdRecallPubkey. */
-bool rnsdRememberPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
-                        const uint8_t pubkey[RNSD_PUBKEY_LEN]);
+ *  Threading: safe from any task. The write is marshalled to the rnsd task, so
+ *  it is asynchronous — the key is not necessarily recallable the instant this
+ *  returns. Returns false only on a malformed argument. */
+bool rnsdSeedPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+                    const uint8_t pubkey[RNSD_PUBKEY_LEN]);
 
-/** Recall the last-heard announce app_data for a destination from the
- *  same identity cache. Copies up to `*inout_len` bytes into `out` and
- *  writes the actual length back to `*inout_len`. Returns false if the
- *  destination is unknown, carried no app_data, or the payload exceeds
- *  the supplied buffer. Same mutex/threading guarantees as
- *  rnsdRecallPubkey. app_data is opaque here — the consumer parses it. */
+/* ──────────────── directory claims ────────────────
+ *
+ * A claim tells rnsd that a destination matters to you, so that when memory
+ * runs short the records it drops are the ones nobody asked for. It is a
+ * preference, not a lifetime: retention is the maximum over all claims on a
+ * record, and rnsd may still break any of them under pressure. There is
+ * deliberately no expiry argument — a duration reads as a guarantee, and a
+ * guarantee is the first thing that has to break at 88% memory.
+ *
+ * The invariant that keeps this safe: an unbounded claim population may not
+ * carry a long duration. Claim your contacts (bounded by the address book) and
+ * your mesh neighbours (bounded by the mesh). Never claim what arrives from
+ * the network at large.
+ *
+ * Claims are advisory and fire-and-forget, so none of these report failure.
+ * They are not durable state either: the authoritative record of "this is a
+ * contact" is your own, and you re-assert at startup. */
+
+enum {
+    RNSD_CLAIM_LXMF  = 0,
+    RNSD_CLAIM_NOMAD = 1,
+    RNSD_CLAIM_RNSH  = 2,
+    RNSD_CLAIM_RLPG  = 3,
+    RNSD_CLAIM_RNSD  = 4,
+};
+
+/** PERSIST outranks EPHEMERAL under eviction; an EPHEMERAL claim also lapses
+ *  once `decay_s` has passed since its last touch. */
+#define RNSD_CLAIM_EPHEMERAL 0
+#define RNSD_CLAIM_PERSIST   1
+
+/** DIR keeps who the destination is; DIR_BLOB additionally asks rnsd to keep
+ *  the raw signed announce, which is what lets this node answer a path request
+ *  for it. */
+#define RNSD_CLAIM_LAYER_DIR      1
+#define RNSD_CLAIM_LAYER_DIR_BLOB 3
+
+/** Assert or refresh `consumer`'s claim on `dest_hash`. `decay_s` is the
+ *  ordering scale for EPHEMERAL claims (0 = rnsd's default); it is ignored for
+ *  PERSIST. */
+void rnsdClaim(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+               uint8_t consumer, uint8_t klass, uint8_t layers, uint32_t decay_s);
+
+/** Restamp an existing claim without changing its terms — "still interested". */
+void rnsdClaimTouch(const uint8_t dest_hash[RNSD_DEST_HASH_LEN], uint8_t consumer);
+
+/** Release this consumer's claim. Other consumers' claims are untouched. */
+void rnsdClaimDrop(const uint8_t dest_hash[RNSD_DEST_HASH_LEN], uint8_t consumer);
+
+/** Recall the last-heard announce app_data for a destination. This reads the
+ *  retained raw announce, so it answers only while rnsd still holds one for
+ *  that destination — knowing who a destination is does not imply still having
+ *  its announce. Consumers that need app_data reliably should take it from the
+ *  announce fan-out, which carries it on arrival, and keep their own copy.
+ *  Copies up to `*inout_len` bytes into `out` and writes the actual length
+ *  back. Returns false if the destination is unknown, its announce is no longer
+ *  retained, it carried no app_data, or the payload exceeds the supplied
+ *  buffer. app_data is opaque here — the consumer parses it. */
 bool rnsdRecallAppData(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                        uint8_t* out, size_t* inout_len);
 

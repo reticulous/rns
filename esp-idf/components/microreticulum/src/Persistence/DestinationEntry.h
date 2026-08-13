@@ -14,18 +14,14 @@
 
 #pragma once
 
+/* The live routing store is the directory pool (src/Directory.h). What
+ * remains here is the record shape the legacy in-memory path table and the
+ * tunnel table are declared in terms of — neither is populated in this build,
+ * and neither is on any packet path. */
+
 #include "Interface.h"
 #include "Packet.h"
 #include "Bytes.h"
-
-// CBA microStore
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-#include <microStore/FileStore.h>
-#else
-#include <microStore/HeapStore.h>
-#endif
-#include <microStore/TypedStore.h>
-#include <microStore/Codec.h>
 
 #include <set>
 #include <map>
@@ -59,15 +55,6 @@ public:
 	inline RNS::Bytes receiving_interface_hash() const { if (_receiving_interface) return _receiving_interface.get_hash(); return {RNS::Type::NONE}; }
 	inline RNS::Bytes announce_packet_hash() const { if (_announce_packet) return _announce_packet.get_hash(); return {RNS::Type::NONE}; }
 public:
-	// Fixed offsets into the Codec<DestinationEntry> encoding. Transport peeks
-	// (cull_path_table eviction ordering) and patches (outbound last-used
-	// stamping) these two doubles on the raw record, avoiding a full
-	// decode/re-encode round trip — which would also bump the cached announce
-	// packet's hop count, since decode() increments hops to mirror receiving
-	// the packet again.
-	static constexpr size_t OFFSET_TIMESTAMP = 0;
-	static constexpr size_t OFFSET_LAST_USED = sizeof(double);
-public:
 	double _timestamp = 0;
 	// Last outbound use of this path via Transport; 0 = never used. Kept
 	// separate from _timestamp, which stays the announce time.
@@ -98,23 +85,6 @@ public:
 	}
 #endif
 };
-//using PathTable = std::map<RNS::Bytes, DestinationEntry>;
 using PathTable = std::map<RNS::Bytes, DestinationEntry, std::less<RNS::Bytes>, Utilities::Memory::ContainerAllocator<std::pair<const RNS::Bytes, DestinationEntry>>>;
 
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-using PathStore = microStore::BasicFileStore<Utilities::Memory::ContainerAllocator<uint8_t>>;
-#else
-using PathStore = microStore::BasicHeapStore<Utilities::Memory::ContainerAllocator<uint8_t>>;
-#endif
-using NewPathTable = microStore::TypedStore<Bytes, DestinationEntry, PathStore>;
-
 } }
-
-namespace microStore {
-template<>
-struct Codec<RNS::Persistence::DestinationEntry>
-{
-	static std::vector<uint8_t> encode(const RNS::Persistence::DestinationEntry& entry);
-	static bool decode(const std::vector<uint8_t>& data, RNS::Persistence::DestinationEntry& entry);
-};
-}

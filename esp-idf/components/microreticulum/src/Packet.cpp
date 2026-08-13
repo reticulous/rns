@@ -491,7 +491,10 @@ PacketReceipt Packet::send() {
 	}
 
 	if (Transport::outbound(*this)) {
-		TRACE("Packet::send: successfully sent packet!!!");
+		/* Transport accepted responsibility for the packet — which is not the
+		 * same as putting it on an interface (a forwarded announce it declined
+		 * to relay also lands here). Transport logs what it actually did. */
+		TRACE("Packet::send: packet handed to transport");
 		_object->_sent = true;
 		//p return self.receipt
 		return _object->_receipt;
@@ -521,7 +524,7 @@ bool Packet::resend() {
 	pack();
 
 	if (Transport::outbound(*this)) {
-		TRACE("Packet::resend: successfully sent packet!!!");
+		TRACE("Packet::resend: packet handed to transport");
 		//z return self.receipt
 		// MOCK
 		return true;

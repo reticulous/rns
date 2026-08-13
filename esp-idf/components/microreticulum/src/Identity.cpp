@@ -24,6 +24,7 @@
 #include "Cryptography/HKDF.h"
 #include "Cryptography/Token.h"
 #include "Cryptography/Random.h"
+#include "Directory.h"
 
 #include <algorithm>
 #include <string.h>
@@ -32,17 +33,6 @@ using namespace RNS;
 using namespace RNS::Type::Identity;
 using namespace RNS::Cryptography;
 using namespace RNS::Utilities;
-
-#ifndef RNS_KNOWN_DESTINATIONS_MAX
-#define RNS_KNOWN_DESTINATIONS_MAX 100
-#endif
-
-/*static*/ Identity::IdentityTable Identity::_known_destinations;
-/*static*/ bool Identity::_saving_known_destinations = false;
-// CBA
-// CBA ACCUMULATES
-/*static*/ uint16_t Identity::_known_destinations_maxsize = RNS_KNOWN_DESTINATIONS_MAX;
-/*static*/ std::recursive_mutex Identity::_known_destinations_mux;
 
 Identity::Identity(bool create_keys /*= true*/) : _object(new Object()) {
 	if (create_keys) {
@@ -207,28 +197,6 @@ Can be used to load previously created and saved identities into Reticulum.
 	return {Type::NONE};
 }
 
-/*static*/ void Identity::remember(const Bytes& packet_hash, const Bytes& destination_hash, const Bytes& public_key, const Bytes& app_data /*= {Bytes::NONE}*/) {
-	if (public_key.size() != Type::Identity::KEYSIZE/8) {
-		throw std::invalid_argument("Can't remember " + destination_hash.toHex() + ", the public key size of " + std::to_string(public_key.size()) + " is not valid.");
-	}
-	else {
-		std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
-		//p _known_destinations[destination_hash] = {OS::time(), packet_hash, public_key, app_data};
-		// CBA ACCUMULATES
-		try {
-			_known_destinations.insert({destination_hash, {OS::time(), packet_hash, public_key, app_data}});
-			// CBA IMMEDIATE CULL
-			cull_known_destinations();
-		}
-		catch (const std::bad_alloc&) {
-			ERRORF("remember: bad_alloc - OUT OF MEMORY, identity not stored for %s", destination_hash.toHex().c_str());
-		}
-		catch (const std::exception& e) {
-			ERRORF("remember: exception storing identity: %s", e.what());
-		}
-	}
-}
-
 /*
 Recall identity for a destination hash.
 
@@ -237,198 +205,58 @@ Recall identity for a destination hash.
 */
 /*static*/ Identity Identity::recall(const Bytes& destination_hash) {
 	TRACE("Identity::recall...");
-	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
-	auto iter = _known_destinations.find(destination_hash);
-	if (iter != _known_destinations.end()) {
-		TRACEF("Identity::recall: Found identity entry for destination %s", destination_hash.toHex().c_str());
-		const IdentityEntry& identity_data = (*iter).second;
-		Identity identity(false);
-		identity.load_public_key(identity_data._public_key);
-		identity.app_data(identity_data._app_data);
-		return identity;
-	}
-	else {
-		TRACEF("Identity::recall: Unable to find identity entry for destination %s, performing destination lookup...", destination_hash.toHex().c_str());
-		Destination registered_destination(Transport::find_destination_from_hash(destination_hash));
-		if (registered_destination) {
-			TRACEF("Identity::recall: Found destination %s", destination_hash.toHex().c_str());
+	if (destination_hash.size() == Type::Reticulum::TRUNCATED_HASHLENGTH/8) {
+		uint8_t public_key[RDIR_PUBKEY_LEN];
+		if (rdirPeekPubkey(destination_hash.data(), public_key)) {
+			TRACEF("Identity::recall: Found directory entry for destination %s", destination_hash.toHex().c_str());
 			Identity identity(false);
-			identity.load_public_key(registered_destination.identity().get_public_key());
+			identity.load_public_key(Bytes(public_key, sizeof(public_key)));
+			/* app_data is not a directory field. A caller that needs it asks
+			 * recall_app_data(), which answers only while the raw announce is
+			 * still retained. */
 			identity.app_data({Bytes::NONE});
 			return identity;
 		}
-		TRACEF("Identity::recall: Unable to find destination %s", destination_hash.toHex().c_str());
-		return {Type::NONE};
 	}
+	TRACEF("Identity::recall: No directory entry for destination %s, performing destination lookup...", destination_hash.toHex().c_str());
+	Destination registered_destination(Transport::find_destination_from_hash(destination_hash));
+	if (registered_destination) {
+		TRACEF("Identity::recall: Found destination %s", destination_hash.toHex().c_str());
+		Identity identity(false);
+		identity.load_public_key(registered_destination.identity().get_public_key());
+		identity.app_data({Bytes::NONE});
+		return identity;
+	}
+	TRACEF("Identity::recall: Unable to find destination %s", destination_hash.toHex().c_str());
+	return {Type::NONE};
 }
 
 /*
 Recall last heard app_data for a destination hash.
 
 :param destination_hash: Destination hash as *bytes*.
-:returns: *Bytes* containing app_data, or *None* if the destination is unknown.
+:returns: *Bytes* containing app_data, or *None* if the destination is unknown or its announce is no longer retained.
 */
 /*static*/ Bytes Identity::recall_app_data(const Bytes& destination_hash) {
 	TRACE("Identity::recall_app_data...");
-	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
-	auto iter = _known_destinations.find(destination_hash);
-	if (iter != _known_destinations.end()) {
-		TRACEF("Identity::recall_app_data: Found identity entry for destination %s", destination_hash.toHex().c_str());
-		const IdentityEntry& identity_data = (*iter).second;
-		return identity_data._app_data;
-	}
-	else {
-		TRACEF("Identity::recall_app_data: Unable to find identity entry for destination %s", destination_hash.toHex().c_str());
+	if (destination_hash.size() != Type::Reticulum::TRUNCATED_HASHLENGTH/8) return {Bytes::NONE};
+
+	/* The announce's app_data sits behind its fixed prefix, so this is a slice
+	 * of the retained raw announce rather than a stored copy. */
+	uint8_t raw[Type::Reticulum::MTU];
+	size_t n = rdirCopyBlob(destination_hash.data(), raw, sizeof(raw));
+	if (n == 0) {
+		TRACEF("Identity::recall_app_data: No retained announce for destination %s", destination_hash.toHex().c_str());
 		return {Bytes::NONE};
 	}
-}
-
-/*static*/ bool Identity::save_known_destinations() {
-	// TODO: Improve the storage method so we don't have to
-	// deserialize and serialize the entire table on every
-	// save, but the only changes. It might be possible to
-	// simply overwrite on exit now that every local client
-	// disconnect triggers a data persist.
-
-	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
-	bool success = false;
-	try {
-		if (_saving_known_destinations) {
-			double wait_interval = 0.2;
-			double wait_timeout = 5;
-			double wait_start = OS::time();
-			while (_saving_known_destinations) {
-				OS::sleep(wait_interval);
-				if (OS::time() > (wait_start + wait_timeout)) {
-					ERROR("Could not save known destinations to storage, waiting for previous save operation timed out.");
-					return false;
-				}
-			}
-		}
-
-		_saving_known_destinations = true;
-		double save_start = OS::time();
-		(void)save_start;	// only consumed by a TODO/disabled block below
-
-		std::map<Bytes, IdentityEntry> storage_known_destinations;
-// TODO
-/*
-		if os.path.isfile(RNS.Reticulum.storagepath+"/known_destinations"):
-			try:
-				file = open(RNS.Reticulum.storagepath+"/known_destinations","rb")
-				storage_known_destinations = umsgpack.load(file)
-				file.close()
-			except:
-				pass
-*/
-
-		for (auto& [destination_hash, identity_entry] : storage_known_destinations) {
-			if (_known_destinations.find(destination_hash) == _known_destinations.end()) {
-				//_known_destinations[destination_hash] = storage_known_destinations[destination_hash];
-				//_known_destinations[destination_hash] = identity_entry;
-				// CBA ACCUMULATES
-				_known_destinations.insert({destination_hash, identity_entry});
-				// CBA IMMEDIATE CULL
-				cull_known_destinations();
-			}
-		}
-
-// TODO
-/*
-		DEBUGF("Saving %lu known destinations to storage...", _known_destinations.size());
-		file = open(RNS.Reticulum.storagepath+"/known_destinations","wb")
-		umsgpack.dump(Identity.known_destinations, file)
-		file.close()
-		DEBUGF("Saved known destinations to storage in %.3f seconds", OS::round(OS::time() - save_start, 3));
-*/
-
-		success = true;
-	}
-	catch (const std::exception& e) {
-		ERRORF("Error while saving known destinations to disk, the contained exception was: %s", e.what());
-	}
-
-	_saving_known_destinations = false;
-
-	return success;
-}
-
-/*static*/ void Identity::load_known_destinations() {
-	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
-// TODO
-/*
-	if os.path.isfile(RNS.Reticulum.storagepath+"/known_destinations"):
-		try:
-			file = open(RNS.Reticulum.storagepath+"/known_destinations","rb")
-			loaded_known_destinations = umsgpack.load(file)
-			file.close()
-
-			Identity.known_destinations = {}
-			for known_destination in loaded_known_destinations:
-				if len(known_destination) == RNS.Reticulum.TRUNCATED_HASHLENGTH//8:
-					Identity.known_destinations[known_destination] = loaded_known_destinations[known_destination]
-
-			RNS.log("Loaded "+str(len(Identity.known_destinations))+" known destination from storage", RNS.LOG_VERBOSE)
-		except:
-			RNS.log("Error loading known destinations from disk, file will be recreated on exit", RNS.LOG_ERROR)
-	else:
-		RNS.log("Destinations file does not exist, no known destinations loaded", RNS.LOG_VERBOSE)
-*/
-
-}
-
-/*static*/ void Identity::cull_known_destinations() {
-	TRACE("Identity::cull_known_destinations()");
-	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
-	if (_known_destinations.size() > _known_destinations_maxsize) {
-		try {
-			// Build lightweight (timestamp, key) index to avoid copying full IdentityEntry
-			// objects — prevents OOM on heap-constrained devices when the table is full.
-			std::vector<std::pair<double, Bytes>> sorted_keys;
-			sorted_keys.reserve(_known_destinations.size());
-			for (const auto& [key, entry] : _known_destinations) {
-				sorted_keys.emplace_back(entry._timestamp, key);
-			}
-			// Sort ascending by timestamp (oldest first)
-			std::sort(sorted_keys.begin(), sorted_keys.end());
-
-			uint16_t count = 0;
-			for (const auto& [timestamp, destination_hash] : sorted_keys) {
-				TRACEF("Identity::cull_known_destinations: Removing destination %s from known destinations", destination_hash.toHex().c_str());
-				if (_known_destinations.erase(destination_hash) < 1) {
-					WARNINGF("Failed to remove destination %s from known destinations", destination_hash.toHex().c_str());
-				}
-				++count;
-				if (_known_destinations.size() <= _known_destinations_maxsize) {
-					break;
-				}
-			}
-			/* Spangap: announce-driven cleanup — verbose, like the rest of
-			 * the announce processing. */
-			VERBOSEF("Removed %d path(s) from known destinations", count);
-		}
-		catch (const std::bad_alloc& e) {
-			ERROR("cull_known_destinations: bad_alloc - OUT OF MEMORY building sort index, falling back to single erase");
-			// Fallback: std::min_element does no heap allocation — erase one oldest entry
-			auto oldest = std::min_element(
-				_known_destinations.begin(), _known_destinations.end(),
-				[](const std::pair<const Bytes, IdentityEntry>& a,
-			   const std::pair<const Bytes, IdentityEntry>& b) {
-				return a.second._timestamp < b.second._timestamp;
-			}
-			);
-			if (oldest != _known_destinations.end()) {
-				_known_destinations.erase(oldest);
-			}
-		}
-		catch (const std::exception& e) {
-			ERRORF("cull_known_destinations: exception: %s", e.what());
-		}
-	}
+	Packet announce(Bytes(raw, n));
+	if (!announce.unpack()) return {Bytes::NONE};
+	const size_t prefix = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8;
+	if (announce.data().size() <= prefix) return {Bytes::NONE};
+	return announce.data().mid(prefix);
 }
 
 /*static*/ bool Identity::validate_announce(const Packet& packet) {
-	std::lock_guard<std::recursive_mutex> _lk(_known_destinations_mux);
 	try {
 		if (packet.packet_type() == Type::Packet::ANNOUNCE) {
 			Bytes destination_hash = packet.destination_hash();
@@ -468,20 +296,25 @@ Recall last heard app_data for a destination hash.
 				if (packet.destination_hash() == expected_hash) {
 					// Check if we already have a public key for this destination
 					// and make sure the public key is not different.
-					auto iter = _known_destinations.find(packet.destination_hash());
-					if (iter != _known_destinations.end()) {
-						IdentityEntry& identity_entry = (*iter).second;
-						if (public_key != identity_entry._public_key) {
-							// In reality, this should never occur, but in the odd case
-							// that someone manages a hash collision, we reject the announce.
-							CRITICAL("Received announce with valid signature and destination hash, but announced public key does not match already known public key.");
-							CRITICAL("This may indicate an attempt to modify network paths, or a random hash collision. The announce was rejected.");
-							return false;
-						}
+					/* rdirPeekEntry, not rdirPeekPubkey: this probe runs on every
+					 * announce and a first-time destination is the normal case,
+					 * so counting it as a recall miss would drown the counter
+					 * that exists to show consumers asking for keys we don't
+					 * hold. */
+					rdir_entry_t known;
+					if (rdirPeekEntry(packet.destination_hash().data(), &known) && known.has_pubkey &&
+					    memcmp(known.pubkey, public_key.data(), RDIR_PUBKEY_LEN) != 0) {
+						// In reality, this should never occur, but in the odd case
+						// that someone manages a hash collision, we reject the announce.
+						CRITICAL("Received announce with valid signature and destination hash, but announced public key does not match already known public key.");
+						CRITICAL("This may indicate an attempt to modify network paths, or a random hash collision. The announce was rejected.");
+						return false;
 					}
 
-					remember(packet.get_hash(), packet.destination_hash(), public_key, app_data);
-					//p del announced_identity
+					/* Nothing is stored here. Validation says the announce is
+					 * genuine; what to keep about it — and at which depth — is
+					 * the retention decision in Transport::inbound, which owns
+					 * the one record both layers share. */
 
 					std::string signal_str;
 // TODO
@@ -528,9 +361,8 @@ Recall last heard app_data for a destination hash.
 }
 
 /*static*/ void Identity::persist_data() {
-	if (!Transport::reticulum() || !Transport::reticulum().is_connected_to_shared_instance()) {
-		save_known_destinations();
-	}
+	/* Nothing of Identity's own is durable: what a node knows about other
+	 * destinations lives in the directory image, which the embedder writes. */
 }
 
 /*static*/ void Identity::exit_handler() {

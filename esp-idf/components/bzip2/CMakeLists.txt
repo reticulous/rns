@@ -1,8 +1,11 @@
 # Vendored bzip2 1.0.8 (libarchive maintained mirror), decompress + compress.
-# Only the buffer-to-buffer API is used (BZ2_bzBuffToBuff{Compress,Decompress});
-# BZ_NO_STDIO drops the FILE-based bzopen/bzread/... so there is no stdio
-# surface to drag in. Used by the µR Resource engine for NomadNet/Reticulum
-# bz2-compressed Resource payloads (every client speaks bz2).
+# Compression goes through BZ2_bzBuffToBuffCompress; decompression drives the
+# stream API so it can enter through BZ2_bzDecompressInitBounded, a local
+# addition that sizes the decoder's tables from the caller's output bound
+# instead of the stream header's blockSize100k digit. BZ_NO_STDIO drops the
+# FILE-based bzopen/bzread/... so there is no stdio surface to drag in. Used by
+# the µR Resource engine for NomadNet/Reticulum bz2-compressed Resource
+# payloads (every client speaks bz2).
 idf_component_register(
     SRCS
         "src/blocksort.c"

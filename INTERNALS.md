@@ -82,11 +82,13 @@ Our deltas, by category:
   `path_is_unresponsive` (not ported), so we key on an outstanding
   `_path_requests` entry instead. Without this, path discovery works exactly
   once and then goes silent.
-- `Identity.cpp`/`.h` — **`static std::recursive_mutex`** around every accessor
-  of the `_known_destinations` map (`remember`/`recall`/`recall_app_data`/
-  `validate_announce`/`cull_known_destinations`/save+load). Transport writes it
-  during announce ingest on the rnsd task; consumers read it cross-task via
-  `rnsdRecallPubkey`. Uncontended in the common case.
+- `Directory.{h,cpp}` (new) + `Identity.cpp`/`.h` — **one arena replaces the
+  identity cache and the path table.** `Identity` has no `_known_destinations`
+  map: `recall()` reads the directory pool, `recall_app_data()` slices the
+  retained raw announce, and `remember()` is gone — validation no longer stores
+  anything, because what to keep and at which depth is the retention decision in
+  `Transport::inbound`. Single writer (the rnsd task), lock-free readers via a
+  per-record sequence counter (§1.1.2).
 - `Packet.cpp` — malformed-packet error path **dumps the first ≤8 bytes hex** so
   HEADER_1-vs-HEADER_2 mis-parse, HDLC desync, or a noise byte are
   distinguishable in the log.
@@ -123,28 +125,94 @@ Our deltas, by category:
   interface (upstream checks `destination.attached_interface`; this port keeps
   the pin on the Link), compared **by name** so a reconnect's new impl keeps
   carrying the link; a not-yet-pinned link broadcasts as before.
-- `Transport.cpp`/`Persistence/DestinationEntry.{h,cpp}` — **use-aware path
-  eviction.** The path-table cap (`s.rnsd.path.max`, default 100) was enforced
-  by `BasicHeapStore`'s `max_recs`, which evicts the lexicographically
-  *smallest key* — on a busy mesh, destinations with low hashes were evicted
-  within seconds of every announce, including peers in active use, so every
-  link open re-sent a path request. `DestinationEntry` now carries a
-  `_last_used` double (stamped on outbound use in `Transport::outbound`, at
-  most once per `PATH_LAST_USED_GRANULARITY` = 60 s) and the cap is enforced
-  by a rewritten `cull_path_table()` at the announce-insert site, evicting
-  ascending by `(_last_used, _timestamp)` — never-used paths first, then
-  least-recently-used; use older than `PATH_LAST_USED_STALE` (48 h) counts as
-  never used, so a route last talked to months ago competes on announce age
-  instead of outranking fresh announces. `_timestamp` stays the announce time. The stamp is
-  patched into the encoded record at a fixed offset (`OFFSET_LAST_USED`)
-  rather than decode/re-encode, which would bump the cached announce packet's
-  hop count each round trip; the re-put also slides the store-level TTL so an
-  in-use path doesn't age out at `s.rnsd.path.ttl` while traffic flows.
-  Announce refreshes carry the previous `_last_used` over. Along the way:
-  the periodic path cull in `Transport::jobs()` was commented out (it iterated
-  the legacy `_path_table`, never populated in the microStore build — pure
-  no-op), and `expire_path()` — which zeroed a timestamp on a decoded copy,
-  another silent no-op — now removes the entry directly.
+- `Log.{h,cpp}` — **step narration is a switch, not a level.** µR's `LOG_VERBOSE`,
+  `LOG_MEM` and `LOG_TRACE` all map to `ESP_LOGV`, so `log rnsd verbose` could
+  not ask for events without also asking for the dozen-lines-per-packet
+  narration inside them — which on a busy TCP link *is* the load rather than a
+  description of it. `TRACE`/`TRACEF` now test `RNS::trace_enabled()` (a plain
+  bool, read before any formatting, so a suppressed `TRACEF` costs no
+  `vsnprintf`), driven live from `s.rnsd.log.trace` and off by default. Nothing
+  is lost and no level moves: verbose alone is one line per event, the switch
+  adds the steps.
+- **Bytes from strangers never reach the console unfiltered** (`logSafe()` in
+  `rnsd.cpp`). Announce app_data, msgpack strings, announced names and remote
+  request-response previews all pass through it: printable ASCII survives,
+  everything else becomes `.`. The bar is *printable ASCII*, not *not a control
+  code*, for a reason — a single 0x0E (Shift Out) in one announce switches the
+  terminal to the DEC line-drawing charset, and from there every line the device
+  emits, including other tasks' and the timestamps, renders as box glyphs until
+  something sends 0x0F. One byte of someone else's app_data corrupts the entire
+  log stream. High bytes go in the same sweep: validating UTF-8 cheaply is not
+  worth it and a lone high byte renders as garbage regardless.
+- `Transport.cpp` — **table culls are bounded and summarised** (`CULL_PER_PASS`).
+  A busy peer leaves hundreds of pending path requests that expire together;
+  the per-entry log line turned each expiry into a burst of blocking writes on
+  the rnsd task, long enough that nothing drained the ITS inbox and interfaces
+  logged `ITS send dropped` underneath it. A yield would not have helped —
+  rnsd is the task that must drain its own inbox, so the sweep has to be
+  *shorter*, not merely interruptible. One line per sweep, a cap on removals
+  per pass (an entry a pass late is still expired), and `OS::time()` hoisted
+  out of the walks — it was a call per entry, compared against a value that
+  cannot change mid-walk.
+- `Transport.cpp` — **`Bytes::toString()` is not a hash formatter.** The
+  waiting-path-request expiry printed `destination_hash.toString()`, i.e. raw
+  binary as text — mojibake in the log where a hash belonged. Hashes are
+  `toHex()`; `toString()` is for `Interface`/`Identity`.
+- `Transport.cpp` — **one announce, one line.** The relay decision is a clause
+  on the announce's own `Destination %s is now %d hops away…` line, not a line
+  of its own. Adding a line per decision to a path already emitting several is
+  how the firehose got built in the first place.
+- `Transport.cpp` — **an announce nothing could carry is refused at ingress.**
+  `announce_relay_possible()` asks, before the announce table is touched,
+  whether *any* OUT interface could re-broadcast this announce: AP mode never
+  lifts for a destination that is not ours, and split horizon excludes the
+  point-to-point interface it arrived on. A node where neither survives — an
+  access-point radio plus the TCP link the announce came in on — used to store
+  every announce it heard and retry it to the retry limit, walking the whole
+  outbound path per attempt and refusing on every interface, refilled from the
+  ingress faster than it drained. It is a **necessary** condition only: rate
+  caps, queue depth and the roaming/boundary next-hop rules depend on emission
+  -time state and stay in `outbound()`, which remains authoritative. The
+  decision is one `VERBOSEF` line per announce, replacing the ten-per-attempt
+  the retry walk emitted.
+- `Transport.cpp` — **the announce walk is bounded per pass**
+  (`ANNOUNCE_EMITS_PER_PASS`, round-robin from a cursor). Nothing in the
+  emission path yields, so a full ring coming due together ran ~100 pack +
+  decide + transmit cycles back-to-back on the rnsd task — IDLE0 starved into
+  the task watchdog, with `[tcp] rnsd ITS send dropped` underneath it. The pass
+  repeats at least once a second against a re-arm interval of seconds, so the
+  ceiling costs no drain rate.
+- `Transport.cpp`/`Packet.cpp` — **"handed to transport" is not "transmitted".**
+  `outbound()` reports a deliberately-unrelayed forwarded announce as handled
+  so `Packet::send` does not cry "No interfaces could process" over a routing
+  decision — but it now says so in its own line, and `Packet::send` no longer
+  logs `successfully sent packet!!!` over it. Conflating the two is how a node
+  that relayed nothing for hours still read as working.
+- `Transport.cpp` — **routing lives in the directory pool.** `Transport::outbound`
+  copies a fixed-size `rdir_route_t` out and resolves one interface: it allocates
+  nothing and constructs no `Packet` on the per-packet path. `has_path`,
+  `hops_to`, `next_hop`, `next_hop_interface` and `remove_path` all read the same
+  record; `remove_path` clears the *routing* fields and keeps the identity, since
+  that is what makes the next path response cheap. There is no periodic path
+  sweep: expiry and vanished-interface detection are lazy, in
+  `peek_live_route()`, which clears a dead record's routing fields and reports a
+  miss on first use so the caller path-requests instead of black-holing.
+- `Transport.cpp` — **announce ingest splits forwarding from storage.** Upstream
+  computes one `should_add` over retained state and uses it to gate the
+  retransmission queue, the immediate rebroadcasts *and* the table insert. Here
+  `fresh` is the forwarding input, computed by the guard pool over every announce
+  we ever validated rather than over whatever we happened to keep; `retain` is
+  the storage decision, true when the announce was resolved on demand (an
+  outstanding path request), arrived on an interface flagged
+  `retain_on_announce`, is claimed, or is in active use. A longer path never
+  displaces a shorter one while the shorter one is still valid, and an announce
+  we have already seen and already hold is not re-stored — on a mesh where
+  several neighbours rebroadcast the same announce, that is most of the traffic.
+- `Interface.{h}` — **`retain_on_announce`**, set at registration the way `mode`
+  is. This is what keeps the ingest split portable while the *policy* — which
+  interfaces retain — stays outside µR, in each interface straddle's own
+  `retain_announces` setting.
+
 - `Destination.cpp` — **empty aspect adds no separator.** `expand_name` appended
   `"." + aspects` unconditionally, so an app-name-only destination (e.g. rnsh's
   `"rnsh"`, passed as app_name `rnsh` + empty aspects) expanded to `"rnsh."` —
@@ -176,36 +244,44 @@ Our deltas, by category:
   `RESOURCE_ICL` so the receiver drops its inbound state instead of waiting
   out its own timeout.
 - `Resource.cpp`/`Compression.h` — **bz2 decode tables sized from the caller's
-  output bound, not from the stream header.** bzip2 sizes the decompressor's
-  working set from the `blockSize100k` digit in the four-byte stream header,
-  before it has looked at a byte of the compressed data behind it. Python's
-  `bz2.compress` defaults to level 9, so every stock peer's compressed Resource
-  — a 2 KB NomadNet page included — asks for ~2.25 MB, 1.8 MB of that a single
-  contiguous block, even with `small=1`. On a 2 MB-PSRAM board that allocation
-  can never succeed, whatever else is resident: the compressed Resource was
-  simply undecompressable, and reported itself as a flat "corrupt".
-  A block can never decode to more bytes than the whole stream does, so the
-  digit is rewritten down to `ceil(cap/100000)` from the output bound the caller
-  already supplies — clamped to the stream's own digit, never raised above it —
-  and a page-sized Resource decodes in a couple of hundred KB. The bound must be
-  a *ceiling*: a digit below what a block genuinely needs is refused as
-  `BZ_DATA_ERROR`, not silently truncated, so an under-estimate fails loudly.
-  Feeding a rewritten header means driving `BZ2_bzDecompress` over the stream
-  API rather than `BZ2_bzBuffToBuffDecompress`, because the input `Bytes` is
-  shared and must not be edited in place. This is the receive-side counterpart
-  of the `blockSize100k=1` we already compress with — both sides now bound their
-  own working set, and neither depends on the peer's choice of level.
+  output bound, not from the stream header.** Stock bzip2 sizes the
+  decompressor's working set from the `blockSize100k` digit in the four-byte
+  stream header, before it has looked at a byte of the compressed data behind
+  it. Python's `bz2.compress` defaults to level 9, so every stock peer's
+  compressed Resource — a 2 KB NomadNet page included — asks for ~2.25 MB,
+  1.8 MB of that a single contiguous block, even with `small=1`. That fails on
+  a 2 MB-PSRAM board whatever else is resident, and fails on an 8 MB one as
+  soon as PSRAM is fragmented enough to have no 200 KB run left; either way the
+  Resource is simply undecompressable.
+  The vendored bzip2 therefore carries a local entry point,
+  `BZ2_bzDecompressInitBounded(strm, verbosity, small, maxOut)`, which derives
+  the decoder's block ceiling `nblockLimit` from `maxOut` — the largest output
+  the caller will accept — and clamps it to the header digit, never above.
+  `ll16`/`ll4`/`tt` are allocated to that ceiling, and every `nblock`/`tPos`/
+  `origPtr` bound in `decompress.c` and the `BZ_GET_*` macros tests against it,
+  so a shrunken table can never be indexed past its end. A 1.5 KB page decodes
+  in ~4 KB of tables instead of 250 KB, and the cost stops depending on the
+  peer's choice of level.
+  `maxOut` is an *output* bound, and a block's Burrows-Wheeler data is the RLE1
+  encoding of what it decodes to, which expands by at most 5/4 (a run of
+  exactly four identical bytes becomes those four plus a count byte) — so
+  `nblockLimit` is `5/4·maxOut`, computed inside the library where callers
+  cannot get it wrong, and left unbounded above 720000 where that ceiling
+  exceeds bzip2's largest block anyway. The bound is a *ceiling*: a block that
+  genuinely needs more is refused as `BZ_DATA_ERROR`, not silently truncated,
+  so an under-estimate fails loudly. Decompression drives `BZ2_bzDecompress`
+  over the stream API rather than `BZ2_bzBuffToBuffDecompress`, which has no
+  bounded variant. This is the receive-side counterpart of the
+  `blockSize100k=1` we already compress with — both sides bound their own
+  working set, and neither depends on the peer's choice of level.
   Alongside it, a failed inbound Resource says which stage failed: the assembled
   byte count against the advertised transfer size (parts arrived short or long),
   decryption failure over that count, and the bz2 return code with bytes
   produced against the cap. Previously every one of these surfaced as the same
   single "corrupt" line.
-- **Tunable identity-cache size** — `RNS::Identity::known_destinations_maxsize` is
-  driven by `s.rnsd.identity.cache_max` (default `1000`, ~200 KiB PSRAM). The
-  generous default prevents cache eviction before probes conclude on a busy network.
 - **Announce/path-request logs are verbose** — the high-volume DEBUGFs in
   `Transport::inbound`/`packet_filter`/`path_request` and
-  `Identity::clean_known_destinations` route through `DBGF_DEMOTE`/`DBG_DEMOTE`
+  route through `DBGF_DEMOTE`/`DBG_DEMOTE`
   macros that emit at verbose unconditionally — busy TCP peers deliver hundreds
   of announces and route requests, and it's all other people's traffic. Same for
   rnsd's own per-announce logger and the per-packet iface tx/rx wire log. The one
@@ -244,6 +320,27 @@ it is now implemented, plus fork-specific behaviour for point-to-point links.
   is `0` for any sub-1-second frame, so `wait_time` was always `0`. All three
   cap sites (`outbound()`, recursive `request_path()`, `process_announce_queue()`)
   now compute in `double` seconds, matching upstream's float `announce_allowed_at`.
+- **The retransmission queue is one fixed ring** (`Transport::AnnounceRec`),
+  allocated once at `start()` from `s.rnsd.announce.table_max`. Each record
+  carries the announce payload inline and names its receiving and attached
+  interfaces by hash prefix rather than holding handles, so an entry costs a
+  flat `sizeof(AnnounceRec)` with no allocation and nothing to run out of
+  mid-burst — a queued `Packet` held nine separate `Bytes`, each its own heap
+  block, and the cull that ran when the table filled built a sort index, which
+  is an allocation at exactly the wrong moment. `cull_announce_table()` is now a
+  select-min pass with no allocation at all.
+
+  It keeps its own storage rather than referencing the directory's blob pool,
+  deliberately: an entry lands here when we are *forwarding* for someone else,
+  which on a gateway is precisely the traffic the retention policy declines to
+  keep — so most references would dangle. Blob slots are also evicted under
+  pressure at any moment, which a cache tolerates and a work queue does not.
+
+  The held-announce edge case (a path request arriving for a destination whose
+  announce is queued but not yet rebroadcast) is a flag on the record, not a
+  second table: the announce is marked `ANNOUNCE_F_HELD`, the path response
+  takes a slot of its own, and the held record is re-armed once that response
+  has gone out.
 - **Queue drain.** µR has no `threading.Timer`; `Transport::jobs()` polls each
   interface and calls `process_announce_queue()` once `announce_allowed_at` has
   elapsed, emitting one held announce (lowest hop count first). Queued announces
@@ -284,6 +381,120 @@ it is now implemented, plus fork-specific behaviour for point-to-point links.
   queues (`drop_announce_queues()`, previously stubbed), so pending rebroadcasts
   stop immediately instead of trickling the backlog out for minutes.
 
+#### 1.1.2 The directory (`Directory.{h,cpp}`)
+
+Everything this node knows about *other* destinations is one arena of packed
+fixed-size records: the public key, the aspect name hash and the route are
+fields of the same record, so they are acquired together, evicted together, and
+cannot disagree. It depends on nothing outside µR's own types and a three-hook
+platform struct (`arena_alloc`, `image_load`, `local_minutes`) — no filesystem,
+no configuration store, no allocator policy. The embedder (rnsd) supplies the
+hooks, the byte budget, and the file the image lands in (§7).
+
+**Three pools, joined only by the destination hash.** No pool stores an index
+into another: a stored link is a second expression of a relationship the key
+already carries, and therefore a consistency obligation across a lock-free
+reader and a raw persisted image.
+
+| pool | means | slot |
+|---|---|---|
+| guard | "I have seen this announce" | 28 B |
+| directory | "I know who this is" — keys, name hash, routing, claims | 160 B |
+| blob | "I can answer a path request for this" — the raw signed announce | 320 B (`s.rnsd.dir.blob_slot`) |
+
+Slot counts come from a byte budget (`s.rnsd.dir.budget_kb`, or a share of free
+PSRAM at boot) split 8 : 4 : 1 guard : directory : blob — 664 : 332 : 83 at the
+96 KiB ceiling. Nothing allocates after `rdirInit`, so no arrival path can fail
+for memory: a full pool evicts, and an ingest that cannot get its deeper layer
+silently keeps the weaker one. Lookup is a linear scan of the pool, which is
+what having no index to keep coherent with a raw image costs, and at these slot
+counts is a few hundred `memcmp`s of a 16-byte key.
+
+**Concurrency: one writer, many readers.** Only the rnsd task writes; only the
+directory pool is read cross-task, and only it carries a per-record sequence
+counter — odd while the payload is in flux, even when coherent, closed with a
+release store so no payload write sinks past it. A reader copies the record
+out, re-reads the counter, and retries (`RDIR_SEQ_TRIES` = 8, then reports a
+miss into `rnsd.stats.dir.seq_retries`). Slot reuse deliberately does **not**
+reset the counter: a counter restarting at zero could match a value a reader
+captured before the reuse, and that reader would accept a torn record. The
+reader's *scan* is racy by construction — a slot can be reused mid-walk — so
+the candidate is confirmed (used flag, key match) inside the seqlocked copy,
+not before it. No pointer into the arena escapes.
+
+**The guard is the forwarding memory, and it is not the directory.** Every
+announce we validate updates it, whether or not we keep anything else: a
+4-byte-truncated destination hash, a four-deep ring of 4-byte random-blob
+fingerprints, the announce's own emission time, and a local age in wrapping
+minutes. A blob already in the ring, or an emission older than the one held, is
+a replay and does not reach the retransmission queue — which is what stops a
+repeat announce costing ~1.5 s of LoRa airtime. Two things fall out of the
+truncated key: a destination collision is possible, so a *run* of
+older-emission suppressions (`RDIR_G_RUN_LIMIT`) resets the entry rather than
+silencing the losing destination forever, at a cost of one duplicate forward;
+and a requested `PATH_RESPONSE` must bypass the fingerprint check, because a
+relay answers from its own cached announce and its blob is necessarily one we
+have already heard — treat that as a replay and path discovery works exactly
+once and then goes silent.
+
+**Ingest splits forwarding from storage.** In `Transport::inbound`, `fresh` is
+the forwarding input (the guard, over every announce ever validated) and
+`retain` is the storage decision, true when a strictly-better-or-equal route
+arrives *and* one of: the announce was resolved on demand (an outstanding path
+request — the arm that keeps a non-retaining interface usable at all, or a node
+with only a cheap link would discard the path response it just asked for), the
+ingress interface carries `retain_on_announce`, the destination is claimed, or
+its route is in active use. A longer path never displaces a shorter valid one;
+an announce already seen and already held is not re-stored, which on a mesh
+where several neighbours rebroadcast the same announce is most of the traffic.
+The *policy* — which interfaces retain — stays outside µR, in each interface
+straddle's `retain_announces` setting, carried in at registration.
+
+**Claims and eviction.** The claim vocabulary lives outside the store and is
+compiled into the record at assert time (a per-consumer bit field for presence,
+persistence and blob interest, plus `claim_touch`/`claim_decay`), so eviction
+reads only in-record data. Records are removed lowest category first, oldest
+first within a category:
+
+| category | ordered by |
+|---|---|
+| guard-only | local age |
+| unclaimed, no live route | `last_heard` |
+| ephemeral claim past decay | `claim_touch` |
+| ephemeral claim, live | `claim_touch` |
+| interface-retained (`EDGE`), unclaimed | `last_heard` |
+| persist claims, and custody | `claim_touch`, or `last_heard` for custody |
+| route used recently | `last_used` |
+
+`RDIR_CLAIM_ANSWER_FOR` is custody, not a consumer claim: it is set when the
+destination is reachable via an interface whose transit policy says we route
+for it, and it ranks with the persistent claims — without it a gateway's own
+segment competes for slots with a large network's announce churn and loses
+continuously, because the churn is what keeps arriving. It is re-evaluated on
+every announce rather than latched, so a destination that moves to an interface
+we do not route for stops being our obligation. Eviction is a select-min pass,
+not a sort index: the store allocates nothing after init, and building one is
+an allocation at exactly the wrong moment.
+
+**Routing reads and writes the same record.** `Transport::outbound` copies a
+fixed-size `rdir_route_t` out and resolves one interface — no allocation, no
+`Packet` construction on the per-packet path. There is no periodic path sweep:
+expiry and vanished-interface detection are lazy, in `peek_live_route()`, which
+clears a dead record's routing fields and reports a miss on first use so the
+caller path-requests instead of black-holing. `rdirTouchUsed` stamps outbound
+use and slides the expiry out, because use is the evidence that a route is
+good; `rdirClearRoute` drops the routing fields and keeps the identity, which
+is what makes the next path response cheap.
+
+**Reader surface.** `rnsdRecallPubkey` / `rnsdRecallAppData` (the latter slices
+the retained blob, so it answers only while one is held), `rnsdClaim` /
+`rnsdClaimTouch` / `rnsdClaimDrop` / `rnsdSeedPubkey` (marshalled to the rnsd
+task over `RNSD_PORT_DIR`, §3), and `rnsd.dir.<hex32>.{pubkey,name_hash,hops,`
+`last_heard,claims,route}` as a storage *provider* — a read answered from the
+store per key, not a mirrored subtree, so nothing is published against the
+chance that someone asks. Occupancy and the counters that explain it are in
+`rnsd.stats.dir.*`; the persisted image is §7.
+
 ### 1.2 The rnsd layer (all new on top of µR)
 
 `rnsd` is entirely ours — µR has no concept of it. It adds:
@@ -311,10 +522,24 @@ it is now implemented, plus fork-specific behaviour for point-to-point links.
 
 ## 2. The `rnsd` task
 
-One FreeRTOS task, **core 0, prio 2, 12 KB PSRAM stack**. It owns µR's
+One FreeRTOS task, **core 0, prio 1, 12 KB PSRAM stack**. It owns µR's
 `Reticulum` + `Transport`, the interface table, the hosted-destination (our-dest)
 ports, the announce fan-out, the link slots, and the probe responder
 (`rnstransport.probe`, gated on `s.rnsd.respond_to_probes`, default on).
+
+**Every task in the RNS ecosystem runs at prio 1** — rnsd, every interface
+(`tcp`, `auto`, `espnow`, `lora`), and every client (`lxmf`, `nomad`, `rnsh`).
+The ecosystem is a pipeline: an interface produces what rnsd consumes, rnsd
+produces what a client consumes. FreeRTOS does not time-slice across
+priorities, so a producer ranked above its consumer owns the core outright for
+as long as it has work, and the consumer never runs to drain it — at which
+point back-pressure feeds itself, because the fuller the consumer's link the
+more work the producer has failing to fill it, and the only CPU that could
+clear it is the one the producer is holding. A flat ecosystem makes the 100 Hz
+tick round-robin them in 10 ms slices instead, which is the only arrangement
+where that resolves. Rank is for work that should genuinely starve while the
+device is busy; nothing that carries packets qualifies. The declaration lives
+with the lifecycle contract in `rnsd.h`.
 
 **Threading rule that governs everything:** µR's Transport/Link/Identity state
 is single-task-owned. Anything that mutates it — `Transport::request_path`,
@@ -351,9 +576,30 @@ the framing details:
   (optional dotted aspect filter). rnsd registers one internal `AnnounceHandler`
   with an empty filter at boot and fans each announce out to matching
   subscribers as one packet-mode message:
-  `hops(1) | dest_hash(16) | identity_hash(16) | app_data_len(2 BE) | app_data(N)`.
+  `hops(1) | dest_hash(16) | identity_hash(16) | pubkey(64) | app_data(N)`.
+  The public key rides along because without it a subscriber cannot cache
+  anything actionable and must call back into a node-global identity map to
+  send — the structural reason that map had to be large in the first place.
+  The per-subscriber aspect filter is the announce's **carried name hash**
+  matched against one compiled at subscribe time: `validate_announce` has
+  already proven `dest_hash == full_hash(carried_name_hash ‖ identity)[:16]`,
+  so that is exactly equivalent to re-deriving the destination hash per
+  subscriber — a ten-byte compare instead of a SHA-256, which is what used to
+  stall the browser transport during announce bursts.
+  The `hops` byte is the **announce's own** hop count, passed to the handler
+  rather than looked up: a subscriber hears every announce, but a route exists
+  only for the ones this node retains, so a routing lookup would report
+  `PATHFINDER_M` — "unreachable", 128 — for everything arriving on an interface
+  that forwards without keeping.
   Per-slot drop-on-full (`itsSend(..,0)`) — a slow subscriber loses announces, it
   never stalls rnsd.
+- **`RNSD_PORT_DIR` (12)** — aux only, no connection. One `rnsd_dir_aux_t` per
+  message: assert / touch / drop a claim, or seed a public key learned off the
+  network. Every directory write must happen on the rnsd task (single writer is
+  what lets every other task read lock-free), and claims originate on app tasks —
+  lxmf/nomad/rlpg react to a storage write on their own task — so `rnsdClaim` /
+  `rnsdSeedPubkey` marshal here. Fire-and-forget: a claim is advisory, so there
+  is no reply to wait for.
 - **`RNSD_PORT_LINK` (10)** — connect (`rnsd_link_connect_t`, built by
   `rnsdLinkOpen`) opens an outbound link; the handle is the packet-mode data
   path. Out-of-band aux frames carry `SEND_RESOURCE` (0x02), `REQUEST` (0x03)
@@ -715,13 +961,51 @@ deliberately not attempted here.
 
 Storage is the source of truth for the durable layer; the `rnsd.*` runtime tree
 is an ephemeral 1 Hz mirror of live state. µR's own `OS::read_file/write_file`
-are no-ops — rnsd is meant to persist transport/path state on demand via
-`rnsd persist if-transport` (cron-driven). **`rnsd persist` is currently a
-no-op stub** (`rnsd.cpp` `// TODO: write paths/hashlist/tunnels when Transport is
-wired`): `if-transport` skips on non-transport endpoints, and even in transport
-mode it writes nothing yet — so path/transport state does **not** survive reboot
-today. The default identity is `secrets.rnsd.identity`; rnsd does **not**
+stay no-ops: what rnsd knows about other destinations — identities, routes,
+retained announces, compiled claims — persists as the directory image at
+`<state>/rnsd/dir.img`, written by spangap-core's persist worker on a debounce
+(§1.1.2), never through µR's filesystem shim. The hashlist and the
+retransmission queue are not persisted; `rnsd persist` remains a no-op stub for
+them. The default identity is `secrets.rnsd.identity`; rnsd does **not**
 auto-create an application identity at boot — that is the app's call.
+
+**The image is the live set, budgeted against the partition — not the arena.**
+Three rules hold it there, and each exists because breaking it broke a board:
+
+- **Only live records are written**, packed, counts in the header. Writing the
+  arena verbatim (holes included) made the file the size of the *budget*, so a
+  node that knew twelve destinations still wrote 96 KB.
+- **Records go out in eviction order**, most valuable first (`dirCategory` /
+  `dirOrder` — the same judgement that decides what to drop under memory
+  pressure), so `rdirSnapshot`'s `cap` is a byte budget rather than a failure
+  condition. Blobs follow *all* the directory records, so a tight cap gives up
+  answering path requests before it gives up knowing who anyone is.
+- **The cap comes from `/state`**, an eighth of it by default
+  (`s.rnsd.dir.img_max_kb`). The arena budget derives from free PSRAM, and
+  PSRAM says nothing about the flash the image lands in: a T3-S3 has 2 MB of
+  PSRAM and a 256 KB state partition, sized itself a 96 KB arena, and could
+  then never write it — `atomicWriteFile` needs the new copy and the old one
+  resident at once, which is 192 KB of a 64-block filesystem. Every write
+  failed with `No more free space`, forever.
+
+The guard depth is **never** persisted, and this is a trade, not a free win.
+Its replay check is the fingerprint ring plus `emitted` — both absolute, so a
+reloaded guard pool *would* suppress announces we forwarded before the reboot.
+What it would not do is matter: the pool is 664 slots at the 96 KiB budget, and
+a node bridged to a large network hears orders of magnitude more distinct
+destinations than that, so it evicts continuously and suppression tends to zero
+whether or not it survives a boot. Against that, only its eviction ordering is
+salvageable — `local_age` is in uptime minutes (`rnsdDirLocalMinutes`), which
+restarts at boot, so a persisted record computes an age of
+`(uint16_t)(now - local_age)` ≈ 45 days and sorts oldest — and it would need a
+load-time reset to fix. On a small mesh, where suppression would work, the pool
+refills within one announce interval. So it stays out of the image, and the
+cost is one duplicate forward per destination after a reboot — the same reason
+guard churn does not bump `rdirGeneration`.
+
+An image whose `format_ver` differs is discarded whole — it is a cache, and a
+node that discards one re-learns by path request at the cost of a round trip
+per destination.
 
 ## 8. Maintainer pitfalls
 
@@ -729,7 +1013,7 @@ auto-create an application identity at boot — that is the app's call.
   construction, destination registration off-task silently no-op (the outbound
   packet is dropped). Defer via ITS or a `rnsd.cmd.*` sentinel.
 - **Large tables go in PSRAM, FreeRTOS sync objects do not.** Internal
-  DRAM/DMA is scarce on the T-Deck, so ITS metadata, identity cache, and recv
+  DRAM/DMA is scarce on the T-Deck, so ITS metadata, the directory arena, and recv
   buffers live in PSRAM. But queues/stream-buffers/mutexes placed in PSRAM trip
   the `S32C1I` spinlock assert — keep every FreeRTOS sync object in internal RAM.
 - **A `LoadProhibited` in cJSON / `navigatePath` / `storageGetInt` during flash
@@ -750,17 +1034,18 @@ auto-create an application identity at boot — that is the app's call.
   (`tickPhase ^= 1`). Both in one tick parks rnsd past tcp's 100 ms `itsSend`
   timeout (symptom: `[tcp] rnsd ITS send dropped`). The cost is that
   `Transport::jobs()` effectively runs at ~2 s cadence. Don't collapse them.
-- **Path table: bounded by caps; the snapshot publisher is disabled.** µR's path
-  table would grow unbounded (age-pruned only), so it's capped at `s.rnsd.path.max`
-  entries (`Transport::path_table_maxsize`, default 100) with age-out at
-  `s.rnsd.path.ttl` seconds (`Transport::destination_timeout`, default 86400) —
-  wired via `NOW_AND_ON_CHANGE`. Separately, `publishPathTable()` (which mirrored
-  the table to `rnsd.paths` for the browser Nodes window) is currently `#if 0`'d:
-  O(N)-snapshotting every tick tripped the task watchdog *inside* it under churn —
-  the `DestinationEntry` dtor walks a PSRAM RB-tree of `_random_blobs`, starving
-  IDLE0 — even with its 64-row cap and a `vTaskDelay(1)` every 8 entries. So
-  **`rnsd.paths` is not published today**; re-enabling needs that bounded/yielded
-  walk and ideally storage→SD. Don't re-enable it blind.
+- **Routes are bounded by the directory pool; the snapshot publisher is
+  disabled.** The pool's slot count is the hard bound (§1.1.2); `s.rnsd.path.max`
+  is a softer target enforced on top of it by `cull_path_table()` at the
+  announce-insert site, and a record ages out at `s.rnsd.path.ttl`
+  (`Transport::destination_timeout`) — both wired via `NOW_AND_ON_CHANGE`.
+  Separately, `publishPathTable()` (which mirrored the table to `rnsd.paths` for
+  the browser Nodes window) is `#if 0`'d: O(N)-snapshotting every tick tripped
+  the task watchdog *inside* it under churn, even with its 64-row cap and a
+  `vTaskDelay(1)` every 8 entries. So **`rnsd.paths` is not published today**;
+  the `rnsd.dir.` storage provider is the paged read path, and re-enabling a
+  whole-table mirror needs a bounded/yielded walk and ideally storage→SD. Don't
+  re-enable it blind.
 - **Resolve link callbacks by shared `LinkData`, not pointer.** µR hands callbacks
   `Link` wrapper *copies* (different address, same `shared_ptr<LinkData>`), so
   `&slot->link == &link` never matches. Use `sameLink(a,b)` (built on µR's public
@@ -790,7 +1075,7 @@ auto-create an application identity at boot — that is the app's call.
 ## 9. Browser UI
 
 The shared RNS UI lives in this straddle: `modules/rnsd.ts` (Pinia store +
-`rnsd:1` DataChannel exposing the path table, identity, and announces),
+`rnsd:1` DataChannel exposing the directory, identity, and announces),
 `panels/RnsdPanel.vue` (Settings → Reticulum), `panels/NodesWindow.vue` (live
 nodes), `panels/MapWindow.vue` (map of GPS-announcing peers). Interface-specific
 UI is **not** here — each interface straddle contributes its own settings panel.
@@ -887,12 +1172,14 @@ a `MessageBase` subclass with `MSGTYPE = 0x0100` and raw `pack`/`unpack` — µR
   docker bridge (172.17.0.2) and the device is on WiFi; there is no route
   between them. You *must* rendezvous through a shared public testnet node — the
   device's own outbound dials give you a common relay for free.
-- **`recall()` succeeding ≠ `has_path()` true.** On the busy testnet the bounded
-  100-entry path table (§8) churns, so a cached identity can outlive its path
-  entry. Gate any outbound link/channel establishment on `has_path() && recall()`
-  and re-`request_path()` while waiting — otherwise the link request has no next
-  hop and is silently dropped, surfacing only as an `establish_timeout`. This is
-  exactly why the device side gates §5.6 the same way.
+- **`recall()` succeeding still ≠ `has_path()` true.** Identity and route are
+  now fields of the same record, so they are acquired and evicted together — but
+  a route also expires on its own TTL and is dropped when its interface stops
+  resolving, both of which leave the identity behind. Gate any outbound
+  link/channel establishment on `has_path() && recall()` and re-`request_path()`
+  while waiting — otherwise the link request has no next hop and is silently
+  dropped, surfacing only as an `establish_timeout`. This is exactly why the
+  device side gates §5.6 the same way.
 - **`spangap cli "<cmd>"` is transient-flaky.** Occasional SSH banner timeout /
   "closed by remote host"; retry 2–3×. It also forwards piped stdin into a nested
   interactive command as long as stdin stays open, which is a feature — e.g.

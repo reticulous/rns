@@ -124,6 +124,25 @@ BZ_EXTERN int BZ_API(BZ2_bzDecompressInit) (
       int       small
    );
 
+/* Spangap addition. As BZ2_bzDecompressInit, but sizes the decoder's
+   working tables from maxOut — the largest output the caller will accept —
+   instead of from the blockSize100k digit in the stream header. The header
+   digit is the compressor's choice, and level 9 (Python bz2.compress's
+   default) asks for 2.25 MB of tables however few bytes are behind it; a
+   1.5 KB payload declared with maxOut=1500 costs ~4 KB. maxOut == 0 means
+   unbounded, i.e. exactly BZ2_bzDecompressInit's behaviour.
+
+   A block whose Burrows-Wheeler data does not fit the derived bound is
+   refused with BZ_DATA_ERROR — never truncated — so an under-estimate fails
+   loudly. Callers pass the decompressed size they expect; the RLE1 slack a
+   block may legitimately carry on top of that is added here. */
+BZ_EXTERN int BZ_API(BZ2_bzDecompressInitBounded) (
+      bz_stream    *strm,
+      int          verbosity,
+      int          small,
+      unsigned int maxOut
+   );
+
 BZ_EXTERN int BZ_API(BZ2_bzDecompress) (
       bz_stream* strm
    );

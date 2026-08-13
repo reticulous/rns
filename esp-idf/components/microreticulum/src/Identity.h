@@ -36,37 +36,15 @@ namespace RNS {
 
 	class Identity {
 
-	private:
-		class IdentityEntry {
-		public:
-			IdentityEntry(double timestamp, const Bytes& packet_hash, const Bytes& public_key, const Bytes& app_data) :
-				_timestamp(timestamp),
-				_packet_hash(packet_hash),
-				_public_key(public_key),
-				_app_data(app_data)
-			{
-			}
-		public:
-			double _timestamp = 0;
-			Bytes _packet_hash;
-			Bytes _public_key;
-			Bytes _app_data;
-		};
-		//using IdentityTable = std::map<Bytes, IdentityEntry>;
-		using IdentityTable = std::map<Bytes, IdentityEntry, std::less<Bytes>, Utilities::Memory::ContainerAllocator<std::pair<const Bytes, IdentityEntry>>>;
-
-	private:
-		static IdentityTable _known_destinations;
-		static bool _saving_known_destinations;
-		// CBA
-		static uint16_t _known_destinations_maxsize;
-		/* Spangap add: protect _known_destinations against concurrent
-		 * access from other tasks (lxmf calls Identity::recall while
-		 * rnsd's Transport::inbound mutates the map). Recursive
-		 * because remember() calls cull_known_destinations() which
-		 * also needs the lock. */
-		static std::recursive_mutex _known_destinations_mux;
-
+	/* There is no identity cache here any more. Every byte one held —
+	 * public key, app_data, the announce packet hash — was already present in
+	 * the announce the path table stored for the same destination, in a
+	 * container costing ten heap blocks per hundred bytes of payload, and the
+	 * two tables evicted independently so neither invariant held: a route in
+	 * daily use lost its key, and keys survived for destinations with no
+	 * route. recall() reads the directory pool (Directory.h) instead, which is
+	 * lock-free for cross-task readers and shares one eviction order with
+	 * routing. */
 	public:
 		Identity(bool create_keys = true);
 		Identity(Type::NoneConstructor none) {
@@ -132,13 +110,12 @@ namespace RNS {
 		void prove(const Packet& packet) const;
 
 		static const Identity from_file(const char* path);
-		static void remember(const Bytes& packet_hash, const Bytes& destination_hash, const Bytes& public_key, const Bytes& app_data = {Bytes::NONE});
 		static Identity recall(const Bytes& destination_hash);
+		/* Blob-present only: app_data is not a directory field, so this
+		 * succeeds for destinations whose raw announce we still hold. Callers
+		 * that need app_data for every announce should take it from the
+		 * announce itself — the fan-out carries it. */
 		static Bytes recall_app_data(const Bytes& destination_hash);
-		static bool save_known_destinations();
-		static void load_known_destinations();
-		// CBA
-		static void cull_known_destinations();
 
 		/*
 		Get a SHA-256 hash of passed data.
@@ -188,10 +165,6 @@ namespace RNS {
 		inline const Cryptography::Ed25519PrivateKey::Ptr sig_prv() const { assert(_object); return _object->_sig_prv; }
 		inline const Cryptography::X25519PublicKey::Ptr pub() const { assert(_object); return _object->_pub; }
 		inline const Cryptography::Ed25519PublicKey::Ptr sig_pub() const { assert(_object); return _object->_sig_pub; }
-		inline static uint16_t known_destinations_maxsize() { return _known_destinations_maxsize; }
-		inline static void known_destinations_maxsize(uint16_t known_destinations_maxsize) { _known_destinations_maxsize = known_destinations_maxsize; }
-		// Spangap: live entry count for the `rnsd memory` breakdown.
-		inline static size_t known_destinations_size() { return _known_destinations.size(); }
 
 		inline std::string toString() const { if (!_object) return ""; return "{Identity:" + _object->_hash.toHex() + "}"; }
 

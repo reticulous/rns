@@ -393,9 +393,6 @@ void Reticulum::clean_caches() {
 */
 
 	Transport::clean_caches();
-
-	// CBA
-	Identity::cull_known_destinations();
 #endif
 
 	_object->_last_cache_clean = OS::time();
@@ -484,15 +481,19 @@ bool Reticulum::drop_path(const Bytes& destination) {
 }
 
 uint16_t Reticulum::drop_all_via(const Bytes& transport_hash) {
-	uint16_t dropped_count = 0;
-	//for (auto& destination_hash : Transport::get_path_table()) {
-	for (const auto& [destination_hash, destination_entry] : Transport::get_path_table()) {
-		if (destination_entry._received_from == transport_hash) {
-			Transport::expire_path(destination_hash);
-			++dropped_count;
-		}
-	}
-	return dropped_count;
+	if (transport_hash.size() != RDIR_DEST_LEN) return 0;
+	struct ctx_t { const Bytes* via; std::vector<Bytes> hits; };
+	ctx_t ctx{ &transport_hash, {} };
+	/* Collect first, drop after: the callback runs while the store is being
+	 * walked, and dropping a route mutates the record under it. */
+	rdirForEach([](const rdir_entry_t* e, void* p) {
+		ctx_t* c = (ctx_t*)p;
+		if (!e->has_route) return;
+		if (memcmp(e->route.received_from, c->via->data(), RDIR_DEST_LEN) != 0) return;
+		c->hits.push_back(Bytes(e->dest, RDIR_DEST_LEN));
+	}, &ctx);
+	for (const auto& destination_hash : ctx.hits) Transport::expire_path(destination_hash);
+	return (uint16_t)ctx.hits.size();
 }
 
 void Reticulum::drop_announce_queues() {

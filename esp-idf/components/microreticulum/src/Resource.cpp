@@ -78,19 +78,18 @@ Bytes rns_full_hash2(const Bytes& a, const uint8_t* b, size_t blen) {
 // Compression.h for reuse by the rnsh channel protocol.
 namespace RNS {
 
-// bzip2 sizes its decode tables from the blockSize100k digit in the stream
-// header, not from the data behind it: Python's bz2.compress defaults to level
-// 9, so a 2 KB page costs 2.25 MB of working set (1.8 MB of it one contiguous
-// block) even with small=1. A block can never decode to more bytes than the
-// whole stream does, so lowering the digit to ceil(cap/100000) leaves every
-// stream decodable and drops a page-sized Resource to a couple of hundred KB.
-// The bound must be a ceiling: a digit below what a block actually needs is
-// rejected as BZ_DATA_ERROR, not silently tolerated.
-//
-// Feeding a rewritten header means driving the stream API rather than
-// BZ2_bzBuffToBuffDecompress — the input Bytes is shared and must not be
-// mutated in place. small=1 on top of that trades speed for another ~1/3 off
-// the working set.
+// Stock bzip2 sizes its decode tables from the blockSize100k digit in the
+// stream header, not from the data behind it: Python's bz2.compress defaults
+// to level 9, so a 2 KB page would cost 2.25 MB of working set (1.8 MB of it
+// one contiguous block) even with small=1 — an allocation this platform has no
+// business making, and one that fails outright once PSRAM is fragmented.
+// The vendored bzip2 takes the caller's output bound instead
+// (BZ2_bzDecompressInitBounded), sizing the tables to what the payload can
+// actually decode to: a page-sized Resource needs a few KB, and the cost no
+// longer depends on the peer's choice of compression level. A block that does
+// not fit the bound is refused as BZ_DATA_ERROR, never truncated, so an
+// under-estimate fails loudly. small=1 on top of that trades speed for another
+// ~1/3 off what remains.
 static bool bz2_stream_decompress(const Bytes& in, size_t cap, Bytes& out,
                                   size_t& produced) {
 	produced = 0;
@@ -99,38 +98,27 @@ static bool bz2_stream_decompress(const Bytes& in, size_t cap, Bytes& out,
 		WARNING("bz2: not a bzip2 stream");
 		return false;
 	}
-	size_t blocks = (cap + 99999) / 100000;
-	if (blocks < 1) blocks = 1;
-	if (blocks > 9) blocks = 9;
-	char header[4] = {'B', 'Z', 'h', static_cast<char>('0' + (int)blocks)};
-	if (header[3] > (char)in.data()[3]) header[3] = (char)in.data()[3];
-
 	std::vector<uint8_t> buf(cap);
 	bz_stream strm;
 	std::memset(&strm, 0, sizeof(strm));
-	if (BZ2_bzDecompressInit(&strm, /*verbosity=*/0, /*small=*/1) != BZ_OK) {
+	if (BZ2_bzDecompressInitBounded(&strm, /*verbosity=*/0, /*small=*/1,
+	                                static_cast<unsigned int>(cap)) != BZ_OK) {
 		WARNING("bz2: decompressor init failed (out of memory)");
 		return false;
 	}
 	strm.next_out  = reinterpret_cast<char*>(buf.data());
 	strm.avail_out = static_cast<unsigned int>(cap);
-	strm.next_in   = header;
-	strm.avail_in  = sizeof(header);
+	strm.next_in   = reinterpret_cast<char*>(const_cast<uint8_t*>(in.data()));
+	strm.avail_in  = static_cast<unsigned int>(in.size());
 	int r = BZ2_bzDecompress(&strm);
-	if (r == BZ_OK) {
-		strm.next_in  = reinterpret_cast<char*>(
-			const_cast<uint8_t*>(in.data()) + sizeof(header));
-		strm.avail_in = static_cast<unsigned int>(in.size() - sizeof(header));
-		r = BZ2_bzDecompress(&strm);
-	}
 	produced = cap - strm.avail_out;
 	BZ2_bzDecompressEnd(&strm);
 	if (r != BZ_STREAM_END) {
 		// rc -3 is BZ_MEM_ERROR (no room for the decode tables), -4/-5 a
 		// malformed stream, and BZ_OK here means the output cap was hit
 		// before the stream ended.
-		WARNINGF("bz2: decompress failed rc=%d after %zu/%zu bytes (level %c→%c, %zu in)",
-		         r, produced, cap, in.data()[3], header[3], in.size());
+		WARNINGF("bz2: decompress failed rc=%d after %zu/%zu bytes (level %c, %zu in)",
+		         r, produced, cap, in.data()[3], in.size());
 		return false;
 	}
 	out = Bytes(buf.data(), produced);

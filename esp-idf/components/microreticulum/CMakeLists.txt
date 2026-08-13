@@ -45,7 +45,9 @@ set(MICRORET_SRCS
     # ESP-IDF we use the platform's tlsf via heap_caps; mR's RNS_HEAP_ALLOCATOR
     # path uses ::operator new/delete, so this file is unused. Building it
     # collides with ESP-IDF's heap component (both export tlsf_*).
-    "src/Persistence/DestinationEntry.cpp"
+    # The arena store behind Identity::recall and Transport's routing — three
+    # pools in one block, seqlocked for cross-task readers (src/Directory.h).
+    "src/Directory.cpp"
     "src/Identity.cpp"
     "src/Destination.cpp"
     "src/Interface.cpp"
@@ -86,9 +88,9 @@ idf_component_register(
         bzip2
 )
 
-# Explicitly do NOT define RNS_USE_FS or RNS_PERSIST_PATHS so that
-# Persistence/DestinationEntry.h falls back to microStore::BasicHeapStore.
-# mR's hourly autopersist is harmless because OS::read_file/write_file are
+# Explicitly do NOT define RNS_USE_FS or RNS_PERSIST_PATHS. Routing state lives
+# in the arena store (src/Directory.h), which the embedder persists as a raw
+# image through its own platform hooks; µR's OS::read_file/write_file stay
 # no-op'd (see src/Utilities/OS.h).
 #
 # ed25519-donna config (see donna/ed25519-donna.h):

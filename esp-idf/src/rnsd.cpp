@@ -125,6 +125,12 @@ public:
                                             : RNS::Type::Reticulum::ANNOUNCE_CAP;
         _announce_cap = (float)cap_pct / 100.0f;
         _point_to_point = info.point_to_point != 0;
+        _retain_on_announce = info.retain_announces != 0;
+        /* Transit policy. On AUTO (the default, and every straddle that
+         * predates the field) route_for is not read and every gate keeps
+         * inferring from mode exactly as before. */
+        _policy_manual = info.policy_manual != 0;
+        _route_for = info.route_for != 0;
     }
 protected:
     void send_outgoing(const RNS::Bytes& data) override;
@@ -1590,14 +1596,29 @@ static void ourDestTickPending(void)
  * through, including UTF-8 multibyte sequences. Single-byte C0 bytes
  * are never UTF-8 continuation bytes so this preserves valid UTF-8
  * intact while keeping ESC out of xterm.js's parser. */
-static std::string appDataPrintable(const RNS::Bytes& app_data) {
+/* Announce app_data is whatever a stranger put on the air, and every path from
+ * it to the console goes through here. Printable ASCII survives; everything
+ * else becomes '.'.
+ *
+ * The bar is deliberately "printable ASCII", not "not a control code". A lone
+ * 0x0E is Shift Out: it switches a terminal to the DEC line-drawing charset
+ * and every subsequent line — ours, other tasks', the timestamps — renders as
+ * box glyphs until something sends 0x0F. One byte from one announce corrupts
+ * the whole log stream. High bytes are dropped in the same sweep: we cannot
+ * cheaply prove a byte sequence is valid UTF-8, and a lone one renders as
+ * garbage anyway. */
+static std::string logSafe(const uint8_t* p, size_t n) {
     std::string out;
-    out.reserve(app_data.size());
-    for (size_t i = 0; i < app_data.size(); i++) {
-        uint8_t b = app_data.data()[i];
-        out += (b < 0x20 || b == 0x7F) ? '.' : (char)b;
+    out.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        uint8_t b = p[i];
+        out += (b < 0x20 || b >= 0x7F) ? '.' : (char)b;
     }
     return out;
+}
+
+static std::string appDataPrintable(const RNS::Bytes& app_data) {
+    return logSafe(app_data.data(), app_data.size());
 }
 
 /* True iff `n` bytes at `p` contain no control codes — i.e. plausibly a
@@ -1630,7 +1651,7 @@ static bool mpDecode(const uint8_t* d, size_t n, size_t& i,
         out += '"';
         for (size_t k = 0; k < L; k++) {
             uint8_t b = d[i+k];
-            out += (b < 0x20 || b == 0x7F) ? '.' : (char)b;
+            out += (b < 0x20 || b >= 0x7F) ? '.' : (char)b;
         }
         out += '"';
         i += L;
@@ -1784,8 +1805,7 @@ static std::string formatAnnounceAppData(const RNS::Bytes& app_data)
     if (app_data.size() >= 32 &&
         isPlausibleText(app_data.data() + 32, app_data.size() - 32)) {
         RNS::Bytes ratchet(app_data.data(), 32);
-        std::string name((const char*)app_data.data() + 32,
-                         app_data.size() - 32);
+        std::string name = logSafe(app_data.data() + 32, app_data.size() - 32);
         out += "ratchet=" + ratchet.toHex() + " name=\"" + name + "\"";
         return out;
     }
@@ -1810,7 +1830,10 @@ public:
     AnnounceDebugLogger() : RNS::AnnounceHandler(nullptr) {}
     void received_announce(const RNS::Bytes& destination_hash,
                            const RNS::Identity& announced_identity,
-                           const RNS::Bytes& app_data) override {
+                           const RNS::Bytes& app_data,
+                           const RNS::Bytes& name_hash,
+                           uint8_t hops) override {
+        (void)name_hash;
         /* Announces are everyone else's traffic and busy TCP peers deliver
          * hundreds of them, so all output here is verb() — debug level
          * stays readable. Gate against the verbose level up front so the
@@ -1820,11 +1843,10 @@ public:
         esp_log_level_t lvl = esp_log_level_get(TAG);
         if (lvl < ESP_LOG_VERBOSE) return;
 
-        int hops = (int)RNS::Transport::hops_to(destination_hash);
         std::string body = formatAnnounceAppData(app_data);
-        verb("announce dest=%s id=%s hops=%d app_data %s",
+        verb("announce dest=%s id=%s hops=%u app_data %s",
              destination_hash.toHex().c_str(),
-             announced_identity.hexhash().c_str(), hops, body.c_str());
+             announced_identity.hexhash().c_str(), (unsigned)hops, body.c_str());
         if (app_data.size() > 0)
             verb("announce hex %s", app_data.toHex().c_str());
     }
@@ -1839,7 +1861,7 @@ static std::shared_ptr<AnnounceDebugLogger> s_announce_logger;
  * apply that subscriber's aspect filter and forward the event over its
  * ITS handle as one packet:
  *
- *     hops(1) | dest_hash(16) | identity_hash(16) | app_data(N)
+ *     hops(1) | dest_hash(16) | identity_hash(16) | pubkey(64) | app_data(N)
  *
  * Drop-on-full (itsSend timeout=0) — slow consumers lose announces,
  * never block the rnsd task. Same fan-out shape as spangap-core's
@@ -1851,7 +1873,12 @@ struct announce_sub_t {
     bool used;
     int  handle;
     char aspect[32];           /* "" = every announce */
+    bool has_filter;
+    uint8_t name_hash[RDIR_NAME_HASH_LEN];   /* aspect compiled, once */
 };
+
+/* hops(1) | dest(16) | identity_hash(16) | pubkey(64) | app_data(N) */
+#define RNSD_ANNOUNCE_FRAME_MAX (1 + 16 + 16 + RNSD_PUBKEY_LEN + 1024)
 static announce_sub_t s_announce_subs[RNSD_MAX_ANNOUNCE_SUBS];
 
 static announce_sub_t* announceSubAlloc(void) {
@@ -1864,40 +1891,55 @@ public:
     AnnounceFanout() : RNS::AnnounceHandler(nullptr) {}
     void received_announce(const RNS::Bytes& dest_hash,
                            const RNS::Identity& announced_identity,
-                           const RNS::Bytes& app_data) override
+                           const RNS::Bytes& app_data,
+                           const RNS::Bytes& name_hash,
+                           uint8_t hops) override
     {
-        /* Build the frame once. 16 B dest_hash + 16 B identity hash +
-         * 1 B hops + app_data. RNS announce app_data is bounded by mR's
-         * configuration; our outbound ITS buffer is 4096, well above
-         * any normal announce. */
+        /* Build the frame once. RNS announce app_data is bounded by mR's
+         * configuration; our outbound ITS buffer is 4096, well above any
+         * normal announce.
+         *
+         * The public key is in the frame because without it a subscriber
+         * cannot cache anything actionable: it would have to call back into a
+         * node-global identity map to send, which is the structural reason
+         * that map had to be large in the first place. */
         size_t app_n = app_data.size();
         if (app_n > 1024) {
             warn("announce fanout: oversize app_data %zu B — dropping", app_n);
             return;
         }
-        uint8_t frame[1 + 16 + 16 + 1024];
-        frame[0] = (uint8_t)RNS::Transport::hops_to(dest_hash);
-        std::memcpy(frame + 1,      dest_hash.data(),                16);
-        std::memcpy(frame + 1 + 16, announced_identity.hash().data(), 16);
-        if (app_n > 0)
-            std::memcpy(frame + 1 + 16 + 16, app_data.data(), app_n);
-        size_t frame_n = 1 + 16 + 16 + app_n;
+        RNS::Bytes pubkey = announced_identity ? announced_identity.get_public_key() : RNS::Bytes();
+        if (pubkey.size() != RNSD_PUBKEY_LEN) {
+            warn("announce fanout: %s has no usable public key — dropping",
+                 dest_hash.toHex().c_str());
+            return;
+        }
+        uint8_t frame[RNSD_ANNOUNCE_FRAME_MAX];
+        size_t o = 0;
+        /* The announce's own hop count, not a routing lookup: a subscriber
+         * hears every announce, but a route exists only for the ones this node
+         * retains, so hops_to() would report PATHFINDER_M ("unreachable") for
+         * everything arriving on a forward-without-keeping interface. */
+        frame[o++] = hops;
+        std::memcpy(frame + o, dest_hash.data(), 16);                 o += 16;
+        std::memcpy(frame + o, announced_identity.hash().data(), 16); o += 16;
+        std::memcpy(frame + o, pubkey.data(), RNSD_PUBKEY_LEN);       o += RNSD_PUBKEY_LEN;
+        if (app_n > 0) std::memcpy(frame + o, app_data.data(), app_n);
+        size_t frame_n = o + app_n;
 
         for (auto& sub : s_announce_subs) {
             if (!sub.used || sub.handle < 0) continue;
 
-            /* Server-side aspect filter — empty = pass all. Otherwise
-             * match the same way mR matches AnnounceHandler subclasses
-             * (Transport.cpp:2278). */
-            if (sub.aspect[0]) {
-                try {
-                    RNS::Bytes expected = RNS::Destination::hash_from_name_and_identity(
-                        sub.aspect, announced_identity);
-                    if (expected != dest_hash) continue;
-                } catch (const std::exception& e) {
-                    warn("announce fanout: aspect hash threw: %s", e.what());
-                    continue;
-                }
+            /* Server-side aspect filter — empty = pass all. The announce's own
+             * name hash is compared against one precomputed at subscribe time:
+             * validate_announce has already proven the destination hash is
+             * full_hash(name_hash ‖ identity)[:16], so this is exactly
+             * equivalent to re-deriving the destination hash per subscriber,
+             * and it is a ten-byte compare rather than a SHA-256. That cost is
+             * why this callback used to need a yield at the end. */
+            if (sub.has_filter) {
+                if (name_hash.size() != RDIR_NAME_HASH_LEN) continue;
+                if (std::memcmp(sub.name_hash, name_hash.data(), RDIR_NAME_HASH_LEN) != 0) continue;
             }
 
             /* Drop on full — never block the rnsd task. */
@@ -1905,12 +1947,6 @@ public:
                 verb("announce fanout: drop to handle=%d aspect=%s",
                      sub.handle, sub.aspect);
         }
-
-        /* Announces arrive in bursts and the per-sub aspect-hash match is
-         * crypto. This task shares core 0 (prio 2) with webrtc, which drives
-         * the browser transport — yield so a burst can't stall the datachannel
-         * and make the browser see us as gone. */
-        vTaskDelay(1);
     }
 };
 
@@ -1987,6 +2023,29 @@ static int onAnnouncesConnect(int handle, const void* data, size_t len)
     slot->handle = handle;
     std::memcpy(slot->aspect, req->aspect, sizeof(slot->aspect));
     slot->aspect[sizeof(slot->aspect) - 1] = '\0';
+    /* Compile the aspect to its name hash once, here, rather than hashing per
+     * announce per subscriber on the fan-out path. */
+    slot->has_filter = false;
+    if (slot->aspect[0]) {
+        std::string a(slot->aspect);
+        auto dot = a.find('.');
+        std::string app = (dot == std::string::npos) ? a : a.substr(0, dot);
+        std::string asp = (dot == std::string::npos) ? std::string() : a.substr(dot + 1);
+        try {
+            RNS::Bytes nh = RNS::Destination::name_hash(app.c_str(), asp.c_str());
+            if (nh.size() == RDIR_NAME_HASH_LEN) {
+                std::memcpy(slot->name_hash, nh.data(), RDIR_NAME_HASH_LEN);
+                slot->has_filter = true;
+            }
+        } catch (const std::exception& e) {
+            warn("announces connect: aspect hash threw: %s", e.what());
+        }
+        if (!slot->has_filter) {
+            err("announces connect: unusable aspect filter '%s'", slot->aspect);
+            slot->used = false;
+            return -1;
+        }
+    }
     info("announces sub %d open: aspect=%s",
          (int)(slot - s_announce_subs),
          slot->aspect[0] ? slot->aspect : "(all)");
@@ -2003,6 +2062,7 @@ static void onAnnouncesDisconnect(int ref)
     s.used = false;
     s.handle = -1;
     s.aspect[0] = '\0';
+    s.has_filter = false;
 }
 
 /* Subscribers don't send anything; if they do, drain and ignore. Port
@@ -2062,6 +2122,310 @@ static void publishPathTable(void)
 }
 #endif  /* route publishing to our storage disabled */
 
+/* ─────────────── directory store ───────────────
+ *
+ * µR owns the arena (three pools: guard / directory / blob, see Directory.h);
+ * everything platform-shaped about it lives here — how big it is, where its
+ * image lives, and who writes that image.
+ *
+ * Sizing is a byte budget, never slot counts. Constants tuned on an 8 MB board
+ * and inherited by a 2 MB one are the defect this whole design exists to
+ * prevent, so the budget is derived from free PSRAM at boot and clamped, with
+ * an operator override. */
+
+#define RNSD_DIR_IMG_DIR   "/rnsd"
+#define RNSD_DIR_IMG_PATH  "/rnsd/dir.img"
+
+/* A share of free PSRAM at bring-up, clamped. The floor keeps a small board
+ * from ending up with a directory too small to hold its own mesh; the ceiling
+ * keeps a big one from spending memory on slots a node will never fill (and
+ * from lengthening rdirPeekRoute's linear scan for nothing). */
+#define RNSD_DIR_PSRAM_SHARE   10
+#define RNSD_DIR_BUDGET_MIN_KB 40
+#define RNSD_DIR_BUDGET_MAX_KB 96
+
+static uint32_t  s_dirPersistedGen  = 0;
+static TickType_t s_dirPersistDueTick = 0;
+static size_t    s_dirImgCap        = 0;   /* 0 = whatever the store holds */
+static bool      s_dirImgCapWarned  = false;
+
+/* How many bytes of the image /state can carry.
+ *
+ * The arena budget is derived from PSRAM, and PSRAM says nothing about the
+ * flash the image lands in: a board with 2 MB of PSRAM and a 256 KB state
+ * partition sized itself a 96 KB arena and then could never write it, because
+ * the atomic rewrite needs the new copy and the old one resident at once.
+ * So the image gets its own budget, from the partition it is stored on — an
+ * eighth of it, which leaves room for the copy and for everything else that
+ * lives there. rdirSnapshot treats a short buffer as a budget and keeps the
+ * most valuable records, so a cap costs coverage, never a failed write. */
+#define RNSD_DIR_IMG_STATE_SHARE  8
+
+static size_t rnsdDirImageCap(void)
+{
+    int kb = storageGetInt("s.rnsd.dir.img_max_kb", 0);
+    if (kb > 0) return (size_t)kb * 1024;
+    size_t total = 0, used = 0;
+    if (fsLittlefsInfo("state", &total, &used) != ESP_OK || total == 0) return 0;
+    return total / RNSD_DIR_IMG_STATE_SHARE;
+}
+
+static void* rnsdDirArenaAlloc(size_t n) { return gp_alloc(n); }
+
+/* Uptime minutes, not wall-clock: the guard pool only ever compares two of
+ * these against each other, and an NTP step must not make every entry look
+ * ancient at once. Wraps every ~45 days, which costs one slightly-wrong
+ * eviction. */
+static uint16_t rnsdDirLocalMinutes(void)
+{
+    return (uint16_t)((xTaskGetTickCount() / configTICK_RATE_HZ) / 60);
+}
+
+static bool rnsdDirImageLoad(void* buf, size_t* len)
+{
+    if (!buf || !len) return false;
+    std::string path = fsStatePath(RNSD_DIR_IMG_PATH);
+    struct stat st;
+    if (fs_stat(path.c_str(), &st) != 0 || st.st_size <= 0) return false;
+    if ((size_t)st.st_size > *len) {
+        warn("dir: image %ld B exceeds the %u B arena, ignoring",
+             (long)st.st_size, (unsigned)*len);
+        return false;
+    }
+    int f = fs_open(path.c_str(), "rb");
+    if (f < 0) return false;
+    size_t n = fs_read(buf, 1, (size_t)st.st_size, f);
+    fs_close(f);
+    if (n != (size_t)st.st_size) return false;
+    *len = n;
+    return true;
+}
+
+/* Apply one marshalled directory write. Runs on the rnsd task only — either
+ * straight from a same-task caller or from the RNSD_PORT_DIR aux handler. */
+static void dirApply(const rnsd_dir_aux_t& m)
+{
+    if (!rdirReady()) return;
+    switch (m.op) {
+        case RNSD_DIR_OP_CLAIM: {
+            rdir_claim_t c = {};
+            c.consumer = m.consumer;
+            c.klass    = m.klass;
+            c.layers   = m.layers;
+            c.decay_s  = m.decay_s;
+            rdirClaim(m.dest, &c);
+            break;
+        }
+        case RNSD_DIR_OP_CLAIM_TOUCH: rdirClaimTouch(m.dest, m.consumer); break;
+        case RNSD_DIR_OP_CLAIM_DROP:  rdirClaimDrop(m.dest, m.consumer);  break;
+        case RNSD_DIR_OP_SEED_PUBKEY: rdirSeedPubkey(m.dest, m.pubkey);   break;
+        default: warn("dir: unknown aux op 0x%02x", m.op); break;
+    }
+}
+
+static void dirAuxRecv(TaskHandle_t /*sender*/, const void* data, size_t len)
+{
+    if (len != sizeof(rnsd_dir_aux_t)) { warn("dir: aux frame %u B, ignoring", (unsigned)len); return; }
+    rnsd_dir_aux_t m;
+    std::memcpy(&m, data, sizeof(m));
+    dirApply(m);
+}
+
+/* ---- storage provider: `rnsd.dir.<hex32>.<field>` ----
+ *
+ * A read-only, paged view of the directory for the CLI and the browser. It is
+ * a provider rather than ordinary storage keys because a directory pages on
+ * demand; it does not mirror. Registered under a prefix excluded from the
+ * browser dump for the same reason. */
+
+static bool dirKeyParse(const char* key, uint8_t dest[RNSD_DEST_HASH_LEN], const char** field)
+{
+    /* key arrives with the registered prefix already stripped: "<hex32>.<field>" */
+    if (!key) return false;
+    size_t i = 0;
+    for (; i < RNSD_DEST_HASH_LEN * 2; i++) {
+        char c = key[i];
+        int v;
+        if      (c >= '0' && c <= '9') v = c - '0';
+        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+        else return false;
+        if (i & 1) dest[i / 2] = (uint8_t)((dest[i / 2] << 4) | v);
+        else       dest[i / 2] = (uint8_t)v;
+    }
+    if (key[i] != '.') return false;
+    *field = key + i + 1;
+    return true;
+}
+
+static void dirHex(const uint8_t* p, size_t n, char* out, size_t outLen)
+{
+    static const char* H = "0123456789abcdef";
+    size_t w = 0;
+    for (size_t i = 0; i < n && w + 2 < outLen; i++) {
+        out[w++] = H[p[i] >> 4];
+        out[w++] = H[p[i] & 0x0f];
+    }
+    out[w < outLen ? w : outLen - 1] = '\0';
+}
+
+static bool dirProviderGet(const char* key, char* out, size_t outLen)
+{
+    uint8_t dest[RNSD_DEST_HASH_LEN];
+    const char* field = nullptr;
+    if (!dirKeyParse(key, dest, &field)) return false;
+    rdir_entry_t e;
+    if (!rdirPeekEntry(dest, &e)) return false;
+
+    if (!strcmp(field, "pubkey")) {
+        if (!e.has_pubkey) return false;
+        dirHex(e.pubkey, sizeof(e.pubkey), out, outLen);
+    } else if (!strcmp(field, "name_hash")) {
+        dirHex(e.name_hash, sizeof(e.name_hash), out, outLen);
+    } else if (!strcmp(field, "hops")) {
+        snprintf(out, outLen, "%u", (unsigned)e.hops);
+    } else if (!strcmp(field, "last_heard")) {
+        snprintf(out, outLen, "%u", (unsigned)e.last_heard);
+    } else if (!strcmp(field, "claims")) {
+        snprintf(out, outLen, "%u", (unsigned)e.claims);
+    } else if (!strcmp(field, "route")) {
+        if (!e.has_route) return false;
+        char via[RNSD_DEST_HASH_LEN * 2 + 1];
+        dirHex(e.route.received_from, RNSD_DEST_HASH_LEN, via, sizeof(via));
+        RNS::Interface iface = RNS::Transport::find_interface_from_hash_prefix(e.route.iface_hash);
+        snprintf(out, outLen, "%s %s %u", via,
+                 iface ? ifaceShortName(iface.toString()).c_str() : "?",
+                 (unsigned)e.route.hops);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool dirProviderExists(const char* key)
+{
+    char tmp[160];
+    return dirProviderGet(key, tmp, sizeof(tmp));
+}
+
+/* Walk the whole directory under a hash prefix. Emitting every field of every
+ * record would be the mirror this design exists to avoid, so the walk yields
+ * one summary line per record. */
+struct dir_walk_t { const char* prefix; void (*cb)(const char*, const char*); };
+
+static void dirProviderForEach(const char* prefix, void (*cb)(const char*, const char*))
+{
+    if (!cb) return;
+    dir_walk_t w{ prefix ? prefix : "", cb };
+    rdirForEach([](const rdir_entry_t* e, void* p) {
+        dir_walk_t* w = (dir_walk_t*)p;
+        char hex[RNSD_DEST_HASH_LEN * 2 + 1];
+        dirHex(e->dest, RNSD_DEST_HASH_LEN, hex, sizeof(hex));
+        if (*w->prefix && strncmp(hex, w->prefix, strlen(w->prefix)) != 0) return;
+        char key[64];
+        snprintf(key, sizeof(key), "%s.summary", hex);
+        char val[96];
+        char nh[RDIR_NAME_HASH_LEN * 2 + 1];
+        dirHex(e->name_hash, RDIR_NAME_HASH_LEN, nh, sizeof(nh));
+        snprintf(val, sizeof(val), "%s %u %u %u%s%s", nh,
+                 (unsigned)e->route.hops, (unsigned)e->last_heard, (unsigned)e->claims,
+                 e->has_route  ? " route"  : "",
+                 e->has_pubkey ? " pubkey" : "");
+        w->cb(key, val);
+    }, &w);
+}
+
+static void rnsdDirUp(void)
+{
+    int blob_slot = storageGetInt("s.rnsd.dir.blob_slot", RDIR_BLOB_SLOT_DEF);
+    rdirSetBlobSlotSize((size_t)blob_slot);
+
+    size_t budget;
+    int kb = storageGetInt("s.rnsd.dir.budget_kb", 0);
+    if (kb > 0) {
+        budget = (size_t)kb * 1024;
+    } else {
+        size_t freeps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        budget = freeps / RNSD_DIR_PSRAM_SHARE;
+        if (budget < RNSD_DIR_BUDGET_MIN_KB * 1024) budget = RNSD_DIR_BUDGET_MIN_KB * 1024;
+        if (budget > RNSD_DIR_BUDGET_MAX_KB * 1024) budget = RNSD_DIR_BUDGET_MAX_KB * 1024;
+    }
+
+    rdir_platform_t plat = {};
+    plat.arena_alloc   = rnsdDirArenaAlloc;
+    plat.image_load    = rnsdDirImageLoad;
+    plat.local_minutes = rnsdDirLocalMinutes;
+
+    if (!rdirInit(&plat, budget)) {
+        err("dir: store unavailable — no routing or identity cache this boot");
+        return;
+    }
+    s_dirPersistedGen = rdirGeneration();
+    s_dirImgCap = rnsdDirImageCap();
+    storageSet("rnsd.dir.slots",  (int)rdirSlots());
+    storageSet("rnsd.dir.bytes",  (int)rdirArenaBytes());
+    storageSet("rnsd.dir.img_cap", (int)s_dirImgCap);
+
+    /* Directory writes arrive here from app tasks; the applying handler runs on
+     * this one. */
+    itsOnAux(RNSD_PORT_DIR, dirAuxRecv);
+
+    static const storage_provider_t dir_provider = {
+        dirProviderGet, dirProviderExists, dirProviderForEach,
+    };
+    storageRegisterProvider("rnsd.dir.", &dir_provider);
+}
+
+/* Debounced image write. rdirSnapshot copies the live set on THIS task, where
+ * it is consistent by construction and needs no lock; the blocking write
+ * happens on spangap-core's persist worker. A filesystem write must never run
+ * on the rnsd task — it stalls for as long as the flash program windows take,
+ * which is exactly how RNSD_PORT_IFACE recv starts dropping.
+ *
+ * The interval is minutes, not the 60 s storage class: the directory changes
+ * on every retained announce, so a busy gateway would otherwise rewrite the
+ * image every minute forever. Contents are a cache — a crash costs at most
+ * one interval. Guard-pool churn deliberately does not count as a change (see
+ * rdirGeneration). */
+static void rnsdDirPersistTick(TickType_t now)
+{
+    if (!rdirReady()) return;
+    int period_s = storageGetInt("s.rnsd.dir.persist_s", 900);
+    if (period_s <= 0) return;
+
+    if (s_dirPersistDueTick == 0) {
+        s_dirPersistDueTick = now + pdMS_TO_TICKS(period_s * 1000);
+        return;
+    }
+    if ((int32_t)(now - s_dirPersistDueTick) < 0) return;
+    s_dirPersistDueTick = now + pdMS_TO_TICKS(period_s * 1000);
+
+    uint32_t gen = rdirGeneration();
+    if (gen == s_dirPersistedGen) return;
+
+    size_t need = rdirImageBytes();
+    if (s_dirImgCap && need > s_dirImgCap) {
+        if (!s_dirImgCapWarned) {
+            s_dirImgCapWarned = true;
+            info("dir: image capped at %u B for /state — persisting the most "
+                 "valuable records of %u B, the rest re-learn by path request",
+                 (unsigned)s_dirImgCap, (unsigned)need);
+        }
+        need = s_dirImgCap;
+    }
+    void* buf = gp_alloc(need);
+    if (!buf) { warn("dir: no memory for a %u B snapshot, skipping", (unsigned)need); return; }
+    size_t n = rdirSnapshot(buf, need);
+    if (n == 0) { free(buf); return; }
+
+    fs_mkdirp(fsStatePath(RNSD_DIR_IMG_DIR).c_str());
+    /* Ownership of buf transfers to the persist worker. */
+    if (storagePersistBlob(fsStatePath(RNSD_DIR_IMG_PATH).c_str(), buf, n))
+        s_dirPersistedGen = gen;
+    else
+        free(buf);
+}
+
 /* ─────────────── stats publishing ─────────────── */
 
 static void publishStats(void)
@@ -2090,6 +2454,18 @@ static void publishStats(void)
         storageSet(key, (int)(i.tx_bytes & 0x7fffffff));
     }
     storageSet("rnsd.stats.ifaces_up", activeIfaces);
+    if (rdirReady()) {
+        rdir_stats_t d;
+        rdirGetStats(&d);
+        storageSet("rnsd.stats.dir.entries",     (int)rdirCount());
+        storageSet("rnsd.stats.dir.blobs",       (int)rdirBlobCount());
+        storageSet("rnsd.stats.dir.guards",      (int)rdirGuardCount());
+        storageSet("rnsd.stats.dir.guard_drops", (int)((d.guard_drop_fp + d.guard_drop_emitted) & 0x7fffffff));
+        storageSet("rnsd.stats.dir.evictions",   (int)((d.evict_guard + d.evict_blob + [&]{
+            uint32_t t = 0; for (auto v : d.evict_dir) t += v; return t; }()) & 0x7fffffff));
+        storageSet("rnsd.stats.dir.recall_miss", (int)(d.recall_miss & 0x7fffffff));
+        storageSet("rnsd.stats.dir.seq_retries", (int)(d.seq_retries & 0x7fffffff));
+    }
     storageEnd();
 }
 
@@ -2172,7 +2548,6 @@ static void cliRnsdMemory(void)
      * task-tracking overhead. Still estimates (payload length varies), but
      * tuned so the rows account for most of the table footprint and `misc`
      * drains to ~the engine object graph + transient in-flight Bytes. */
-    unsigned id_n = (unsigned)RNS::Identity::known_destinations_size();
     unsigned pa_n = (unsigned)RNS::Transport::path_table_size();
     unsigned an_n = (unsigned)RNS::Transport::announce_table_size();
     unsigned he_n = (unsigned)RNS::Transport::held_announces_size();
@@ -2186,13 +2561,22 @@ static void cliRnsdMemory(void)
     unsigned if_n = (unsigned)RNS::Transport::interfaces_count();
 
     unsigned long long tot = 0;
-    tot += memBar("identity cache", (int)id_n, (unsigned)RNS::Identity::known_destinations_maxsize(),
-                  (unsigned long long)id_n * 520, psramTot, true);
-    tot += memBar("path table",     (int)pa_n, (unsigned)RNS::Transport::path_table_maxsize(),
-                  (unsigned long long)pa_n * 340, psramTot, true);
-    tot += memBar("announce table", (int)an_n, (unsigned)RNS::Transport::announce_table_maxsize(),
-                  (unsigned long long)an_n * 520, psramTot, true);
-    tot += memBar("held announces", (int)he_n, 0, (unsigned long long)he_n * 520, psramTot, true);
+    /* The directory arena is one allocation whose size is known exactly, so
+     * these three rows are the only non-estimates among the tables. They are
+     * shown per pool for occupancy, and the arena row carries the bytes — the
+     * pools do not each own a block. */
+    if (rdirReady()) {
+        tot += memBar("dir entries", (int)rdirCount(),      (unsigned)rdirSlots(),
+                      (unsigned long long)rdirSlots() * RDIR_DIR_SLOT_SZ, psramTot, false);
+        tot += memBar("dir guards",  (int)rdirGuardCount(), (unsigned)rdirGuardSlots(),
+                      (unsigned long long)rdirGuardSlots() * RDIR_GUARD_SLOT_SZ, psramTot, false);
+        tot += memBar("dir blobs",   (int)rdirBlobCount(),  (unsigned)rdirBlobSlots(),
+                      (unsigned long long)rdirBlobSlots() * rdirBlobSlotSize(), psramTot, false);
+    }
+    (void)pa_n;
+    /* One fixed ring, so this row is exact: `used` counts queued plus held. */
+    tot += memBar("announce queue", (int)(an_n + he_n), (unsigned)RNS::Transport::announce_table_slots(),
+                  (unsigned long long)RNS::Transport::announce_queue_bytes(), psramTot, false);
     tot += memBar("hashlist",       (int)hl_n, (unsigned)RNS::Transport::hashlist_maxsize(),
                   (unsigned long long)hl_n * 120, psramTot, true);
     tot += memBar("pr tags",        (int)pr_n, (unsigned)RNS::Transport::max_pr_tags(),
@@ -2220,6 +2604,20 @@ static void cliRnsdMemory(void)
                   ifc, RNSD_MAX_IFACES, mbc, RNSD_MAX_OUR_DESTS, lkc, RNSD_MAX_LINK_CONNS);
     }
 
+    if (rdirReady()) {
+        rdir_stats_t d;
+        rdirGetStats(&d);
+        uint32_t ev = d.evict_guard + d.evict_blob;
+        for (auto v : d.evict_dir) ev += v;
+        cliPrintf("dir: image %u B, guard drops %u (blob %u / emitted %u / bypass %u / resets %u),\n"
+                  "     evictions %u, recall misses %u, seq retries %u\n",
+                  (unsigned)rdirImageBytes(),
+                  (unsigned)(d.guard_drop_fp + d.guard_drop_emitted),
+                  (unsigned)d.guard_drop_fp, (unsigned)d.guard_drop_emitted,
+                  (unsigned)d.guard_bypass, (unsigned)d.guard_resets,
+                  (unsigned)ev, (unsigned)d.recall_miss, (unsigned)d.seq_retries);
+    }
+    cliPrintf("announces: %u queued, %u held\n", an_n, he_n);
     cliPrintf("stats: pkts in %u out %u, dests added %u\n",
               (unsigned)RNS::Transport::packets_received(),
               (unsigned)RNS::Transport::packets_sent(),
@@ -2422,37 +2820,48 @@ static void cliRnpath(const char* args)
         return;
     }
 
-    /* Single pass: collect matching rows + accumulate histograms. The path
-     * table can be ~thousands of entries on a busy testnet; iteration copies
-     * each DestinationEntry, so we only walk once. */
+    /* Single pass over the directory pool: collect matching rows and
+     * accumulate histograms. Only records carrying a route are paths — the
+     * rest are destinations we know the identity of but hold no route to. */
+    struct walk_t {
+        std::vector<PathRow>*       rows;
+        std::map<std::string, int>* by_iface;
+        std::map<int, int>*         by_hops;
+        const std::string*          filter_dest;
+        const std::string*          filter_iface;
+        int  max_hops;
+        int  total;
+        int  yield_n;
+    };
     std::vector<PathRow> rows;
     std::map<std::string, int> by_iface;
     std::map<int, int>         by_hops;
-    int total = 0;
-    int yield_n = 0;
+    walk_t w{ &rows, &by_iface, &by_hops, &filter_dest, &filter_iface, max_hops, 0, 0 };
     try {
-        auto& pt = RNS::Transport::get_new_path_table();
-        for (auto kv : pt) {
-            total++;
-            const auto& entry = kv.value;
-            std::string iname = entry._receiving_interface
-                ? ifaceShortName(entry._receiving_interface.toString()) : "?";
-            int hops = (int)entry._hops;
-            by_iface[iname]++;
-            by_hops[hops]++;
+        rdirForEach([](const rdir_entry_t* e, void* ctx) {
+            walk_t* w = (walk_t*)ctx;
+            if (!e->has_route) return;
+            w->total++;
+            RNS::Interface iface = RNS::Transport::find_interface_from_hash_prefix(e->route.iface_hash);
+            std::string iname = iface ? ifaceShortName(iface.toString()) : "?";
+            int hops = (int)e->route.hops;
+            (*w->by_iface)[iname]++;
+            (*w->by_hops)[hops]++;
 
-            std::string dh = kv.key.toHex();
-            if (!filter_dest.empty()  && dh.rfind(filter_dest, 0) != 0) goto next;
-            if (!filter_iface.empty() && iname != filter_iface)         goto next;
-            if (max_hops >= 0         && hops  > max_hops)              goto next;
-            rows.push_back({dh, entry._received_from.toHex(), iname, hops, entry._timestamp});
-        next:
-            if ((++yield_n % RNPATH_YIELD_EVERY) == 0) vTaskDelay(1);
-        }
+            std::string dh = RNS::Bytes(e->dest, RDIR_DEST_LEN).toHex();
+            bool keep = (w->filter_dest->empty()  || dh.rfind(*w->filter_dest, 0) == 0)
+                     && (w->filter_iface->empty() || iname == *w->filter_iface)
+                     && (w->max_hops < 0          || hops <= w->max_hops);
+            if (keep)
+                w->rows->push_back({dh, RNS::Bytes(e->route.received_from, RDIR_DEST_LEN).toHex(),
+                                    iname, hops, (double)e->route.timestamp});
+            if ((++w->yield_n % RNPATH_YIELD_EVERY) == 0) vTaskDelay(1);
+        }, &w);
     } catch (const std::exception& e) {
-        cliPrintf("path table iteration threw: %s\n", e.what());
+        cliPrintf("directory iteration threw: %s\n", e.what());
         return;
     }
+    int total = w.total;
 
     if (json) {
         cJSON* root = cJSON_CreateObject();
@@ -2556,6 +2965,9 @@ static void rnstatusPrintIface(const iface_t& i)
     cliPrintf("Announce cap %u%%\n",
               (unsigned)(i.info.announce_cap ? i.info.announce_cap
                                              : RNS_IFACE_ANNOUNCE_CAP_DEFAULT));
+    cliPrintf("Transit policy %s\n", !i.info.policy_manual ? "auto (inferred from mode)"
+                                    : (i.info.route_for ? "manual: route for this interface"
+                                                        : "manual: do not route for this interface"));
     cliPrintf("Split horizon %s\n", i.info.point_to_point ? "yes (point-to-point)"
                                                           : "no (shared/hidden-node)");
     cliPrintf("MTU          %u\n", (unsigned)i.info.mtu);
@@ -2905,8 +3317,8 @@ static TickType_t nextDeadline(void)
  * Byte-array wrappers around the mR primitives consumers (lxmf etc.)
  * need. All pure-crypto helpers execute on the caller's task —
  * underlying mbedTLS calls (used by mR) are thread-safe and the
- * Identity objects are local to each call. The recall API takes
- * mR's `_known_destinations_mux` (added in Identity.h). The async
+ * Identity objects are local to each call. The recall API reads the
+ * directory lock-free (single writer, seqlocked records). The async
  * path request crosses to rnsd's task via a storage sentinel
  * (`rnsd.cmd.request_path`). */
 
@@ -3112,8 +3524,8 @@ bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                       uint8_t out_pubkey[RNSD_PUBKEY_LEN])
 {
     try {
-        /* Identity::recall takes _known_destinations_mux internally
-         * (see Identity.cpp), so this is safe from any task. */
+        /* Identity::recall copies the record out of the directory under
+         * its sequence counter, so this is safe from any task. */
         RNS::Identity id = RNS::Identity::recall(
             RNS::Bytes(dest_hash, RNSD_DEST_HASH_LEN));
         if (!id) return false;
@@ -3127,21 +3539,63 @@ bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
     }
 }
 
-bool rnsdRememberPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
-                        const uint8_t pubkey[RNSD_PUBKEY_LEN])
+/* Every directory write happens on the rnsd task — that is what lets every
+ * other task read the store without a lock. Claims and seeded keys originate
+ * on app tasks (lxmf/nomad/rlpg react to a storage write on their own task), so
+ * they ride an aux frame to RNSD_PORT_DIR and are applied by dirAuxRecv below.
+ * Fire-and-forget: a claim is advisory, so there is no reply to wait for. */
+static void dirSendAux(const rnsd_dir_aux_t& m)
 {
-    try {
-        /* Identity::remember takes _known_destinations_mux internally and
-         * throws if the key size is wrong; NONE packet_hash/app_data (unused
-         * for recall). */
-        RNS::Identity::remember({RNS::Bytes::NONE},
-                                RNS::Bytes(dest_hash, RNSD_DEST_HASH_LEN),
-                                RNS::Bytes(pubkey, RNSD_PUBKEY_LEN));
-        return true;
-    } catch (const std::exception& e) {
-        warn("rnsdRememberPubkey: %s", e.what());
-        return false;
-    }
+    if (!s_task) return;
+    if (xTaskGetCurrentTaskHandle() == s_task) { dirApply(m); return; }
+    itsSendAuxByTaskHandle(s_task, RNSD_PORT_DIR, &m, sizeof(m),
+                           pdMS_TO_TICKS(50), ITS_WAIT_PICKUP);
+}
+
+bool rnsdSeedPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+                    const uint8_t pubkey[RNSD_PUBKEY_LEN])
+{
+    if (!dest_hash || !pubkey) return false;
+    rnsd_dir_aux_t m = {};
+    m.op = RNSD_DIR_OP_SEED_PUBKEY;
+    std::memcpy(m.dest,   dest_hash, RNSD_DEST_HASH_LEN);
+    std::memcpy(m.pubkey, pubkey,    RNSD_PUBKEY_LEN);
+    dirSendAux(m);
+    return true;
+}
+
+void rnsdClaim(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
+               uint8_t consumer, uint8_t klass, uint8_t layers, uint32_t decay_s)
+{
+    if (!dest_hash) return;
+    rnsd_dir_aux_t m = {};
+    m.op       = RNSD_DIR_OP_CLAIM;
+    m.consumer = consumer;
+    m.klass    = klass;
+    m.layers   = layers;
+    m.decay_s  = decay_s;
+    std::memcpy(m.dest, dest_hash, RNSD_DEST_HASH_LEN);
+    dirSendAux(m);
+}
+
+void rnsdClaimTouch(const uint8_t dest_hash[RNSD_DEST_HASH_LEN], uint8_t consumer)
+{
+    if (!dest_hash) return;
+    rnsd_dir_aux_t m = {};
+    m.op       = RNSD_DIR_OP_CLAIM_TOUCH;
+    m.consumer = consumer;
+    std::memcpy(m.dest, dest_hash, RNSD_DEST_HASH_LEN);
+    dirSendAux(m);
+}
+
+void rnsdClaimDrop(const uint8_t dest_hash[RNSD_DEST_HASH_LEN], uint8_t consumer)
+{
+    if (!dest_hash) return;
+    rnsd_dir_aux_t m = {};
+    m.op       = RNSD_DIR_OP_CLAIM_DROP;
+    m.consumer = consumer;
+    std::memcpy(m.dest, dest_hash, RNSD_DEST_HASH_LEN);
+    dirSendAux(m);
 }
 
 bool rnsdRecallAppData(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
@@ -5724,10 +6178,8 @@ static void onCreqResponse(TaskHandle_t /*sender*/, const void* data, size_t len
          * controls folded to '.') + ellipsis. No full-page dump in the log. */
         const uint8_t* b = (const uint8_t*)d.buf;
         size_t hx = d.len < 12 ? d.len : 12;
-        std::string frag;
         size_t fn = d.len < 56 ? d.len : 56;
-        for (size_t i = 0; i < fn; ++i)
-            frag += (b[i] < 0x20 || b[i] == 0x7f) ? '.' : (char)b[i];
+        std::string frag = logSafe(b, fn);
         info("creq: RESPONSE %uB (cid=%u) hex=%s%s text=\"%s%s\"",
              (unsigned)d.len, (unsigned)d.opaque_id,
              RNS::Bytes(b, hx).toHex().c_str(), d.len > hx ? "…" : "",
@@ -6165,6 +6617,12 @@ static void rnsdTaskMain(void*)
     signalFlag("rns.ready");   /* wake any iface/client still on the legacy barrier */
     info("rns: ready to engage (uptime %lu ms)\n", (unsigned long)millis());
 
+    /* The directory store comes up before anything else can touch it: Transport's
+     * first path lookup and every announce ingest read it, and the client tasks
+     * rnsStart() releases assert their claims into it the moment they run. Its
+     * image is loaded here, not by µR. */
+    rnsdDirUp();
+
     /* Bring the ecosystem up from one place: rnsStart() walks every registered
      * iface/client start hook in dependency (registration) order and sets
      * rnsd.up=1. Registration ran during serviceRunInit, long before the boot
@@ -6175,14 +6633,7 @@ static void rnsdTaskMain(void*)
      * current stored value, or the fallback default if unset) and re-applies
      * on later `set`. Fallbacks are the working defaults; operators override
      * via `set s.rnsd.*`. No storageDefault — silent defaults wouldn't fire a
-     * subscription, and the fallback in each read already covers "unset".
-     *
-     * Identity cache: 100 is too small for busy testnet traffic — entries get
-     * evicted before we can probe them even though the path table still has the
-     * route, so Identity::recall fails and rnprobe can't proceed. Default 1000. */
-    NOW_AND_ON_CHANGE("s.rnsd.identity.cache_max", {
-        RNS::Identity::known_destinations_maxsize(storageGetInt(key, 1000));
-    });
+     * subscription, and the fallback in each read already covers "unset". */
     /* Delivery-proof dial (see the our-dest-dest comment). Consumer dests stay
      * PROVE_NONE at the RNS layer; this only toggles whether the hand-off
      * callbacks (onOurDestInbound / onLinkPacketCb) prove after delivering a
@@ -6216,6 +6667,20 @@ static void rnsdTaskMain(void*)
     });
     NOW_AND_ON_CHANGE("s.rnsd.path.ttl_roaming", {
         RNS::Transport::roaming_path_time(storageGetInt(key, 3600));
+    });
+    /* Destinations we are custodian of — reached via an interface whose policy
+     * says we route for it — outlive ones we merely heard announced. */
+    NOW_AND_ON_CHANGE("s.rnsd.path.ttl_custody", {
+        RNS::Transport::custody_path_time(storageGetInt(key, 86400));
+    });
+    /* Cheapest-first discovery: how long a path request we originated waits on
+     * the cheap interfaces before it is also asked of the expensive ones, and
+     * where the line between the two falls. */
+    NOW_AND_ON_CHANGE("s.rnsd.path.escalate_s", {
+        RNS::Transport::path_escalate_time(storageGetInt(key, 3));
+    });
+    NOW_AND_ON_CHANGE("s.rnsd.path.cheap_bps", {
+        RNS::Transport::path_cheap_bitrate(storageGetInt(key, 50000));
     });
     /* jobs() cadence + table-cull cadence. */
     NOW_AND_ON_CHANGE("s.rnsd.jobs_interval_ms", {
@@ -6284,6 +6749,15 @@ static void rnsdTaskMain(void*)
             rnsdProbeDestUp();
         storageSubscribeChanges("s.rnsd.respond_to_probes",
                                 onRespondToProbesChange);
+
+        /* µR's per-call step narration. `log rnsd verbose` otherwise means a
+         * dozen lines per packet — enough, on a busy TCP link, to be the load
+         * rather than to describe it. Verbose alone now gives one line per
+         * event; this switch adds the steps inside them, and flips live. */
+        RNS::trace_enabled(storageGetInt("s.rnsd.log.trace", 0) != 0);
+        storageSubscribeChanges("s.rnsd.log.trace", [](const char*, const char* val) {
+            RNS::trace_enabled(val && atoi(val) != 0);
+        });
 
         /* Async-path-request endpoint for the rnsd.h API. Callers
          * write `rnsd.cmd.request_path = <32-hex>`; we process it on
@@ -6370,13 +6844,26 @@ static void rnsdTaskMain(void*)
                     jobsDeferred++;
                 } else {
                     jobsDeferred = 0;
+                    /* The sweep is unyieldy: it holds the core for its whole
+                     * duration, and every task it shares core 0 with — the
+                     * storage actor, the interfaces feeding this task — is at
+                     * the same priority, so none of them runs until it
+                     * returns. From over there that is indistinguishable from
+                     * a storage stall or a wedged consumer. Time it so the
+                     * sweep accuses itself instead. */
+                    int64_t jt0 = esp_timer_get_time();
                     try { RNS::Transport::jobs(); }
                     catch (const std::exception& e) { warn("Transport::jobs threw: %s", e.what()); }
+                    int64_t jus = esp_timer_get_time() - jt0;
+                    if (jus >= 200000)
+                        warn("jobs() ran %lldms — every lower-priority task on "
+                             "core 0 was frozen for it", jus / 1000);
                 }
                 ourDestTickPending();
                 ourDestReceiptTick();
                 linkTick();
                 channelTick();
+                rnsdDirPersistTick(now);
 
                 /* Rnsd-hosted announces — debounce fire + periodic check.
                  * sendProbeAnnounce() is a no-op when the destination is
@@ -6538,8 +7025,24 @@ void RnsdService::onInit()
     cliRegisterCmd("rnpath",   cliRnpath);
     cliRegisterCmd("rnprobe",  cliRnprobe);
 
-    /* PSRAM stack, core 0 alongside tcpip_thread, prio 2. */
-    s_task = spawnTask(rnsdTaskMain, TAG, 12288, nullptr, 2, 0, STACK_PSRAM);
+    /* PSRAM stack, core 0 alongside tcpip_thread, prio 1 — the one tier the whole
+     * RNS ecosystem and every other processing task on this core (storage, lxmf,
+     * nomad, web) share; see the lifecycle block in rnsd.h for why the pipeline
+     * is flat.
+     *
+     * Transport is not a driver. The interfaces drain the socket or the radio and
+     * hand packets here over ITS, and what happens next — announce parse, path
+     * table, directory insert and eviction — is unbounded per burst. Above the
+     * processing tier that work would not merely go first, it would go to
+     * completion: a firehose of announces holding core 0 for the length of the
+     * burst with everything else stopped for it, config writes and browser mirror
+     * included. At the same priority the 100 Hz tick round-robins the burst
+     * against its peers in 10 ms slices, which is the granularity those peers
+     * already poll at. Latency here is queueing, not loss: back-pressure lands in
+     * the announce queue and the interface queues, where dropping the surplus of
+     * a firehose is the correct outcome — announces are periodic and the
+     * catalogue they feed is a bounded RAM cache. */
+    s_task = spawnTask(rnsdTaskMain, TAG, 12288, nullptr, 1, 0, STACK_PSRAM);
 
     /* The clink smoke consumer is a test-only task: it is spawned on demand by
      * clinkEnsureTask() the first time an `rnsd clink`/`creq` command runs, and

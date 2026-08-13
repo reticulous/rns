@@ -31,9 +31,15 @@ kconfig:
   # Identity, Packet, Cryptography, Persistence raises std::invalid_argument /
   # std::runtime_error. The platform default disables exceptions for code size
   # (CONFIG_COMPILER_CXX_EXCEPTIONS=n); re-enable here. Cost ~30 KB + libstdc++
-  # unwinder tables. EMG_POOL_SIZE=0 = no emergency throw pool.
+  # unwinder tables.
+  #
+  # The emergency pool must be non-zero. __cxa_throw allocates the per-thread
+  # exception globals; with no pool it cannot, and eh_globals.cc calls
+  # std::terminate() directly — so every std::bad_alloc aborts the device and
+  # each `catch (const std::bad_alloc&)` in the tree is unreachable. 2048 B is
+  # enough for the globals plus one in-flight exception object.
   - CONFIG_COMPILER_CXX_EXCEPTIONS=y
-  - CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0
+  - CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=2048
   # mbedTLS HKDF — used by µR's Cryptography/HKDF.cpp (key derivation for
   # Fernet, IFAC, Identity prove/verify). Off by default in IDF.
   - CONFIG_MBEDTLS_HKDF_C=y

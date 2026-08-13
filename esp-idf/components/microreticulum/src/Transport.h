@@ -19,6 +19,7 @@
 #include "Type.h"
 #include "Utilities/Memory.h"
 #include "Persistence/DestinationEntry.h"
+#include "Directory.h"
 
 #include <map>
 #include <vector>
@@ -52,15 +53,30 @@ namespace RNS {
 		// None, all announces will be passed to the instance.
 		// If only some announces are wanted, it can be set to
 		// an aspect string.
-		AnnounceHandler(const char* aspect_filter = nullptr) { if (aspect_filter != nullptr) _aspect_filter = aspect_filter; }
+		AnnounceHandler(const char* aspect_filter = nullptr);
+		virtual ~AnnounceHandler() {}
 		// This method will be called by Reticulums Transport
 		// system when an announce arrives that matches the
 		// configured aspect filter. Filters must be specific,
 		// and cannot use wildcards.
-		virtual void received_announce(const Bytes& destination_hash, const Identity& announced_identity, const Bytes& app_data) = 0;
+		//
+		// `name_hash` is the aspect hash the announce itself carries — a pure
+		// function of the aspect text, independent of who announced. Handlers
+		// that classify announces compare against a value precomputed once,
+		// rather than hashing per announce.
+		//
+		// `hops` is the announce's own hop count. It is passed rather than
+		// looked up because a handler runs for every announce, while a route is
+		// only stored for the ones this node retains — asking the routing layer
+		// would report "unreachable" for everything heard on an interface that
+		// forwards without keeping.
+		virtual void received_announce(const Bytes& destination_hash, const Identity& announced_identity, const Bytes& app_data, const Bytes& name_hash, uint8_t hops) = 0;
 		std::string& aspect_filter() { return _aspect_filter; }
+		// The aspect filter compiled to its name hash, once, at construction.
+		const Bytes& name_hash_filter() const { return _name_hash_filter; }
 	private:
 		std::string _aspect_filter;
+		Bytes _name_hash_filter;
 	};
 	using HAnnounceHandler = std::shared_ptr<AnnounceHandler>;
 
@@ -118,38 +134,57 @@ namespace RNS {
 		};
 		using PacketTable = std::map<Bytes, PacketEntry>;
 
-		// CBA TODO Analyze safety of using Inrerface references here
-		// CBA TODO Analyze safety of using Packet references here
-		class AnnounceEntry {
-		public:
-			AnnounceEntry(double timestamp, double retransmit_timeout, uint8_t retries, const Bytes& received_from, uint8_t hops, const Packet& packet, uint8_t local_rebroadcasts, bool block_rebroadcasts, const Interface& attached_interface) :
-				_timestamp(timestamp),
-				_retransmit_timeout(retransmit_timeout),
-				_retries(retries),
-				_received_from(received_from),
-				_hops(hops),
-				_packet(packet),
-				_local_rebroadcasts(local_rebroadcasts),
-				_block_rebroadcasts(block_rebroadcasts),
-				_attached_interface(attached_interface)
-			{
-			}
-		public:
-			double _timestamp = 0;
-			double _retransmit_timeout = 0;
-			uint8_t _retries = 0;
-			const Bytes _received_from;
-			uint8_t _hops = 0;
-			// CBA Storing packet reference causes memory issues, presumably because orignal packet is being destroyed
-			//  MUST use instance instad of reference!!!
-			//const Packet& _packet;
-			const Packet _packet = {Type::NONE};
-			uint8_t _local_rebroadcasts = 0;
-			bool _block_rebroadcasts = false;
-			const Interface _attached_interface = {Type::NONE};
+		/* The announce retransmission queue.
+		 *
+		 * This is a work queue, not a cache: an entry exists to be emitted a
+		 * bounded number of times and then leave. That is why it keeps its own
+		 * storage rather than referencing the directory's blob pool — the two
+		 * hold opposite sets. An announce lands here when we are FORWARDING for
+		 * someone else, which on a gateway is exactly the traffic the retention
+		 * policy declines to keep; and blob slots are evicted under pressure at
+		 * any moment, which a queue entry cannot survive.
+		 *
+		 * One fixed-slot ring, allocated once. Each record carries the announce
+		 * payload inline and names its interfaces by hash prefix instead of
+		 * holding handles, so an entry costs a flat `sizeof(AnnounceRec)` with
+		 * no allocation, no map nodes, and nothing to run out of mid-burst. The
+		 * `Packet` copies this replaced held nine separate `Bytes` each, every
+		 * one of them its own heap block.
+		 *
+		 * The data field is sized so an announce is never refused: the largest
+		 * payload that can reach us is one MTU minus the biggest header. */
+		static constexpr size_t ANNOUNCE_DATA_MAX =
+			((Type::Reticulum::MTU - Type::Reticulum::HEADER_MAXSIZE) + 3) & ~(size_t)3;
+
+		enum : uint8_t {
+			ANNOUNCE_F_USED     = 0x01,
+			ANNOUNCE_F_BLOCK    = 0x02,  /* block_rebroadcasts: emit as PATH_RESPONSE */
+			ANNOUNCE_F_ATTACHED = 0x04,  /* attached_iface names one interface, else all */
+			/* An announce that arrived while a path request for the same
+			 * destination was being served waits here and is re-armed once the
+			 * response has gone out. A flag, not a second table: the only thing
+			 * that ever differed was which of the two was due next. */
+			ANNOUNCE_F_HELD     = 0x08,
 		};
-		//using AnnounceTable = std::map<Bytes, AnnounceEntry>;
-		using AnnounceTable = std::map<Bytes, AnnounceEntry, std::less<Bytes>, Utilities::Memory::ContainerAllocator<std::pair<const Bytes, AnnounceEntry>>>;
+
+#pragma pack(push, 1)
+		struct AnnounceRec {
+			uint8_t  dest[Type::Reticulum::DESTINATION_LENGTH];
+			uint8_t  recv_iface[Type::Reticulum::DESTINATION_LENGTH];
+			uint8_t  attached_iface[Type::Reticulum::DESTINATION_LENGTH];
+			double   timestamp;        /* insertion time; cull ordering */
+			double   retransmit_at;    /* kept a double: the path-request grace is
+			                            * sub-second and must not round to zero */
+			uint16_t data_len;
+			uint8_t  retries;
+			uint8_t  hops;
+			uint8_t  local_rebroadcasts;
+			uint8_t  flags;
+			uint8_t  context_flag;
+			uint8_t  pad;
+			uint8_t  data[ANNOUNCE_DATA_MAX];
+		};
+#pragma pack(pop)
 
 		// CBA TODO Analyze safety of using Inrerface references here
 		class LinkEntry {
@@ -299,6 +334,10 @@ namespace RNS {
 		static void deregister_announce_handler(HAnnounceHandler handler);
 		static bool is_interface_from_hash(const Bytes& interface_hash);
 		static Interface find_interface_from_hash(const Bytes& interface_hash);
+		/* An interface hash is a full SHA-256, but the directory record carries
+		 * only its first 16 bytes — an interface table holds a handful of
+		 * entries, so half a hash separates them with room to spare. */
+		static Interface find_interface_from_hash_prefix(const uint8_t prefix[RDIR_DEST_LEN]);
 		static bool should_cache_packet(const Packet& packet);
 		static bool cache_packet(const Packet& packet, bool force_cache = false);
 		static bool is_cached_packet(const Bytes& packet_hash);
@@ -306,7 +345,17 @@ namespace RNS {
 		static bool clear_cached_packet(const Bytes& packet_hash);
 		static bool cache_request_packet(const Packet& packet);
 		static void cache_request(const Bytes& packet_hash, const Destination& destination);
-		static DestinationEntry& get_path(const Bytes& destination_hash);
+		/* Routing now lives in the directory pool (Directory.h). This is the
+		 * one accessor that turns a stored record into something usable: it
+		 * copies the route out, resolves the receiving interface, and — when
+		 * the stored iface_hash no longer resolves, which happens whenever an
+		 * interface re-registers — clears the record's routing fields and
+		 * reports a miss, so the caller path-requests instead of black-holing.
+		 * Writer-task only, because of that clear. */
+		static bool peek_live_route(const Bytes& destination_hash, rdir_route_t& route, Interface& outbound_interface);
+		/* The lifetime a path learned on (or used over) this interface gets,
+		 * from the runtime-tunable TTLs. */
+		static uint32_t path_ttl_for(const Interface& interface);
 		static bool remove_path(const Bytes& destination_hash);
 		static bool has_path(const Bytes& destination_hash);
 		static uint8_t hops_to(const Bytes& destination_hash);
@@ -353,6 +402,34 @@ namespace RNS {
 		// CBA
 		static void cull_path_table();
 		static void cull_announce_table();
+		static size_t announce_count(bool held);
+		static AnnounceRec* announce_find(const Bytes& destination_hash, bool held);
+		static AnnounceRec* announce_alloc();
+		static void announce_store(AnnounceRec* rec, const Bytes& destination_hash,
+		                           const Packet& packet, double timestamp, double retransmit_at,
+		                           uint8_t retries, uint8_t hops, bool block_rebroadcasts,
+		                           const Interface& attached_interface);
+		/* Could a re-broadcast of this announce leave the node on ANY interface?
+		 * A cheap necessary condition checked before the announce table is
+		 * touched — see the definition for why it is not the whole rule. */
+		static bool announce_relay_possible(const Bytes& destination_hash,
+		                                    const Interface& received_on);
+		/* Could a forwarded path request reach any interface at all? Same
+		 * necessary condition, checked before a discovery entry is booked. */
+		static bool path_search_possible(const Interface& requestor);
+
+		/* Cheapest-first discovery. A path request we originate is our own
+		 * errand, so no transit policy suppresses it — but it need not cost
+		 * airtime to find out that the cheap link knew the answer all along. */
+		static bool interface_is_cheap(const Interface& interface);
+		static void escalate_path_requests(double now);
+
+		static constexpr uint16_t PATH_ESCALATIONS_MAX = 16;
+		struct PathEscalation {
+			uint8_t dest[Type::Reticulum::DESTINATION_LENGTH];
+			double  due;
+			bool    used;
+		};
 
 		// getters/setters
 		static inline void set_receive_packet_callback(Callbacks::receive_packet callback) { _callbacks._receive_packet = callback; }
@@ -361,12 +438,9 @@ namespace RNS {
 		static inline const Reticulum& reticulum() { return _owner; }
 		static inline const Identity& identity() { return _identity; }
 		inline static uint16_t path_table_maxsize() { return _path_table_maxsize; }
-		/* Spangap: deliberately NOT wired to _path_store.set_max_recs — the
-		 * store's own cap eviction removes the lexicographically smallest key
-		 * regardless of age or use, so on a busy mesh destinations with low
-		 * hashes were perpetually evicted, including ones we were actively
-		 * talking to. The cap is instead enforced use-aware by
-		 * cull_path_table() at the announce-insert site. */
+		/* A soft target below the directory pool's own slot count, enforced by
+		 * cull_path_table() at the announce-insert site. The pool size is the
+		 * hard bound; this lets an operator hold the resident set lower. */
 		inline static void path_table_maxsize(uint16_t path_table_maxsize) { _path_table_maxsize = path_table_maxsize; }
 		inline static uint16_t announce_table_maxsize() { return _announce_table_maxsize; }
 		inline static void announce_table_maxsize(uint16_t announce_table_maxsize) { _announce_table_maxsize = announce_table_maxsize; }
@@ -376,16 +450,19 @@ namespace RNS {
 		inline static void max_pr_tags(uint16_t max_pr_tags) { _max_pr_tags = max_pr_tags; }
 		inline static uint16_t path_table_maxpersist() { return _path_table_maxpersist; }
 		inline static void path_table_maxpersist(uint16_t value) { _path_table_maxpersist = value; }
-		inline static uint32_t path_store_segment_size() { return _path_store_segment_size; }
-		inline static void path_store_segment_size(uint32_t value) { _path_store_segment_size = value; }
-		inline static uint8_t path_store_segment_count() { return _path_store_segment_count; }
-		inline static void path_store_segment_count(uint8_t value) { _path_store_segment_count = value; }
-		// Spangap: runtime-tunable path-entry TTLs (seconds). Applied at the
-		// live _new_path_table.put() site; govern age-based path expiry.
+		// Spangap: runtime-tunable path-entry TTLs (seconds). Written into the
+		// directory record's `expires` at ingest; govern age-based path expiry.
 		inline static uint32_t destination_timeout() { return _destination_timeout; }
 		inline static void destination_timeout(uint32_t value) { _destination_timeout = value; }
 		inline static uint32_t ap_path_time() { return _ap_path_time; }
 		inline static void ap_path_time(uint32_t value) { _ap_path_time = value; }
+		/* Lifetime for destinations reached via an interface we route for. */
+		inline static uint32_t custody_path_time() { return _custody_path_time; }
+		inline static void custody_path_time(uint32_t value) { _custody_path_time = value; }
+		inline static uint32_t path_escalate_time() { return _path_escalate_time; }
+		inline static void path_escalate_time(uint32_t value) { _path_escalate_time = value; }
+		inline static uint32_t path_cheap_bitrate() { return _path_cheap_bitrate; }
+		inline static void path_cheap_bitrate(uint32_t value) { _path_cheap_bitrate = value; }
 		inline static uint32_t roaming_path_time() { return _roaming_path_time; }
 		inline static void roaming_path_time(uint32_t value) { _roaming_path_time = value; }
 		// Spangap: runtime-tunable jobs() cadence (seconds).
@@ -397,7 +474,6 @@ namespace RNS {
 		static inline void identity(Identity& identity) { _identity = identity; }
 
 		inline static const PathTable& get_path_table() { return _path_table; }
-		inline static NewPathTable& get_new_path_table() { return _new_path_table; }
 		inline static const RateTable& get_announce_rate_table() { return _announce_rate_table; }
 		inline static const LinkTable& get_link_table() { return _link_table; }
 
@@ -410,9 +486,11 @@ namespace RNS {
 		inline static size_t active_links_count()  { return _active_links.size(); }
 
 		// Spangap: table-size + stat getters for the `rnsd memory` breakdown.
-		inline static size_t path_table_size()     { return _new_path_table.size(); }
-		inline static size_t announce_table_size() { return _announce_table.size(); }
-		inline static size_t held_announces_size() { return _held_announces.size(); }
+		inline static size_t path_table_size()     { return rdirCount(); }
+		inline static size_t announce_table_size() { return announce_count(false); }
+		inline static size_t held_announces_size() { return announce_count(true); }
+		inline static size_t announce_table_slots() { return _announce_slots; }
+		inline static size_t announce_queue_bytes() { return (size_t)_announce_slots * sizeof(AnnounceRec); }
 		inline static size_t hashlist_size()       { return _packet_hashlist.size(); }
 		inline static size_t reverse_table_size()  { return _reverse_table.size(); }
 		inline static size_t link_table_size()     { return _link_table.size(); }
@@ -436,11 +514,11 @@ namespace RNS {
 		static std::set<Bytes> _packet_hashlist;	// A list of packet hashes for duplicate detection
 		static std::list<PacketReceipt> _receipts;	// Receipts of all outgoing packets for proof processing
 
-		static AnnounceTable _announce_table;	// A table for storing announces currently waiting to be retransmitted
+		static AnnounceRec* _announce_ring;		// Announces waiting to be retransmitted
+		static uint16_t _announce_slots;		// Ring capacity, fixed at start()
 		static PathTable _path_table;			// A lookup table containing the next hop to a given destination
 		static ReverseTable _reverse_table;		// A lookup table for storing packet hashes used to return proofs and replies
 		static LinkTable _link_table;			// A lookup table containing hops for links
-		static AnnounceTable _held_announces;	// A table containing temporarily held announce-table entries
 		static TunnelTable _tunnels;			// A table storing tunnels to other transport instances
 		static RateTable _announce_rate_table;	// A table for keeping track of announce rates
 		static std::set<HAnnounceHandler> _announce_handlers;	// A table storing externally registered announce handlers
@@ -497,6 +575,10 @@ namespace RNS {
 		// Spangap: runtime-tunable path TTLs (seeded from Type::Transport)
 		static uint32_t _destination_timeout;
 		static uint32_t _ap_path_time;
+		static uint32_t _custody_path_time;
+		static PathEscalation _path_escalations[PATH_ESCALATIONS_MAX];
+		static uint32_t _path_escalate_time;    /* s.rnsd.path.escalate_s */
+		static uint32_t _path_cheap_bitrate;    /* s.rnsd.path.cheap_bps  */
 		static uint32_t _roaming_path_time;
 
 		static Reticulum _owner;
@@ -515,12 +597,6 @@ namespace RNS {
 
 		// CBA Block re-entrance
 		static bool cleaning_caches;
-
-		// CBA microStore
-		static uint32_t _path_store_segment_size;
-		static uint8_t _path_store_segment_count;
-		static PathStore _path_store;
-		static NewPathTable _new_path_table;
 	};
 
 	template <typename M, typename S> 

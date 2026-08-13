@@ -496,6 +496,18 @@ int BZ_API(BZ2_bzDecompressInit)
                        int        verbosity,
                        int        small )
 {
+   return BZ2_bzDecompressInitBounded ( strm, verbosity, small, 0 );
+}
+
+
+/*---------------------------------------------------*/
+/* Spangap addition — see the header comment in bzlib.h. */
+int BZ_API(BZ2_bzDecompressInitBounded)
+                     ( bz_stream*   strm,
+                       int          verbosity,
+                       int          small,
+                       unsigned int maxOut )
+{
    DState* s;
 
    if (!bz_config_ok()) return BZ_CONFIG_ERROR;
@@ -525,6 +537,16 @@ int BZ_API(BZ2_bzDecompressInit)
    s->tt                    = NULL;
    s->currBlockNo           = 0;
    s->verbosity             = verbosity;
+
+   /* A block's Burrows-Wheeler data is the RLE1 encoding of the bytes that
+      block decodes to, and RLE1 expands by at most 5/4 (a run of exactly
+      four identical bytes becomes those four plus a count byte), so a block
+      yielding no more than maxOut bytes is no longer than 5/4 maxOut. Past
+      720000 that ceiling exceeds bzip2's largest block, where the header
+      digit is always the tighter bound, so leave those unbounded. */
+   s->maxOutBound = (maxOut > 0 && maxOut < 720000)
+                       ? (Int32)(maxOut + maxOut / 4 + 16) : 0;
+   s->nblockLimit = 0;   /* derived from the stream header in BZ2_decompress */
 
    return BZ_OK;
 }
@@ -600,7 +622,7 @@ Bool unRLE_obuf_to_output_FAST ( DState* s )
       UInt32        c_tPos               = s->tPos;
       char*         cs_next_out          = s->strm->next_out;
       unsigned int  cs_avail_out         = s->strm->avail_out;
-      Int32         ro_blockSize100k     = s->blockSize100k;
+      Int32         ro_nblockLimit       = s->nblockLimit;
       /* end restore */
 
       UInt32       avail_out_INIT = cs_avail_out;
