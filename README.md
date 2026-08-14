@@ -314,13 +314,15 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.log.trace` | `0` | Add microReticulum's per-call step narration to `log rnsd verbose`. Off, verbose gives one line per event; on, it narrates the steps inside each one — a dozen lines per packet, which on a busy TCP link is the load rather than a description of it. Flips live. |
 | `s.rnsd.respond_to_probes` | `1` | Host `rnstransport.probe` and answer probes (PROVE_ALL). |
 | `s.rnsd.prove_incoming` | `1` | Emit delivery proofs for inbound packets we receive. |
-| `s.rnsd.proof_timeout_s` | `60` | Deadline for an outbound delivery-proof receipt. |
+| `s.rnsd.proof_timeout_s` | `60` | Deadline for an outbound delivery-proof receipt, stamped onto the µR receipt too so Transport keeps it validatable for exactly as long as rnsd waits. |
 | `s.rnsd.link.path_timeout_s` | `30` | Path-request / link-request retry budget. |
 | `s.rnsd.link.request_timeout_s` | `15` | Request/response (page fetch) timeout. |
 | `s.rnsd.link.max_inbound_resources_total` | `4` | Concurrent inbound Resource cap across all links. |
 | `s.rnsd.its_no_pool` | `0` | Disable the ITS server inbox pool (debug). |
 | `s.lxmf.max_resource_size` | `262144` | Size gate for accepting an inbound Resource. |
 | `s.net.up_wait_s` | `20` | Boot barrier: how long to wait for the network at startup. |
+| `s.rns.boot_min_s` | `10` | Mesh-safety boot window, floor: seconds from boot before the ecosystem may come up and first transmit. Always served — a boot-looping node must not be able to spam the shared medium with re-announces, and nothing cancels this part. |
+| `s.rns.boot_max_s` | `300` | Same window, ceiling: how much longer an *unattended* node holds. Cancelled by `sys.human_detected` — the first keystroke on a console, USB host on the console, screen wake, or click in the web UI drops the rest of the hold, since someone at the controls is not a bootloop. |
 
 ### Runtime state & telemetry (written)
 

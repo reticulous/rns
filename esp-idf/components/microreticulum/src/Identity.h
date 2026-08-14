@@ -106,6 +106,9 @@ namespace RNS {
 		bool validate(const Bytes& signature, const Bytes& message) const;
 		// CBA following default for reference value requires inclusiion of header
 		//void prove(const Packet& packet, const Destination& destination = {Type::NONE}) const;
+		// report_signal appends the rx report after the proof data:
+		// int16 rssi | int16 snr×10 | int8 our tx power (dBm). See
+		// Packet::prove_report.
 		void prove(const Packet& packet, const Destination& destination, bool report_signal = false) const;
 		void prove(const Packet& packet) const;
 

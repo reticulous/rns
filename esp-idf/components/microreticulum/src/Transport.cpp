@@ -2795,10 +2795,10 @@ static const Bytes& ifac_salt() {
 				}
 
 				Bytes proof_hash;
-				// EXPL_LENGTH (+4 for a reticulous rx-report trailer) is an
+				// EXPL_LENGTH (+5 for a reticulous rx-report trailer) is an
 				// explicit proof; the hash is its first HASHLENGTH bytes.
 				if (packet.data().size() == Type::PacketReceipt::EXPL_LENGTH ||
-				    packet.data().size() == Type::PacketReceipt::EXPL_LENGTH + 4) {
+				    packet.data().size() == Type::PacketReceipt::EXPL_LENGTH + 5) {
 					proof_hash = packet.data().left(Type::Identity::HASHLENGTH/8);
 				}
 
@@ -2854,6 +2854,17 @@ static const Bytes& ifac_salt() {
 				// CBA since modifying of collection while iterating is forbidden
 				for (auto& receipt : cull_receipts) {
 					_receipts.remove(receipt);
+				}
+
+				// A proof nobody was waiting for. Ordinary on a shared medium
+				// (every neighbour's proofs land here too), but it is also what
+				// a proof arriving past its receipt's timeout looks like — the
+				// receipt is culled by then, so the send reports PROOF_TIMEOUT
+				// with the proof sitting plainly in the rx log.
+				if (cull_receipts.empty()) {
+					DEBUGF("Proof for %s matched none of %u outstanding receipt(s)",
+						packet.destination_hash().toHex().c_str(),
+						(unsigned)_receipts.size());
 				}
 			}
 		}

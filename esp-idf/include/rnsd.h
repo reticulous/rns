@@ -291,16 +291,17 @@ void rnsdDropPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
 
 /* ──────────────── rx-signal-report capability ────────────────
  *
- * A reticulous node can append its own rx signal (rssi/snr) to the delivery
- * proof it emits for a direct radio message, so the sender learns how well it
- * was heard (the "extended proof", Packet::prove_report). A vanilla RNS node
- * would length-reject that longer proof, so rnsd only emits it to peers KNOWN
- * to accept it — those that advertised the rx-report capability (LXMF announce
- * caps bit1). lxmf owns that knowledge (it parses announces); rnsd owns the
- * proof path. These two calls bridge the two: lxmf records the capability per
- * peer here, rnsd consults it when proving. Receiving an rx report is
- * unconditional — we accept and process reports from anyone; the capability
- * gates only what WE emit. */
+ * A reticulous node can append its own rx signal (rssi/snr) and antenna tx
+ * power to the delivery proof it emits for a direct radio message, so the
+ * sender learns how well it was heard and at what power the answer left (the
+ * "extended proof", Packet::prove_report). A vanilla RNS node would
+ * length-reject that longer
+ * proof, so rnsd only emits it to peers KNOWN to accept it — those that
+ * advertised the rx-report capability (LXMF announce caps bit1). lxmf owns that
+ * knowledge (it parses announces); rnsd owns the proof path. These two calls
+ * bridge the two: lxmf records the capability per peer here, rnsd consults it
+ * when proving. Receiving an rx report is unconditional — we accept and process
+ * reports from anyone; the capability gates only what WE emit. */
 
 /** Record whether the peer at `dest_hash` (its lxmf.delivery destination hash)
  *  accepts rx-signal-report delivery proofs. Set from each parsed announce

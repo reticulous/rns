@@ -521,18 +521,29 @@ void Identity::prove(const Packet& packet, const Destination& destination /*= {T
 		proof_data = packet.packet_hash() + signature;
 		TRACEF("Identity::prove: explicit proof data: %s", proof_data.toHex().c_str());
 	}
-	// Reticulous "rx report": append our own rx signal of the proven packet
-	// (int16 rssi dBm | int16 snr×10, big-endian) AFTER the proof data, outside
-	// the signature (which covers only packet_hash). Only when asked and we have
-	// a radio reading. A vanilla receiver ignores or length-rejects the longer
-	// proof; a reticulous receiver reads it as the remote reading for the message
-	// this proves. See Packet::prove_report and PacketReceipt::validate_proof.
+	// Reticulous "rx report": append our own rx of the proven packet AFTER the
+	// proof data, outside the signature (which covers only packet_hash) —
+	// int16 rssi dBm | int16 snr×10 | int8 antenna tx power dBm, big-endian.
+	// Only when asked and we have a radio reading.
+	//
+	// The tx power is that of the interface the proven packet arrived on — the
+	// same radio this proof leaves by — so the far end can pair the rssi it
+	// measures on this proof with the power that produced it and read the path
+	// loss directly. INT8_MIN when the interface has no such notion.
+	//
+	// A vanilla receiver length-rejects the longer proof, which is why rnsd
+	// sends it only to peers that advertised the capability. See
+	// Packet::prove_report and PacketReceipt::validate_proof.
 	if (report_signal && !Type::isNan(packet.rssi())) {
 		auto rnd = [](float x) -> int16_t { return (int16_t)(x < 0 ? x - 0.5f : x + 0.5f); };
 		int16_t r = rnd(packet.rssi());
 		int16_t s = Type::isNan(packet.snr()) ? 0 : rnd(packet.snr() * 10.0f);
-		uint8_t tail[4] = { (uint8_t)((uint16_t)r >> 8), (uint8_t)r,
-		                    (uint8_t)((uint16_t)s >> 8), (uint8_t)s };
+		int txp = packet.receiving_interface()
+		        ? packet.receiving_interface().tx_power_dbm() : INT8_MIN;
+		if (txp < INT8_MIN || txp > INT8_MAX) txp = INT8_MIN;
+		uint8_t tail[5] = { (uint8_t)((uint16_t)r >> 8), (uint8_t)r,
+		                    (uint8_t)((uint16_t)s >> 8), (uint8_t)s,
+		                    (uint8_t)(int8_t)txp };
 		proof_data << Bytes(tail, sizeof(tail));
 	}
 

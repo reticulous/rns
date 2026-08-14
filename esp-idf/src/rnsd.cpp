@@ -544,6 +544,10 @@ static int onTransportConnect(int handle, const void* data, size_t len)
     std::shared_ptr<RNS::InterfaceImpl> impl =
         std::make_shared<TaskInterface>(slot->info, handle);
     slot->mr_iface = RNS::Interface(impl);
+    /* Antenna transmit power, for the rx-report proof to state alongside the
+     * signal a peer measures. INT8_MIN when this interface has no such notion. */
+    slot->mr_iface.tx_power_dbm(slot->info.tx_power_known
+                                ? (int)slot->info.tx_power_dbm : INT8_MIN);
     /* Apply IFAC (Interface Access Codes) before registering, so the very
      * first packet on this iface is access-coded. No-op when both strings
      * are empty (open interface). */
@@ -755,9 +759,10 @@ static void ourDestSendOutResult(our_dest_t& c, uint16_t send_id,
                                  const char* iface = nullptr,
                                  bool has_signal = false,
                                  int16_t local_rssi = INT16_MIN, int16_t local_snr = 0,
-                                 int16_t remote_rssi = INT16_MIN, int16_t remote_snr = 0)
+                                 int16_t remote_rssi = INT16_MIN, int16_t remote_snr = 0,
+                                 int8_t local_txp = INT8_MIN, int8_t remote_txp = INT8_MIN)
 {
-    uint8_t f[9 + RNSD_DEST_HASH_LEN + 1 + 24 + 8];   /* +8 = optional signal trailer */
+    uint8_t f[9 + RNSD_DEST_HASH_LEN + 1 + 24 + 10];  /* +10 = optional signal trailer */
     f[0] = RNSD_DEST_OUT_RESULT;
     f[1] = (uint8_t)(send_id >> 8);
     f[2] = (uint8_t)(send_id & 0xFF);
@@ -777,16 +782,23 @@ static void ourDestSendOutResult(our_dest_t& c, uint16_t send_id,
         memcpy(f + len, iface, ilen);
         len += ilen;
     }
-    /* Optional signal trailer (the DELIVERED result): local(2+2) | remote(2+2),
-     * int16 BE each — rssi in dBm (INT16_MIN = absent), snr in dB×10. `local` is
-     * our rx of the proof packet; `remote` is the peer's rx of our message (from
-     * the rx-report proof). The consumer parses it by status, so it never
-     * collides with the first_hop/iface trailer carried on the SENT result. */
+    /* Optional signal trailer (the DELIVERED result): local(2+2) | remote(2+2) |
+     * local_txp(1) | remote_txp(1). The rssi/snr pairs are int16 BE — rssi in dBm
+     * (INT16_MIN = absent), snr in dB×10; the tx powers are int8 dBm at the
+     * antenna (INT8_MIN = unknown). `local` is our rx of the proof packet and our
+     * own tx power on the radio it came back by; `remote` is the peer's rx of our
+     * message and its tx power, both from the rx-report proof. Each side's tx
+     * power pairs with the OTHER side's rssi to give that direction's path loss.
+     * The consumer parses this by status, so it never collides with the
+     * first_hop/iface trailer carried on the SENT result. Fixed width: an
+     * unknown figure is INT8_MIN / INT16_MIN, never an absent field. */
     if (has_signal) {
         f[len++] = (uint8_t)((uint16_t)local_rssi  >> 8); f[len++] = (uint8_t)local_rssi;
         f[len++] = (uint8_t)((uint16_t)local_snr   >> 8); f[len++] = (uint8_t)local_snr;
         f[len++] = (uint8_t)((uint16_t)remote_rssi >> 8); f[len++] = (uint8_t)remote_rssi;
         f[len++] = (uint8_t)((uint16_t)remote_snr  >> 8); f[len++] = (uint8_t)remote_snr;
+        f[len++] = (uint8_t)local_txp;
+        f[len++] = (uint8_t)remote_txp;
     }
     if (itsSend(c.handle, f, len, pdMS_TO_TICKS(100)) == 0)
         warn("our-dest: OUT_RESULT send dropped (send_id=%u)", (unsigned)send_id);
@@ -922,11 +934,29 @@ struct our_dest_receipt_t {
     int                conn_handle;  /* guards conn-slot reuse */
     uint16_t           send_id;
     uint8_t            hops;
+    double             sent_at;      /* OS::time() at egress — names the wait in the log */
     double             deadline;     /* OS::time() backstop */
     RNS::PacketReceipt receipt{RNS::Type::NONE};
 };
 
 static our_dest_receipt_t* s_our_dest_receipts = nullptr;
+
+/* Seconds rnsd waits for a delivery proof, and the timeout it stamps on the µR
+ * receipt so both agree. µR's own default is a per-hop airtime estimate — one
+ * MTU transmission plus 6 s — which models neither the peer's turnaround nor
+ * the CSMA backoff its proof waits through. When that expires first, µR's
+ * Transport::jobs culls the receipt from the list Transport::inbound validates
+ * proofs against, and a proof arriving afterwards matches nothing: the send
+ * reports PROOF_TIMEOUT with the proof plainly visible in the interface log.
+ * Whoever holds the receipt therefore sets its timeout to the window they
+ * actually wait out. */
+static int rnsdProofWindowS(void)
+{
+    int s = storageGetInt("s.rnsd.proof_timeout_s", 60);
+    if (s < 1)     s = 1;
+    if (s > 32767) s = 32767;   /* PacketReceipt::set_timeout takes int16_t */
+    return s;
+}
 
 static void ourDestReceiptFree(our_dest_receipt_t& r)
 {
@@ -946,7 +976,8 @@ static void ourDestReceiptSettle(our_dest_receipt_t& r, uint8_t status,
                                  uint32_t rtt_ms,
                                  bool has_signal = false,
                                  int16_t local_rssi = INT16_MIN, int16_t local_snr = 0,
-                                 int16_t remote_rssi = INT16_MIN, int16_t remote_snr = 0)
+                                 int16_t remote_rssi = INT16_MIN, int16_t remote_snr = 0,
+                                 int8_t local_txp = INT8_MIN, int8_t remote_txp = INT8_MIN)
 {
     int      conn_idx    = r.conn_idx;
     int      conn_handle = r.conn_handle;
@@ -956,7 +987,8 @@ static void ourDestReceiptSettle(our_dest_receipt_t& r, uint8_t status,
     our_dest_t& c = s_our_dests[conn_idx];
     if (c.used && c.handle == conn_handle)
         ourDestSendOutResult(c, send_id, status, rtt_ms, hops, nullptr, nullptr,
-                             has_signal, local_rssi, local_snr, remote_rssi, remote_snr);
+                             has_signal, local_rssi, local_snr, remote_rssi, remote_snr,
+                             local_txp, remote_txp);
 }
 
 /* mR delivery callback — runs on the rnsd task during Transport proof
@@ -986,9 +1018,16 @@ static void onOurDestReceiptDelivery(const RNS::PacketReceipt& receipt)
         int16_t lr, ls, rr, rs;
         rnsdSignalToInt16(receipt.rssi(),        receipt.snr(),        lr, ls);
         rnsdSignalToInt16(receipt.remote_rssi(), receipt.remote_snr(), rr, rs);
+        /* Antenna tx powers alongside: ours on the radio the proof came back by,
+         * the peer's from its rx report. Each is the counterpart of the
+         * OTHER end's rssi above, which is what makes the pair a path loss. */
+        auto clampTxp = [](int v) -> int8_t {
+            return (v < INT8_MIN || v > INT8_MAX) ? (int8_t)INT8_MIN : (int8_t)v; };
+        int8_t ltx = clampTxp(receipt.local_txp());
+        int8_t rtx = clampTxp(receipt.remote_txp());
         bool has_signal = (lr != INT16_MIN) || (rr != INT16_MIN);
         ourDestReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED, rtt_ms,
-                             has_signal, lr, ls, rr, rs);
+                             has_signal, lr, ls, rr, rs, ltx, rtx);
         return;
     }
 }
@@ -1011,14 +1050,16 @@ static void ourDestReceiptTrack(our_dest_t& c, uint16_t send_id,
              (unsigned)slot->send_id);
         ourDestReceiptSettle(*slot, RNSD_DEST_STATUS_PROOF_TIMEOUT, 0);
     }
+    const int window  = rnsdProofWindowS();
     slot->used        = true;
     slot->conn_idx    = (int)(&c - s_our_dests);
     slot->conn_handle = c.handle;
     slot->send_id     = send_id;
     slot->hops        = hops;
-    slot->deadline    = RNS::Utilities::OS::time()
-                      + storageGetInt("s.rnsd.proof_timeout_s", 60);
+    slot->sent_at     = RNS::Utilities::OS::time();
+    slot->deadline    = slot->sent_at + window;
     slot->receipt     = receipt;
+    receipt.set_timeout((int16_t)window);
     receipt.set_delivery_callback(onOurDestReceiptDelivery);
 }
 
@@ -1041,8 +1082,11 @@ static void ourDestReceiptTick(void)
             /* FAILED/CULLED — mR's own receipt timeout (Transport's sweep
              * flips status but never fires timeout callbacks) — or our
              * wall-clock backstop. Not a failure: the packet may well have
-             * arrived; the peer just didn't prove it (in time). */
-            info("our-dest: send_id=%u no delivery proof", (unsigned)r.send_id);
+             * arrived; the peer just didn't prove it (in time). The waited
+             * time is named because a proof landing just past it is the
+             * signature of a window that is too short for the link. */
+            info("our-dest: send_id=%u no delivery proof after %.1fs",
+                 (unsigned)r.send_id, now - r.sent_at);
             ourDestReceiptSettle(r, RNSD_DEST_STATUS_PROOF_TIMEOUT, 0);
         }
     }
@@ -4300,9 +4344,10 @@ static void linkTrackTxReceipt(link_conn_t& c, const RNS::PacketReceipt& receipt
          * counters always account for every tracked send. */
         linkBumpInt(c, "proof_timeouts");
     }
+    const int window = rnsdProofWindowS();
     c.tx_receipt = receipt;
-    c.tx_receipt_deadline = RNS::Utilities::OS::time()
-                          + storageGetInt("s.rnsd.proof_timeout_s", 60);
+    c.tx_receipt.set_timeout((int16_t)window);
+    c.tx_receipt_deadline = RNS::Utilities::OS::time() + window;
 }
 
 static void linkPublishState(link_conn_t& c)
@@ -6392,31 +6437,31 @@ static void clinkEnsureTask()
 
 /* Mesh-safety boot window — holds RNS offline before it may first transmit, so a
  * brownout/boot-looping node can't spam the shared medium with re-announces.
- * Always serves s.rns.boot_min_s; then holds up to s.rns.boot_max_s (default
- * 5 min) — the wild-mesh safeguard — but cuts that short the instant a USB-serial
- * host enumerates, since a developer on a cable isn't a bootloop. Measured from
- * boot (uptime); delay() light-sleeps between the 1 Hz USB checks, so the wait
- * itself costs almost nothing. */
+ * Always serves s.rns.boot_min_s, human present or not; then holds up to
+ * s.rns.boot_max_s (default 5 min) — the wild-mesh safeguard — and drops that
+ * hold the moment `sys.human_detected` says somebody is at the controls, since
+ * an attended device isn't a bootloop. Every input path feeds that flag (a
+ * keystroke on any console, a USB host enumerating, a woken screen, a click in
+ * the browser UI), so the hold ends on the first sign of a person. Measured from
+ * boot (uptime); both waits light-sleep, so the window itself costs nothing. */
 static void rnsBootWindow(void) {
     uint32_t min_ms = (uint32_t)storageGetInt("s.rns.boot_min_s", 10) * 1000;
     uint32_t max_ms = (uint32_t)storageGetInt("s.rns.boot_max_s", 300) * 1000;
     if (max_ms < min_ms) max_ms = min_ms;
-    /* Minimum: always served, USB or not. */
+    /* Minimum: always served. */
     while (millis() < min_ms) {
         uint32_t rem = min_ms - millis();
         delay(pdMS_TO_TICKS(rem > 1000 ? 1000 : rem));
     }
-    /* Maximum: the wild-mesh hold, released early by a USB dev. */
-    while (millis() < max_ms) {
-        if (usb_serial_jtag_is_connected()) {
-            info("rns: boot window released early — USB host present (%lu ms)\n",
-                 (unsigned long)millis());
-            return;
-        }
-        uint32_t rem = max_ms - millis();
-        delay(pdMS_TO_TICKS(rem > 1000 ? 1000 : rem));
-    }
-    info("rns: boot window elapsed (%lu ms)\n", (unsigned long)millis());
+    /* Maximum: the wild-mesh hold, released early by a human. */
+    uint32_t now = millis();
+    if (now >= max_ms) return;
+    int rem_s = (int)((max_ms - now + 999) / 1000);
+    if (waitForFlag("sys.human_detected", rem_s))
+        info("rns: boot window released early — human present (%lu ms)\n",
+             (unsigned long)millis());
+    else
+        info("rns: boot window elapsed (%lu ms)\n", (unsigned long)millis());
 }
 
 static void rnsdTaskMain(void*)

@@ -100,13 +100,16 @@ Our deltas, by category:
 - `Packet.{h,cpp}`/`Identity.{h,cpp}` — **rx-signal report riding the delivery
   proof** (the "extended proof"; see [rnsd §5.7](../../INTERNALS.md)). `Packet::
   prove_report` / `Identity::prove(report_signal=true)` append the prover's own
-  rx signal (`int16 rssi dBm | int16 snr×10`, BE) after the proof data, outside
-  the signature (which covers only the packet hash). `validate_proof` accepts the
-  trailing 4 bytes on both proof forms — `IMPL_LENGTH + 4` (implicit, the default
-  per `should_use_implicit_proof`) and `EXPL_LENGTH + 4` — and `validate_proof_
-  packet` decodes them into new `PacketReceipt::remote_rssi/remote_snr` (which
-  also captures the proof packet's own rssi/snr/hops for the receipt callback).
-  `Transport.cpp`'s proof-hash size check likewise admits `EXPL_LENGTH + 4`.
+  rx signal and antenna tx power (`int16 rssi dBm | int16 snr×10 | int8 txpwr
+  dBm`, BE) after the proof data, outside the signature (which covers only the
+  packet hash). `validate_proof` accepts the trailing 5 bytes on both proof forms
+  — `IMPL_LENGTH + 5` (implicit, the default per `should_use_implicit_proof`) and
+  `EXPL_LENGTH + 5` — and `validate_proof_packet` decodes them into
+  `PacketReceipt::remote_rssi/remote_snr/remote_txp`, stamps `local_txp` from the
+  interface the proof arrived on, and also captures the proof packet's own
+  rssi/snr/hops for the receipt callback. `Transport.cpp`'s proof-hash size check
+  likewise admits `EXPL_LENGTH + 5`. `Interface` carries `tx_power_dbm`
+  (`INT8_MIN` = not a radio) for the driver to fill in.
   **Pitfall:** the trailer is inert to validation (signature covers only the
   hash), but a *vanilla* receiver length-rejects the longer proof — so rnsd only
   emits it under the per-peer negotiation in rnsd §5.7, never blindly.
@@ -716,10 +719,17 @@ bounded 8-entry table (oldest evicted with a synthetic timeout) correlated to
 - `DELIVERED` (1) — the cryptographic proof validated (rtt populated), fired via
   the receipt's delivery callback (resolved by packet hash — µR callbacks carry
   no userdata).
-- `PROOF_TIMEOUT` (5) — no proof before the deadline (µR's receipt timeout,
-  observed by polling, or the `s.rnsd.proof_timeout_s` backstop, default 60).
-  **Not a failure** — the packet may have arrived; the peer may simply not prove
-  or the proof was lost.
+- `PROOF_TIMEOUT` (5) — no proof before the deadline (`s.rnsd.proof_timeout_s`,
+  default 60, observed by polling the receipt status plus a wall-clock
+  backstop). **Not a failure** — the packet may have arrived; the peer may
+  simply not prove or the proof was lost.
+
+  rnsd stamps that same window onto the µR receipt (`set_timeout`). µR's own
+  default is a per-hop airtime estimate — one MTU transmission plus 6 s — which
+  budgets for neither the peer's turnaround nor the CSMA backoff its proof
+  waits through; if it expired first, `Transport::jobs` would cull the receipt
+  from the list `Transport::inbound` validates proofs against, and a proof
+  arriving after that matches nothing. One window, one owner.
 
 **Link packets (`RNSD_PORT_LINK`):** the receipt lives in the link slot
 (consumers serialize sends per link, so one suffices); `linkTick` publishes
@@ -843,22 +853,41 @@ direct packet feeds the per-contact/per-message signal instead, never gw.
 Published as `rnsd.gw.{rssi,snr,timestamp}`; kept as the last qualifying sample.
 
 **Per-message rx reports (the "extended proof").** So a sender can learn how
-well the recipient heard it, a reticulous node appends its own rx signal
-(`int16 rssi dBm | int16 snr×10`, BE) to the delivery proofs it emits for
-messages that reached it **direct** (`hops ≤ 1`) on radio — `Packet::prove_report`
-/ `Identity::prove(report_signal=true)`. The receiver decodes it off the proof
-into `PacketReceipt::remote_rssi/remote_snr` and rnsd forwards local (our rx of
-the proof) + remote (the peer's rx of our message) on the DELIVERED `OUT_RESULT`
-signal trailer, keyed by send_id, for lxmf to attach to the outbound message.
+well the recipient heard it, a reticulous node appends its own rx signal and the
+power it transmits at to the delivery proofs it emits for messages that reached
+it **direct** (`hops ≤ 1`) on radio — `Packet::prove_report` /
+`Identity::prove(report_signal=true)`. The trailer is five bytes, big-endian:
 
-*Interop.* The append lengthens the proof, which a vanilla RNS node would
-length-reject (losing its delivered-tick). So `proveInboundWithReport` emits the
+```
+int16 rssi dBm | int16 snr×10 | int8 txpwr dBm
+```
+
+The last byte is the prover's own antenna transmit power, `INT8_MIN` when its
+receiving interface has no such notion. It is what turns the reported rssi from
+a number into a path loss: the reader already knows what *it* transmitted at, so
+`our txpwr − their rssi` and `their txpwr − our rssi` are the two directions of
+the same link. rnsd feeds the figure to mR at interface registration
+(`rnsd_iface_t.tx_power_known/tx_power_dbm` → `Interface::tx_power_dbm`); the
+LoRa straddle states its configured `tx_power` there, not its adaptive per-peer
+power, because this is a readout for the operator and not a term in any loop.
+
+The receiver decodes the trailer off the proof into
+`PacketReceipt::remote_rssi/remote_snr/remote_txp`, and stamps
+`PacketReceipt::local_txp` from the interface the proof arrived on — the radio
+the proven packet went out by, so each side's power sits beside the other side's
+rssi. rnsd forwards all of it on the DELIVERED `OUT_RESULT` signal trailer
+(`local rssi|snr | remote rssi|snr | local_txp | remote_txp`, fixed width), keyed
+by send_id, for lxmf to attach to the outbound message or to a Ping.
+
+*Interop.* The append lengthens the proof, which a **vanilla** RNS node
+length-rejects (losing its delivered-tick). So `proveInboundWithReport` emits the
 extended proof **only to a peer known to accept it** — one that advertised the
 rx-report capability (LXMF announce caps bit1). lxmf parses that bit and pushes
 it to rnsd via `rnsdSetRxReportCap(dest_hash, capable)`; rnsd keeps it in
 `s_peer_caps` (keyed by the peer's lxmf.delivery hash; RAM-only, reboot-reset)
 and `proveInboundWithReport` reads it back through `rnsdGetRxReportCap` /
-`peerAcceptsRxReport` when it proves an inbound direct radio packet. The table
+`peerAcceptsRxReport` when it proves an inbound direct radio packet. Reception is
+unconditional — we accept a report from anyone. The table
 tracks lxmf **contacts**, not every announcer: lxmf preloads it from stored
 contacts at boot and updates it on contact creation (including the first message
 from a new peer) and on each re-announce — so the set stays bounded and matches

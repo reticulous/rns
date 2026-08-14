@@ -130,6 +130,11 @@ namespace RNS {
 		// prover). See Packet::prove_report / validate_proof.
 		inline float remote_rssi() const { assert(_object); return _object->_remote_rssi; }
 		inline float remote_snr()  const { assert(_object); return _object->_remote_snr; }
+		// Antenna tx power, dBm; INT8_MIN = unknown. local = ours on the radio the
+		// proven packet went out by; remote = the prover's, from a five-byte
+		// rx-report trailer. See validate_proof_packet.
+		inline int local_txp()  const { assert(_object); return _object->_local_txp; }
+		inline int remote_txp() const { assert(_object); return _object->_remote_txp; }
 		inline const Bytes& truncated_hash() const { assert(_object); return _object->_truncated_hash; }
 		inline const Callbacks& callbacks() const { assert(_object); return _object->_callbacks; }
 
@@ -167,6 +172,13 @@ namespace RNS {
 			// the packet we sent); decoded from the proof's trailing 4 bytes.
 			float _remote_rssi = Type::NaN<float>;
 			float _remote_snr  = Type::NaN<float>;
+			// Antenna tx power in dBm, INT8_MIN = unknown. _local_txp is our own
+			// on the interface the proof arrived by (the radio that carried the
+			// proven packet out); _remote_txp is the prover's, from a five-byte
+			// rx-report trailer. Each pairs with the OTHER end's rssi to give the
+			// path loss for that direction.
+			int _local_txp  = INT8_MIN;
+			int _remote_txp = INT8_MIN;
 		friend class PacketReceipt;
 		};
 		std::shared_ptr<Object> _object;
@@ -253,13 +265,14 @@ namespace RNS {
 		PacketReceipt send();
 		bool resend();
 		void prove(const Destination& destination = {Type::NONE});
-		// Like prove(), but appends this packet's own rx signal (int16 rssi dBm |
-		// int16 snr×10, big-endian) after the proof data, outside the signature.
-		// The reticulous receiver reads it as the "remote" reading for the message
-		// this proves; a vanilla receiver length-rejects the longer proof (which is
-		// why rnsd only sends it alongside a plain prove() until the peer is known
-		// reticulous). Opportunistic (Identity) proofs only; link proofs fall back
-		// to a plain prove.
+		// Like prove(), but appends this packet's own rx report (int16 rssi dBm |
+		// int16 snr×10 | int8 our antenna tx power dBm, big-endian) after the proof
+		// data, outside the signature. The reticulous receiver reads it as the
+		// "remote" reading for the message this proves, pairing our tx power with
+		// the rssi it measures to get the path loss; a vanilla receiver
+		// length-rejects the longer proof, which is why rnsd sends it only to a
+		// peer that advertised the capability. Opportunistic (Identity) proofs
+		// only; link proofs fall back to a plain prove.
 		void prove_report(const Destination& destination = {Type::NONE});
 		ProofDestination generate_proof_destination() const;
 		bool validate_proof_packet(const Packet& proof_packet);
