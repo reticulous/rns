@@ -2,7 +2,6 @@ import { ref } from 'vue'
 import { useMenuStore } from 'spangap-browser/stores/menu'
 import { registerWindowMount } from 'spangap-browser/lib/windowMounts'
 import { registerTopbarIcon } from 'spangap-browser/lib/topbarIcons'
-import RnsdPanel from '../panels/RnsdPanel.vue'
 import MapWindow from '../panels/MapWindow.vue'
 import NodesWindow from '../panels/NodesWindow.vue'
 import GwSignal from '../panels/GwSignal.vue'
@@ -25,10 +24,6 @@ export function registerRnsd() {
                         component: NodesWindow, visible: nodesVisible })
   registerWindowMount({ id: 'map', title: 'Reticulum Map',
                         component: MapWindow, visible: mapVisible })
-
-  /* Settings → Mesh Network → Reticulum / RNS (the lead item of the group). */
-  menu.setMenu('settings/mesh', { label: 'Mesh Network', placement: 3 })
-  menu.register('settings/mesh/general', 'Reticulum / RNS', { type: 'panel', component: RnsdPanel }, { placement: 1 })
 
   /* #if 0 — Show Nodes / Show Map removed from the menu; the NodesWindow /
    * MapWindow components and these visibility refs are kept for re-enabling. */
