@@ -11,7 +11,7 @@
       <div class="map-body">
         <div v-if="rows.length === 0" class="empty">
           No paths known yet. Configure a TCP peer in
-          Settings → Mesh Network → RNS Interfaces → TCP
+          Settings → Reticulum Mesh → RNS Interfaces → TCP
           and wait for announces to arrive.
         </div>
         <table v-else class="map-table">

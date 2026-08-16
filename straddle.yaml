@@ -66,7 +66,7 @@ browser_register:
 # non-setting rnsd defaults stay in rnsd.cpp.
 settings:
   - at:
-      - { id: mesh, label: "Mesh Network", short: "Mesh", order: 3 }
+      - { id: reticulum }
       - { id: general, label: "Reticulum / RNS", short: "RNS", order: 1 }
     rows:
       - section: "Reticulum"

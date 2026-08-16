@@ -1105,9 +1105,11 @@ per destination.
 
 The shared RNS UI lives in this straddle: `modules/rnsd.ts` (Pinia store +
 `rnsd:1` DataChannel exposing the directory, identity, and announces),
-`panels/RnsdPanel.vue` (Settings → Reticulum), `panels/NodesWindow.vue` (live
-nodes), `panels/MapWindow.vue` (map of GPS-announcing peers). Interface-specific
-UI is **not** here — each interface straddle contributes its own settings panel.
+`panels/NodesWindow.vue` (live nodes) and `panels/MapWindow.vue` (map of
+GPS-announcing peers). Settings → Reticulum Mesh → Reticulum / RNS is generated
+from the `settings:` block in [`straddle.yaml`](straddle.yaml), so there is no
+hand-written pane. Interface-specific UI is **not** here — each interface
+straddle contributes its own settings block.
 
 ## 10. Bundled components
 
