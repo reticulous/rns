@@ -804,10 +804,14 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 				}
 				*/
 
-				/* Escalate our own unanswered path requests to the expensive
-				 * interfaces. Ahead of the culls: an entry that resolved should
-				 * clear on the same pass it resolved. */
-				escalate_path_requests(OS::time());
+				/* Path-request escalation MOVED below the _jobs_running clear:
+				 * it transmits through request_path → Packet::send →
+				 * Transport::outbound, which spins on _jobs_running — from
+				 * here that is the livelock the teardown comment at the
+				 * bottom of this function warns about, and it wedged the rnsd
+				 * task solid on hardware. The culls below still see a
+				 * resolved entry cleared on the pass after it resolved, one
+				 * tick later than before. */
 
 				// Cull the pending discovery path requests table.
 				//
@@ -924,6 +928,13 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 	}
 
 	_jobs_running = false;
+
+	/* Escalate our own unanswered path requests to the expensive interfaces.
+	 * Deferred past the _jobs_running clear like everything below: the
+	 * escalation transmits through Transport::outbound(), which spins on
+	 * _jobs_running — calling it above the clear wedged the rnsd task in a
+	 * permanent sleep loop. */
+	escalate_path_requests(OS::time());
 
 	// Spangap: tear down reaped half-open links now that _jobs_running is
 	// cleared. teardown() -> LINKCLOSE -> Transport::outbound() spins on
@@ -2276,8 +2287,19 @@ static const Bytes& ifac_salt() {
 					 * announce is most of the traffic. Store when the announce
 					 * is new to us, or when we hold nothing for the
 					 * destination (the record was evicted since). */
+					/* The neighborhood arm: an announce ORIGINATED by the node
+					 * at the other end of this link (ingress already
+					 * incremented hops, so wire-hops 0 reads as 1 here) is
+					 * kept even on a non-retaining interface — the direct
+					 * peer's own destinations are the local neighborhood, and
+					 * the mesh firehose is structurally >= 2 by now. The hops
+					 * field is unsigned, so only the direct peer itself could
+					 * lie its relays down to 0 — and that peer is the trust
+					 * boundary already; the bounded directory arena caps what
+					 * a hostile one could cost. */
 					retain = route_better && (fresh || !have_record) &&
 					         (requested ||
+					          packet.hops() == 1 ||
 					          (packet.receiving_interface() && packet.receiving_interface().retain_on_announce()) ||
 					          rdirHasClaim(packet.destination_hash().data()) ||
 					          rdirInUse(packet.destination_hash().data()));

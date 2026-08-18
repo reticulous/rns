@@ -79,9 +79,12 @@ static std::string formatAnnounceAppData(const RNS::Bytes& app_data);
 
 #define RNSD_VERSION 2
 
-/* Up to N concurrent registered interfaces. Each TCP peer is its
- * own iface, so this caps total interfaces (lora + auto + espnow + N tcp). */
-#define RNSD_MAX_IFACES 16
+/* Up to N concurrent registered interfaces. A per-peer interface straddle
+ * registers one each, so this caps the total across every transport — lora +
+ * auto + espnow + N tcp + N ble. The table is PSRAM and a packet port's
+ * per-direction caps are lazy windows rather than reserved rings, so the idle
+ * cost of a spare slot is a struct. */
+#define RNSD_MAX_IFACES 32
 
 /* mR Interface impl wrapping the ITS handle to a transport task. mR's
  * Transport calls `send_outgoing(Bytes)` when it wants to push a packet
@@ -290,6 +293,14 @@ struct our_dest_t {
     TaskHandle_t               link_listener_task = nullptr;
     uint16_t                   link_inbox_port    = 0;
 
+    /* The last RNSD_DEST_ANNOUNCE, kept so a newly registered interface can
+     * be given every hosted announce without waiting for each client's own
+     * periodic cycle (half an hour for lxmf). want_announce marks a dest
+     * that has announced at least once — a deliberately quiet dest stays
+     * quiet on replay too. */
+    RNS::Bytes                 last_announce_data;
+    bool                       want_announce = false;
+
     our_dest_pending_t          pending[RNSD_OUR_DEST_MAX_PENDING];  /* concurrent path searches */
 };
 
@@ -428,9 +439,17 @@ static void logWire(const char* iface, const char* dir, const uint8_t* p, size_t
          * only packets that can involve this node (single/group/link-
          * addressed, proofs, lreqs). Our own tx of these stays at debug. */
         if (ptype == 1 /*announce*/ || dtype == 2 /*plain*/) {
-            verb("%s rx %s %s %s ctx=%s hops=%u %zuB",
-                 iface, wirePktType(ptype), wireDestType(dtype), hash, ctx,
-                 (unsigned)p[1], n);
+            /* hops=1 stays at debug, above the verbose flood: traffic from the
+             * local neighborhood — one link away — matters more than the wider
+             * mesh's endlessly repeated announces. */
+            if (p[1] == 1) {
+                dbg("%s rx %s %s %s ctx=%s hops=1 %zuB",
+                    iface, wirePktType(ptype), wireDestType(dtype), hash, ctx, n);
+            } else {
+                verb("%s rx %s %s %s ctx=%s hops=%u %zuB",
+                     iface, wirePktType(ptype), wireDestType(dtype), hash, ctx,
+                     (unsigned)p[1], n);
+            }
         }
         else {
             dbg("%s rx %s %s %s ctx=%s hops=%u %zuB",
@@ -485,7 +504,23 @@ static int s_iface_event_seq = 0;
 static RNS::Destination s_probe_dest{RNS::Type::NONE};
 static TickType_t       s_rnsd_announce_due_tick  = 0;
 static TickType_t       s_rnsd_last_announce_tick = 0;
+
+/* Hosted-destination announce replay for newly registered interfaces —
+ * armed by publishIfaceUp, fired from the tick, and PINNED to the new
+ * interfaces via attached_interface: a reconnect on one interface must never
+ * cause announces on another (a BLE peer cycling every few seconds would
+ * otherwise spend LoRa airtime each time). due=0 means none pending; the
+ * bitmask holds the iface slots awaiting their replay. */
+static TickType_t       s_dest_replay_due_tick = 0;
+static uint32_t         s_dest_replay_pending  = 0;
+static_assert(RNSD_MAX_IFACES <= 32, "replay bitmask holds one bit per iface slot");
 #define RNSD_ANNOUNCE_DEBOUNCE_MS 10000
+/* The per-interface announce replay fires much sooner: it spends only the new
+ * link's own airtime, and a freshly linked peer that hears NOTHING may hang
+ * up long before ten seconds — Columba's central gives a silent link ~5 s.
+ * Long enough to coalesce a registration burst, short enough to beat every
+ * peer's patience. */
+#define RNSD_REPLAY_DEBOUNCE_MS   1500
 
 static void publishIfaceUp(const iface_t& i)
 {
@@ -498,11 +533,24 @@ static void publishIfaceUp(const iface_t& i)
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.announce_cap", i.info.name); storageSet(key, (int)(i.info.announce_cap ? i.info.announce_cap : RNS_IFACE_ANNOUNCE_CAP_DEFAULT));
     storageSet("rnsd.iface_event_seq", ++s_iface_event_seq);
     storageEnd();
-    /* If we're hosting the probe destination, (re)arm the announce
-     * debounce. Same 10 s rate-limit shape as lxmf's. */
-    if (s_probe_dest) {
-        s_rnsd_announce_due_tick = xTaskGetTickCount() +
-            pdMS_TO_TICKS(RNSD_ANNOUNCE_DEBOUNCE_MS);
+    /* The hosted destinations AND the probe reach the new interface through
+     * the pinned replay below — never through a broadcast announce, which
+     * would spend every other interface's airtime on this one's reconnect.
+     * The probe's own periodic broadcast cadence is untouched. */
+    /* The hosted destinations, because: announced before this
+     * interface existed, they are invisible on it until each client's own
+     * periodic cycle — half an hour for lxmf, which on a freshly linked BLE
+     * peer reads as a node that never speaks. Debounced like the probe, and
+     * pinned to THIS interface at fire time — no other interface hears it. */
+    {
+        int slot = (int)(&i - s_ifaces);
+        if (slot >= 0 && slot < RNSD_MAX_IFACES)
+            s_dest_replay_pending |= (1u << slot);
+        TickType_t due = xTaskGetTickCount() +
+            pdMS_TO_TICKS(RNSD_REPLAY_DEBOUNCE_MS);
+        if (!s_dest_replay_due_tick ||
+            (int32_t)(s_dest_replay_due_tick - due) > 0)
+            s_dest_replay_due_tick = due;
     }
 }
 
@@ -655,8 +703,54 @@ static our_dest_t* ourDestFindByDestHash(const RNS::Bytes& h)
 static our_dest_t* ourDestAlloc(void)
 {
     for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++)
-        if (!s_our_dests[j].used) return &s_our_dests[j];
+        if (!s_our_dests[j].used) {
+            /* A recycled slot must not inherit its predecessor's announce. */
+            s_our_dests[j].want_announce      = false;
+            s_our_dests[j].last_announce_data = RNS::Bytes();
+            return &s_our_dests[j];
+        }
     return nullptr;
+}
+
+/* Replay every hosted destination's last announce onto each newly registered
+ * interface — the debounced follow-up to publishIfaceUp, PINNED per interface
+ * via attached_interface so no other interface spends airtime on it. Runs on
+ * the rnsd task, the same context the RNSD_DEST_ANNOUNCE handler announces
+ * from. */
+static void replayOurDestAnnounces(void)
+{
+    uint32_t pending = s_dest_replay_pending;
+    s_dest_replay_pending = 0;
+    if (!s_our_dests || !pending) return;
+
+    for (int s = 0; s < RNSD_MAX_IFACES; s++) {
+        if (!(pending & (1u << s))) continue;
+        iface_t& ifc = s_ifaces[s];
+        if (!ifc.used || !ifc.mr_iface) continue;   /* gone again already */
+        int n = 0;
+        for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++) {
+            our_dest_t& c = s_our_dests[j];
+            if (!c.used || !c.listener_dest || !c.want_announce) continue;
+            try {
+                c.listener_dest.announce(c.last_announce_data,
+                                         /*path_response=*/false, ifc.mr_iface);
+                n++;
+            } catch (const std::exception& e) {
+                err("announce replay for %s threw: %s",
+                    c.listener_hash.toHex().c_str(), e.what());
+            }
+        }
+        if (s_probe_dest) {
+            try {
+                s_probe_dest.announce({}, /*path_response=*/false, ifc.mr_iface);
+                n++;
+            } catch (const std::exception& e) {
+                err("probe announce replay threw: %s", e.what());
+            }
+        }
+        if (n) info("replayed %d hosted announce%s onto %s",
+                    n, n == 1 ? "" : "s", ifc.info.name);
+    }
 }
 
 /* Frame helpers. Headers are small; we stack-allocate. */
@@ -1507,10 +1601,15 @@ static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
             }
             RNS::Bytes app_data;
             if (n > 1) app_data.assign(buf + 1, n - 1);
-            /* Hold until an interface exists — otherwise nothing reaches the air. */
+            /* Cache first: this is what a later interface registration
+             * replays, and it is also what saves an announce made before
+             * any interface exists from being lost outright. */
+            c->last_announce_data = app_data;
+            c->want_announce      = true;
             if (ifaceCount() == 0) {
-                info("announce held for %s aspect=%s — no interface up yet",
-                     c->listener_hash.toHex().c_str(), c->req.aspect);
+                info("announce held for %s aspect=%s — replayed when an "
+                     "interface registers", c->listener_hash.toHex().c_str(),
+                     c->req.aspect);
                 break;
             }
             info("announcing %s aspect=%s app_data %s",
@@ -3352,6 +3451,11 @@ static TickType_t nextDeadline(void)
     /* Housekeeping tick, at the current adaptive cadence (see s_tickPeriodMs). */
     TickType_t now = xTaskGetTickCount();
     TickType_t due = s_lastPublishTick + pdMS_TO_TICKS(s_tickPeriodMs);
+    /* A pending per-interface announce replay must not wait for a backed-off
+     * cadence: a freshly linked peer hearing nothing hangs up in seconds. */
+    if (s_dest_replay_due_tick != 0 &&
+        (int32_t)(s_dest_replay_due_tick - due) < 0)
+        due = s_dest_replay_due_tick;
     if (due <= now) return 0;
     return due - now;
 }
@@ -6561,8 +6665,9 @@ static void rnsdTaskMain(void*)
     itsClientInit(RNSD_MAX_LINK_CONNS + RNSD_MAX_CHAN_CONNS + 4);
     /* 4 KB per direction per handle — bursty announce traffic on a busy
      * testnet can fill 2 KB before rnsd drains during the 1 Hz publish
-     * block. 4 KB gives ~4× more headroom; PSRAM-allocated, ~64 KB total
-     * across RNSD_MAX_IFACES=16 × 2 directions. */
+     * block. On a packet port these are lazy backpressure windows, not
+     * reserved rings, so the figure bounds one interface's in-flight bytes
+     * rather than costing RNSD_MAX_IFACES × 2 × 4 KB at rest. */
     if (!itsServerPortOpen(RNSD_PORT_IFACE, ITS_PACKET,
                            /*maxHandles=*/RNSD_MAX_IFACES,
                            /*toCap=*/4096, /*fromCap=*/4096,
@@ -6839,6 +6944,15 @@ static void rnsdTaskMain(void*)
         /* Drive Channel reliability every wake — proof arrivals wake itsPoll,
          * so delivery detection and window-freeing are prompt. */
         channelPollAll();
+
+        /* The per-interface announce replay checks on EVERY wake, not in the
+         * cadence-gated block below: its deadline is seconds and the block's
+         * cadence backs off to a minute when the node is idle. */
+        if (s_dest_replay_due_tick != 0 &&
+            (int32_t)(xTaskGetTickCount() - s_dest_replay_due_tick) >= 0) {
+            s_dest_replay_due_tick = 0;
+            replayOurDestAnnounces();
+        }
 
         TickType_t now = xTaskGetTickCount();
         /* Run the block on schedule, but if we're backed off and a packet has

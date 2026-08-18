@@ -67,7 +67,6 @@ browser_register:
 settings:
   - at:
       - { id: reticulum }
-      - { id: general, label: "Reticulum / RNS", short: "RNS", order: 1 }
     rows:
       - section: "Reticulum"
       - value:  { label: "Identity", key: "rnsd.identity_hash", copyable: true }

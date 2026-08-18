@@ -1070,7 +1070,7 @@ void Link::request_resource_concluded(const Resource& resource) {
 		double requested_at;
 		MsgPack::bin_t<uint8_t> path_hash;
 		MsgPack::bin_t<uint8_t> request_data;
-		unpacker.from_array(requested_at, path_hash, request_data);
+		unpacker.from_request(requested_at, path_hash, request_data);
 		ResourceRequest resource_request;
 		resource_request._requested_at = requested_at;
 		resource_request._path_hash = path_hash;
@@ -1099,7 +1099,7 @@ void Link::response_resource_concluded(const Resource& resource) {
 		unpacker.feed(packed_response.data(), packed_response.size());
 		MsgPack::bin_t<uint8_t> request_id;
 		MsgPack::bin_t<uint8_t> response_data;
-		unpacker.from_array(request_id, response_data);
+		unpacker.from_response(request_id, response_data);
 
 		handle_response(request_id, response_data, resource.total_size(), resource.size());
 	}
@@ -1332,7 +1332,7 @@ void Link::receive(const Packet& packet) {
 							double requested_at;
 							MsgPack::bin_t<uint8_t> path_hash;
 							MsgPack::bin_t<uint8_t> request_data;
-							unpacker.from_array(requested_at, path_hash, request_data);
+							unpacker.from_request(requested_at, path_hash, request_data);
 							ResourceRequest resource_request;
 							resource_request._requested_at = requested_at;
 							resource_request._path_hash = path_hash;
@@ -1358,10 +1358,11 @@ void Link::receive(const Packet& packet) {
 							unpacker.feed(packed_response.data(), packed_response.size());
 							MsgPack::bin_t<uint8_t> request_id;
 							MsgPack::bin_t<uint8_t> response_data;
-							unpacker.from_array(request_id, response_data);
-							MsgPack::Packer packer;
-							packer.serialize(response_data);
-							size_t transfer_size = packer.size() - 2;
+							unpacker.from_response(request_id, response_data);
+							/* Reference RNS reports the payload's packed size;
+							 * response_data is already the payload's bytes, and
+							 * this only feeds progress reporting. */
+							size_t transfer_size = response_data.size();
 							handle_response(Bytes(request_id.data(), request_id.size()), Bytes(response_data.data(), response_data.size()), transfer_size, transfer_size);
 						}
 					}
@@ -1764,8 +1765,9 @@ const Bytes Link::sign(const Bytes& message) {
 bool Link::validate(const Bytes& signature, const Bytes& message) {
 	assert(_object);
 	try {
-		_object->_peer_sig_pub->verify(signature, message);
-		return true;
+		/* verify() reports by return value and never throws — see
+		 * Identity::validate for the port bug this shape invited. */
+		return _object->_peer_sig_pub->verify(signature, message);
 	}
 	catch (const std::exception& e) {
 		return false;

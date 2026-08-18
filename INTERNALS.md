@@ -764,6 +764,20 @@ link; path+data are sent inline in the aux so must fit `ITS_MAX_MSG_DATA`
 (ample for a GET; large form uploads as a request-Resource are not yet
 implemented).
 
+**The envelope's payload slot is typed by the peer's protocol, not by the
+shim.** Reference RNS puts whatever the remote handler returned straight into
+the RESPONSE array's second element, so the type varies per path: a NomadNet
+page body is a `bin`, an LXMF propagation node answers `/get` with an *array*
+(transient ids, or message blobs) and refuses with a bare *int*. `MsgPack.h`'s
+`unpack_blob_or_object` therefore hands the consumer a blob's bytes but any
+structured element **verbatim, as its own msgpack encoding** — the inbound
+mirror of `Link::request`'s `data_packed`, which splices an already-packed
+object into the outbound envelope. Consumers that speak a structured protocol
+parse the buffer they receive; page fetchers still get plain bytes. **Never
+narrow that slot to one type**: the RESPONSE handler catches and logs decode
+throws, so a mistyped payload never surfaces as a protocol error — the response
+is dropped and the request times out as `REQUEST_FAILED` instead.
+
 ## 5.6 Channel (reliable messaging inside a Link)
 
 A **Channel** rides inside a `Link` and turns it from a best-effort packet pipe
@@ -1106,9 +1120,9 @@ per destination.
 The shared RNS UI lives in this straddle: `modules/rnsd.ts` (Pinia store +
 `rnsd:1` DataChannel exposing the directory, identity, and announces),
 `panels/NodesWindow.vue` (live nodes) and `panels/MapWindow.vue` (map of
-GPS-announcing peers). Settings → Reticulum Mesh → Reticulum / RNS is generated
-from the `settings:` block in [`straddle.yaml`](straddle.yaml), so there is no
-hand-written pane. Interface-specific UI is **not** here — each interface
+GPS-announcing peers). The rows on the Settings → Reticulum Mesh page itself
+are generated from the `settings:` block in [`straddle.yaml`](straddle.yaml), so
+there is no hand-written pane. Interface-specific UI is **not** here — each interface
 straddle contributes its own settings block.
 
 ## 10. Bundled components

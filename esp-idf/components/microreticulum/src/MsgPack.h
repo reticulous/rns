@@ -3,13 +3,16 @@
  * `attermann/microReticulum`'s upstream `Link.cpp` uses from the
  * hideakitai/MsgPack Arduino library.
  *
- * Spangap's microreticulum fork only needs four wire shapes:
+ * Spangap's microreticulum fork only needs these wire shapes:
  *   - serialize/deserialize a single `double`            (LRRTT echo)
  *   - serialize a single `bin_t<uint8_t>`                (transfer-size probe)
  *   - to_array(double, RNS::Bytes, RNS::Bytes)           (REQUEST)
- *   - from_array(double, bin_t<uint8_t>, bin_t<uint8_t>) (REQUEST decode)
+ *   - from_request(double, bin, payload)                 (REQUEST decode)
  *   - to_array(RNS::Bytes, RNS::Bytes)                   (RESPONSE)
- *   - from_array(bin_t<uint8_t>, bin_t<uint8_t>)         (RESPONSE decode)
+ *   - from_response(bin, payload)                        (RESPONSE decode)
+ *
+ * The envelopes' trailing `payload` slot is typed by the protocol spoken
+ * over the link, not by this shim — see detail::unpack_blob_or_object.
  *
  * The implementation directly emits/consumes the msgpack wire format
  * (https://github.com/msgpack/msgpack/blob/master/spec.md): float64,
@@ -317,6 +320,50 @@ inline size_t unpack_one(const uint8_t* p, size_t n, bin_t<uint8_t>& v) {
     return unpack_bin(p, n, v);
 }
 
+/* The trailing payload slot of a Link REQUEST/RESPONSE envelope, whose
+ * msgpack type is chosen by the protocol spoken over the link and not by
+ * this shim: reference RNS puts whatever the remote handler was handed (or
+ * returned) straight into that element.
+ *
+ *   - bin/str  → the blob's bytes, which is a NomadNet page body.
+ *   - anything structured (array, map, int, bool, float) → the element's own
+ *     msgpack encoding, verbatim, so the consumer that speaks that protocol
+ *     parses the object itself. An LXMF propagation node answers `/get` with
+ *     an array (transient ids, or message blobs) and refuses with a bare
+ *     int; demanding bin here silently dropped every such response.
+ *   - nil → empty.
+ *
+ * The verbatim path is the inbound mirror of Link::request's `data_packed`,
+ * which splices an already-packed object into the outbound envelope. */
+inline size_t unpack_blob_or_object(const uint8_t* p, size_t n, bin_t<uint8_t>& out) {
+    if (n < 1) throw std::runtime_error("MsgPack: short payload slot");
+    uint8_t t = p[0];
+    if (t == 0xc0) { out.clear(); return 1; }                        // nil
+    size_t hdr, len;
+    if ((t & 0xe0) == 0xa0) { hdr = 1; len = t & 0x1f; }             // fixstr
+    else if (t == 0xd9 || t == 0xc4) {
+        if (n < 2) throw std::runtime_error("MsgPack: short payload blob8");
+        hdr = 2; len = p[1];
+    }
+    else if (t == 0xda || t == 0xc5) {
+        if (n < 3) throw std::runtime_error("MsgPack: short payload blob16");
+        hdr = 3; len = get_be16(p + 1);
+    }
+    else if (t == 0xdb || t == 0xc6) {
+        if (n < 5) throw std::runtime_error("MsgPack: short payload blob32");
+        hdr = 5; len = get_be32(p + 1);
+    }
+    else {
+        size_t elem = skip_value(p, n);
+        if (elem > n) throw std::runtime_error("MsgPack: short payload object");
+        out.assign(p, p + elem);
+        return elem;
+    }
+    if (n < hdr + len) throw std::runtime_error("MsgPack: short payload blob");
+    out.assign(p + hdr, p + hdr + len);
+    return hdr + len;
+}
+
 } // namespace detail
 
 class Packer {
@@ -353,38 +400,51 @@ public:
         _off += detail::unpack_one(_raw.data() + _off, _raw.size() - _off, out);
     }
 
-    template <class... Args>
-    bool from_array(Args&... args) {
-        if (_off > _raw.size()) throw std::runtime_error("MsgPack: cursor past end");
-        size_t count = 0;
-        _off += detail::unpack_array_header(_raw.data() + _off, _raw.size() - _off, count);
-        if (count < sizeof...(Args)) {
-            throw std::runtime_error("MsgPack: array shorter than expected");
-        }
-        (consume_one(args), ...);
-        // Skip any trailing array members we didn't ask for (defensive — peers
-        // can extend the array).
-        for (size_t i = sizeof...(Args); i < count; ++i) skip_one();
+    /** REQUEST envelope: [float64 requested_at, bin path_hash, payload]. */
+    bool from_request(double& requested_at, bin_t<uint8_t>& path_hash,
+                      bin_t<uint8_t>& payload) {
+        size_t count = open_array(3);
+        consume_one(requested_at);
+        consume_one(path_hash);
+        consume_payload(payload);
+        skip_rest(3, count);
+        return true;
+    }
+
+    /** RESPONSE envelope: [bin request_id, payload]. */
+    bool from_response(bin_t<uint8_t>& request_id, bin_t<uint8_t>& payload) {
+        size_t count = open_array(2);
+        consume_one(request_id);
+        consume_payload(payload);
+        skip_rest(2, count);
         return true;
     }
 
 private:
+    size_t open_array(size_t least) {
+        if (_off > _raw.size()) throw std::runtime_error("MsgPack: cursor past end");
+        size_t count = 0;
+        _off += detail::unpack_array_header(_raw.data() + _off, _raw.size() - _off, count);
+        if (count < least) {
+            throw std::runtime_error("MsgPack: array shorter than expected");
+        }
+        return count;
+    }
+
     template <class T>
     void consume_one(T& out) {
         _off += detail::unpack_one(_raw.data() + _off, _raw.size() - _off, out);
     }
 
-    void skip_one() {
-        // Minimal best-effort skip: only the types we know how to pack.
-        if (_off >= _raw.size()) throw std::runtime_error("MsgPack: short skip");
-        uint8_t tag = _raw[_off];
-        if (tag == 0xcb) { double tmp; consume_one(tmp); return; }
-        if (tag == 0xc4 || tag == 0xc5 || tag == 0xc6) {
-            bin_t<uint8_t> tmp;
-            consume_one(tmp);
-            return;
-        }
-        throw std::runtime_error("MsgPack: unsupported trailing element");
+    void consume_payload(bin_t<uint8_t>& out) {
+        _off += detail::unpack_blob_or_object(_raw.data() + _off,
+                                              _raw.size() - _off, out);
+    }
+
+    /* Trailing members we didn't ask for — peers can extend the envelope. */
+    void skip_rest(size_t taken, size_t count) {
+        for (size_t i = taken; i < count; ++i)
+            _off += detail::skip_value(_raw.data() + _off, _raw.size() - _off);
     }
 
     std::vector<uint8_t> _raw;

@@ -261,28 +261,35 @@ Recall last heard app_data for a destination hash.
 		if (packet.packet_type() == Type::Packet::ANNOUNCE) {
 			Bytes destination_hash = packet.destination_hash();
 			//TRACEF("Identity::validate_announce: destination_hash: %s", packet.destination_hash().toHex().c_str());
-			Bytes public_key = packet.data().left(KEYSIZE/8);
-			//TRACEF("Identity::validate_announce: public_key:       %s", public_key.toHex().c_str());
-			Bytes name_hash = packet.data().mid(KEYSIZE/8, NAME_HASH_LENGTH/8);
-			//TRACEF("Identity::validate_announce: name_hash:        %s", name_hash.toHex().c_str());
-			Bytes random_hash = packet.data().mid(KEYSIZE/8 + NAME_HASH_LENGTH/8, RANDOM_HASH_LENGTH/8);
-			//TRACEF("Identity::validate_announce: random_hash:      %s", random_hash.toHex().c_str());
-			Bytes signature = packet.data().mid(KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8, SIGLENGTH/8);
-			//TRACEF("Identity::validate_announce: signature:        %s", signature.toHex().c_str());
+			/* A set context flag marks a RATCHETED announce: a 32-byte ratchet
+			 * key sits between the random hash and the signature, and it is
+			 * part of the signed data. Upstream announces ratchets by default
+			 * on LXMF delivery destinations, so both layouts arrive routinely.
+			 * The ratchet itself is validated and skipped — this build
+			 * encrypts to the identity key, which every receiver accepts. */
+			const bool   ratcheted = packet.context_flag() == Type::Packet::FLAG_SET;
+			const size_t KS = KEYSIZE/8, NH = NAME_HASH_LENGTH/8, RH = RANDOM_HASH_LENGTH/8;
+			Bytes public_key  = packet.data().left(KS);
+			Bytes name_hash   = packet.data().mid(KS, NH);
+			Bytes random_hash = packet.data().mid(KS + NH, RH);
+			size_t off = KS + NH + RH;
+			Bytes ratchet;
+			if (ratcheted) {
+				ratchet = packet.data().mid(off, RATCHETSIZE/8);
+				off += RATCHETSIZE/8;
+			}
+			Bytes signature = packet.data().mid(off, SIGLENGTH/8);
+			off += SIGLENGTH/8;
 			Bytes app_data;
-			if (packet.data().size() > (KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8)) {
-				app_data = packet.data().mid(KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8);
+			if (packet.data().size() > off) {
+				app_data = packet.data().mid(off);
 			}
 			//TRACEF("Identity::validate_announce: app_data:         %s", app_data.toHex().c_str());
-			//TRACEF("Identity::validate_announce: app_data text:    %s", app_data.toString().c_str());
 
 			Bytes signed_data;
-			signed_data << packet.destination_hash() << public_key << name_hash << random_hash+app_data;
+			signed_data << packet.destination_hash() << public_key << name_hash
+			            << random_hash + ratchet + app_data;
 			//TRACEF("Identity::validate_announce: signed_data:      %s", signed_data.toHex().c_str());
-
-			if (packet.data().size() <= KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8) {
-				app_data.clear();
-			}
 
 			Identity announced_identity(false);
 			announced_identity.load_public_key(public_key);
@@ -343,6 +350,17 @@ Recall last heard app_data for a destination hash.
 				}
 				else {
 					DEBUGF("Received invalid announce for %s: Destination mismatch.", packet.destination_hash().toHex().c_str());
+					/* The signature verified, so every field is exactly as the
+					 * origin signed it — the disagreement is in the derivation.
+					 * Print both sides so a capture names the culprit. */
+					/* NB operator<< mutated name_hash into hash_material above;
+					 * slice the original 10 bytes back out for the print. */
+					DEBUGF("  expected %s = H(name_hash %s + identity %s), ctx_flag=%d data=%uB",
+					       expected_hash.toHex().c_str(),
+					       hash_material.left(NAME_HASH_LENGTH/8).toHex().c_str(),
+					       announced_identity.hash().toHex().c_str(),
+					       (int)packet.context_flag(),
+					       (unsigned)packet.data().size());
 					return false;
 				}
 			}
@@ -497,8 +515,10 @@ bool Identity::validate(const Bytes& signature, const Bytes& message) const {
 	if (_object->_pub) {
 		try {
 			TRACEF("Identity::validate: Attempting to verify signature: %s and message: %s", signature.toHex().c_str(), message.toHex().c_str());
-			_object->_sig_pub->verify(signature, message);
-			return true;
+			/* verify() REPORTS BY RETURN VALUE and never throws — the
+			 * Python original raised on a bad signature, and porting that
+			 * shape while ignoring the boolean made every signature pass. */
+			return _object->_sig_pub->verify(signature, message);
 		}
 		catch (const std::exception& e) {
 			return false;

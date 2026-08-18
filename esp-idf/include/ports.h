@@ -264,8 +264,11 @@ typedef struct {
                                destination's custodian and re-acquiring it costs
                                airtime, so we keep what we hear (LoRa, ESP-NOW);
                                on a cheap or vast one we keep only what was
-                               resolved on demand, claimed, or is in active use
-                               (TCP into the wider network). Set from the
+                               resolved on demand, claimed, in active use, or
+                               originated by the direct peer itself (hops 0 on
+                               the wire — the local neighborhood is kept even on
+                               a non-retaining interface; the relayed firehose
+                               is structurally deeper). Set from the
                                interface's own `retain_announces` setting; the
                                struct default of 0 means "don't retain", so a
                                registering interface states its intent. */
