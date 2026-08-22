@@ -30,6 +30,11 @@ Our deltas, by category:
   *inside* a `Link` (§5.6). `Link::get_channel()` is live and `Link::receive`
   routes `CONTEXT.CHANNEL` (0x0E) packets into it (`prove → decrypt →
   _receive`). This is what the [rnsh](../rnsh) shell rides on.
+- **Link round-trip re-measurement.** Upstream takes one RTT sample at
+  establishment and every retry timer above the link is a multiple of it.
+  `Link::rtt_sample()` folds each delivered link proof's own round trip into a
+  smoothed estimate instead (§5.3a), so a link that established while the medium
+  was busy is not paced by that one reading forever.
 - **IFAC enforcement in `Transport.cpp`.** The fork had no Interface Access
   Code support; `ifac_salt`/`derive_ifac` (HKDF from netname+netkey, size
   clamped 1–64), outbound masking/signing, and inbound verify-by-recompute
@@ -92,6 +97,19 @@ Our deltas, by category:
 - `Packet.cpp` — malformed-packet error path **dumps the first ≤8 bytes hex** so
   HEADER_1-vs-HEADER_2 mis-parse, HDLC desync, or a noise byte are
   distinguishable in the log.
+- `Packet.cpp`/`Link.cpp`/`Transport.cpp` — **an unprovable proof is dropped, not
+  fatal.** `Identity::validate` opens with `assert(_object)`, so calling it on an
+  unset identity aborts the device. Three paths reached it from the air: the
+  *explicit* branch of `PacketReceipt::validate_proof` (the implicit branch
+  beside it had always guarded), `Link::validate_proof`, and `Transport`'s
+  link-proof relay, where `Identity::recall()` answers "not known" with an unset
+  identity that `get_public_key()` would have asserted on before `validate()`
+  even ran. All three now check first and treat it as a proof that cannot be
+  verified, which is what the surrounding code already claimed to do. A
+  destination holding no identity is a remote party's doing, never a local
+  invariant, so this is reachable by anyone in radio earshot: it presented as a
+  reboot part-way through a 2 kB LXMF resource, which is simply a long enough
+  run of proofs to find one.
 - `Packet.cpp` — **link-packet proof validation enabled.**
   `PacketReceipt::validate_link_proof` was stubbed (`if (false)`); `Link::validate`
   exists and verifies against the peer's link signing key, so the call is wired
@@ -706,6 +724,25 @@ identifies), and the local destination hash. There is no target-task argument:
 rnsd already knows the owning task from the dest handle, so a consumer can only
 receive links for destinations it owns.
 
+### 5.3a The link's round trip is re-measured, not frozen
+
+Every retry timer that rides a link is a multiple of `Link::rtt()`: a channel
+envelope's resend deadline (§5.6), a resource's advertisement and part timeouts,
+and the `max(rtt × TRAFFIC_TIMEOUT_FACTOR, …)` a `PacketReceipt` gives a proof
+before calling it late. Upstream measures that round trip once, during
+establishment — on a link that was, by definition, contending for the medium at
+the time. On a slow interface one unlucky sample there sets the pace of
+everything for the life of the link, and on a LoRa link the difference between a
+0.8 s and a 2.5 s reading is the difference between a 5 s stall and a 15 s one.
+
+`Link::rtt_sample()` therefore folds every delivered link proof's own round trip
+(`PacketReceipt::_concluded_at − _sent_at`, taken where `validate_link_proof`
+concludes) into a smoothed estimate at α = ¼, moving in both directions, and
+re-derives the keepalive and stale intervals from it. No sample is discarded for
+having been a retransmission: `Packet::resend` re-encrypts, so the resend's
+packet hash is new and the proof matching it is unambiguously that
+transmission's.
+
 ### 5.4 Outbound delivery-proof tracking
 
 Always on. (`s.rnsd.prove_incoming`, default 1, only governs whether *we* prove
@@ -806,9 +843,22 @@ device-native port of upstream `RNS/Channel.py`, kept **wire-identical**:
   by **polling** each envelope's receipt status from `Channel::poll()` (the same
   idiom the link-receipt tracking in §5.4 uses) — no global receipt registry.
   The delivered-message sink is a single `void*`-carrying callback (the rnsd
-  bridge sets it to its channel slot). The window is a small fixed size for now;
-  the adaptive RTT-based window growth from `Channel.py` is intentionally not
-  ported yet.
+  bridge sets it to its channel slot). The window moves in `poll()` for the same
+  reason: upstream opens it in its delivery callback and closes it in its
+  timeout callback, and those are the two branches of the poll loop here.
+- **The window is `Channel.py`'s, and the link's round trip sets its ceiling.**
+  It opens by one on every delivered envelope and closes by one on every retry,
+  between `_window_min` and `_window_max`. The ceiling starts at
+  `WINDOW_MAX_SLOW` (5) and is raised to `WINDOW_MAX_MEDIUM` (12) or
+  `WINDOW_MAX_FAST` (48) only after `FAST_RATE_THRESHOLD` consecutive
+  deliveries whose `Link::rtt()` sits inside `RTT_MEDIUM` (0.75 s) or
+  `RTT_FAST` (0.18 s); anything slower resets that count, so a LoRa link lives
+  on the slow ceiling. The window is what a round trip can hold in flight, not
+  what the sender would like to send: every envelope in it is a link packet
+  waiting on its own delivery proof, and one whose proof does not come back
+  stops the sender for a whole retry deadline —
+  `1.5^(tries-1) × max(rtt × 2.5, 0.025) × (ring + 1.5)`, tens of seconds on a
+  radio link. `Channel::poll` names each resend under `rnsd` debug.
 - **Cycle break:** `LinkData` owns the `Channel`, and the `Channel` holds a
   `Link` handle back — a `shared_ptr` cycle. `Link::link_closed()` shuts the
   channel down and clears `LinkData::_channel` so the graph frees.

@@ -2747,13 +2747,21 @@ static const Bytes& ifac_salt() {
 									signalling_bytes = Link::signalling_bytes(Link::mtu_from_lp_packet(packet), Link::mode_from_lp_packet(packet));
 								}
 								Bytes peer_pub_bytes = packet.data().mid(Type::Identity::SIGLENGTH/8, Type::Link::ECPUBSIZE/2);
+								/* recall() answers "not known" with an unset identity,
+								 * and both get_public_key() and validate() assert on
+								 * one of those. The hash comes off the air, so a
+								 * proof naming a destination this node has never
+								 * recalled would abort it. An unprovable proof is a
+								 * dropped proof — the else below already says so. */
 								Identity peer_identity = Identity::recall(link_entry._destination_hash);
-								Bytes peer_sig_pub_bytes = peer_identity.get_public_key().mid(Type::Link::ECPUBSIZE/2, Type::Link::ECPUBSIZE/2);
+								Bytes peer_sig_pub_bytes = peer_identity
+									? peer_identity.get_public_key().mid(Type::Link::ECPUBSIZE/2, Type::Link::ECPUBSIZE/2)
+									: Bytes();
 
 								Bytes signed_data = packet.destination_hash() + peer_pub_bytes + peer_sig_pub_bytes + signalling_bytes;
 								Bytes signature = packet.data().left(Type::Identity::SIGLENGTH/8);
 
-								if (peer_identity.validate(signature, signed_data)) {
+								if (peer_identity && peer_identity.validate(signature, signed_data)) {
 									TRACEF("Link request proof validated for transport via %s", link_entry._receiving_interface.toString().c_str());
 									//p new_raw = packet.raw[0:1]
 									// CBA RESERVE

@@ -940,6 +940,9 @@ bool PacketReceipt::validate_link_proof(const Bytes& proof, const Link& link, co
 				_object->_status = DELIVERED;
 				_object->_proved = true;
 				_object->_concluded_at = OS::time();
+				/* Send to proof, over the link this packet flew on: the
+				 * measurement every timer above the link is scaled by. */
+				const_cast<Link&>(link).rtt_sample(_object->_concluded_at - _object->_sent_at);
 				//z _object->_proof_packet = proof_packet;
 				//z link.last_proof(_object->_concluded_at);
 
@@ -1004,6 +1007,14 @@ bool PacketReceipt::validate_proof(const Bytes& proof, const Packet& proof_packe
 		Bytes proof_hash = proof.left(Type::Identity::HASHLENGTH/8);
 		Bytes signature = proof.mid(Type::Identity::HASHLENGTH/8, Type::Identity::SIGLENGTH/8);
 		if (proof_hash == _object->_hash) {
+			/* No identity, no validation — the same guard the implicit branch
+			 * below has always had. A proof arrives from the network, so a
+			 * destination that holds no identity is a remote party's doing, not
+			 * a local invariant: validate() asserts on an unset identity, which
+			 * turns an unverifiable proof into a reboot. */
+			if (!_object->_destination.identity()) {
+				return false;
+			}
 			if (_object->_destination.identity().validate(signature, _object->_hash)) {
 				_object->_status = DELIVERED;
 				_object->_proved = true;

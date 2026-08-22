@@ -373,6 +373,12 @@ void Link::validate_proof(const Packet& packet) {
 				const Bytes signature(packet_data.left(Type::Identity::SIGLENGTH/8));
 				
 				TRACEF("Link %s validating identity", link_id().toHex().c_str());
+				/* A link proof is a frame off the air, and the destination it
+				 * names may hold no identity — validate() asserts on one of
+				 * those, so without this an unprovable proof is a reboot. */
+				if (!_object->_destination.identity()) {
+					return;
+				}
 				if (_object->_destination.identity().validate(signature, signed_data)) {
 					if (_object->_status != Type::Link::HANDSHAKE) {
 						throw std::runtime_error("Invalid link state for proof validation: " + _object->_status);
@@ -947,6 +953,34 @@ void Link::__watchdog_job() {
 // STALE_FACTOR x keepalive. Without this both stay at the fixed 360/720 s
 // defaults, so on a fast link a peer-as-responder — which derives its own
 // stale_time from RTT — would reap the link long before our keepalive fired.
+/* A delivered packet's round trip, folded into the link's own estimate.
+ *
+ * Every retry timer that rides this link is a multiple of `rtt()`: a channel
+ * envelope's resend deadline, a resource's advertisement and part timeouts, and
+ * the receipt timeout that decides whether a proof came back late at all.
+ * Establishment measures the round trip once — on a link that was contending
+ * for the medium at the time, since that is what establishing it just did — so
+ * on a slow interface that single sample sets the pace of everything for the
+ * life of the link.
+ *
+ * Every proof that comes back is another measurement of the same path, so take
+ * it: a smoothed estimate at a quarter weight on the newest sample, moving in
+ * both directions, because a link that has slowed down needs its timers to
+ * lengthen as much as a link that has sped up needs them to tighten. No sample
+ * is discarded for having been a retransmission — a resend is re-encrypted and
+ * carries a new packet hash, so the proof that matches it is unambiguously the
+ * one for that transmission and not for an earlier attempt.
+ *
+ * The keepalive and stale intervals are derived from the same number, so they
+ * follow it here rather than keeping the establishment reading. */
+void Link::rtt_sample(double sample) {
+	assert(_object);
+	if (sample <= 0.0) return;
+	if (_object->_rtt <= 0.0) _object->_rtt = sample;
+	else                      _object->_rtt += 0.25 * (sample - _object->_rtt);
+	update_keepalive();
+}
+
 void Link::update_keepalive() {
 	assert(_object);
 	double ka = _object->_rtt * ((double)Type::Link::KEEPALIVE_MAX / Type::Link::KEEPALIVE_MAX_RTT);

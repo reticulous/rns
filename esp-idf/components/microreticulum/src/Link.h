@@ -257,6 +257,10 @@ namespace RNS {
 		//void __str__();
 		std::string toString() const;
 
+		// One delivered packet's measured round trip, folded into the link's
+		// estimate (see the note on the definition).
+		void rtt_sample(double sample);
+
 		// getters
 		double rtt() const;
 		const Destination& destination() const;

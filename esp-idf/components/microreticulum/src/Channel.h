@@ -29,7 +29,10 @@
 //   * No threads and no per-packet closures. mR's PacketReceipt callbacks are
 //     plain C function pointers with no userdata, so delivery/timeout are driven
 //     by polling each envelope's receipt status from poll(), exactly as rnsd
-//     already polls link tx receipts — no global receipt registry.
+//     already polls link tx receipts — no global receipt registry. The window
+//     moves in poll() for the same reason: upstream opens it in its delivery
+//     callback and closes it in its timeout callback, and both of those are
+//     the two branches of the poll loop here.
 //   * A single receive callback carrying an opaque ctx pointer replaces the
 //     Python message-handler list; the rnsd bridge sets ctx to its channel slot.
 //   * The message layer carries the upstream 16-bit envelope msgtype end to end:
@@ -55,12 +58,32 @@ namespace RNS {
 		// speak a typed protocol pass their own msgtype to send().
 		static const uint16_t MSGTYPE_RAW = 0x0100;
 
-		// Initial / bounded window. v1 uses a small fixed window (adaptive RTT
-		// growth from Channel.py is intentionally not ported yet).
-		static const uint16_t WINDOW      = 2;
-		// Only used as the guard span for the inbound out-of-window sequence
-		// check (mirrors Channel.py, which uses the global max window here).
-		static const uint16_t WINDOW_MAX  = 48;
+		// The sender window, ported from Channel.py: it opens by one on every
+		// delivered envelope and closes by one on every retry, between a floor
+		// and a ceiling that the LINK'S ROUND TRIP sets. Deliveries inside
+		// RTT_MEDIUM raise the ceiling once FAST_RATE_THRESHOLD of them have
+		// come in a row, and inside RTT_FAST raise it again; a round trip above
+		// RTT_MEDIUM resets that count, so a radio link sits on the slow
+		// ceiling. The window is what a round trip can hold in flight, not what
+		// the sender would like to send — every envelope in it is a link packet
+		// waiting on its own delivery proof, and one that does not come back
+		// stops the sender for as long as the retry deadline.
+		static const uint16_t WINDOW                  = 2;
+		static const uint16_t WINDOW_MIN              = 2;
+		static const uint16_t WINDOW_MIN_LIMIT_SLOW   = 2;
+		static const uint16_t WINDOW_MIN_LIMIT_MEDIUM = 5;
+		static const uint16_t WINDOW_MIN_LIMIT_FAST   = 16;
+		static const uint16_t WINDOW_MAX_SLOW         = 5;
+		static const uint16_t WINDOW_MAX_MEDIUM       = 12;
+		static const uint16_t WINDOW_MAX_FAST         = 48;
+		static const uint16_t WINDOW_FLEXIBILITY      = 4;
+		static const uint16_t FAST_RATE_THRESHOLD     = 10;
+		static constexpr double RTT_FAST              = 0.18;
+		static constexpr double RTT_MEDIUM            = 0.75;
+		// The largest window any link can reach, which is also the guard span
+		// for the inbound out-of-window sequence check (mirrors Channel.py,
+		// which uses the global max window there).
+		static const uint16_t WINDOW_MAX  = WINDOW_MAX_FAST;
 		static const uint16_t SEQ_MAX     = 0xFFFF;
 		static const uint32_t SEQ_MODULUS = 0x10000;
 		static const uint8_t  MAX_TRIES   = 5;

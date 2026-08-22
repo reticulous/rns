@@ -51,10 +51,54 @@ namespace RNS {
 		uint16_t             _next_sequence = 0;
 		uint16_t             _next_rx_sequence = 0;
 		uint16_t             _window = Channel::WINDOW;
+		uint16_t             _window_max = Channel::WINDOW_MAX_SLOW;
+		uint16_t             _window_min = Channel::WINDOW_MIN;
+		uint16_t             _window_flexibility = Channel::WINDOW_FLEXIBILITY;
+		uint16_t             _fast_rate_rounds = 0;
+		uint16_t             _medium_rate_rounds = 0;
 		Channel::Receive     _recv_cb = nullptr;
 		void*                _recv_ctx = nullptr;
 	};
 
+}
+
+// The window opens by one on every delivered envelope, and the ceiling it opens
+// toward is the link's round trip: FAST_RATE_THRESHOLD deliveries in a row
+// inside RTT_MEDIUM earn the medium ceiling, inside RTT_FAST the fast one, and
+// anything slower resets the count. Ported from Channel._packet_tx_op.
+static void channelWindowOpen(ChannelData& d) {
+	if (d._window < d._window_max) d._window += 1;
+	const double rtt = d._link.rtt();
+	if (rtt == 0.0) return;
+	if (rtt > Channel::RTT_FAST) {
+		d._fast_rate_rounds = 0;
+		if (rtt > Channel::RTT_MEDIUM) {
+			d._medium_rate_rounds = 0;
+			return;
+		}
+		d._medium_rate_rounds += 1;
+		if (d._window_max < Channel::WINDOW_MAX_MEDIUM &&
+		    d._medium_rate_rounds == Channel::FAST_RATE_THRESHOLD) {
+			d._window_max = Channel::WINDOW_MAX_MEDIUM;
+			d._window_min = Channel::WINDOW_MIN_LIMIT_MEDIUM;
+		}
+		return;
+	}
+	d._fast_rate_rounds += 1;
+	if (d._window_max < Channel::WINDOW_MAX_FAST &&
+	    d._fast_rate_rounds == Channel::FAST_RATE_THRESHOLD) {
+		d._window_max = Channel::WINDOW_MAX_FAST;
+		d._window_min = Channel::WINDOW_MIN_LIMIT_FAST;
+	}
+}
+
+// And closes by one on every retry, the ceiling following it down for as long as
+// it keeps more than the flexibility's slack above the floor. Ported from
+// Channel._packet_timeout.
+static void channelWindowClose(ChannelData& d) {
+	if (d._window <= d._window_min) return;
+	d._window -= 1;
+	if (d._window_max > (uint16_t)(d._window_min + d._window_flexibility)) d._window_max -= 1;
 }
 
 // Per-envelope retransmit timeout, ported from Channel._get_packet_timeout_time.
@@ -147,6 +191,7 @@ void Channel::poll() {
 		if (env.packet && env.packet.receipt()) st = env.packet.receipt().status();
 
 		if (st == Type::PacketReceipt::DELIVERED) {
+			channelWindowOpen(d);
 			it = d._tx_ring.erase(it);
 			continue;
 		}
@@ -160,8 +205,23 @@ void Channel::poll() {
 				return;
 			}
 			env.tries += 1;
+			channelWindowClose(d);
+			const double wait = channelTimeoutTime(d, env.tries);
+			/* The resend is otherwise silent, and it is the one thing that
+			 * distinguishes a stalled channel from an idle one: the window
+			 * counts every envelope whose receipt is not DELIVERED, so a proof
+			 * that does not come back stops the sender until this fires. */
+			const char* stname = st == Type::PacketReceipt::SENT      ? "still sent"
+			                   : st == Type::PacketReceipt::FAILED    ? "proof timed out"
+			                   : st == Type::PacketReceipt::CULLED    ? "culled"
+			                   : "delivered";
+			DEBUGF("Channel: seq %u unproved (%s, %u outstanding, link rtt %.2f s), "
+				"resend %u of %u, next in %.1f s, window %u/%u",
+				(unsigned)env.sequence, stname, (unsigned)d._tx_ring.size(),
+				d._link.rtt(), (unsigned)env.tries, (unsigned)Channel::MAX_TRIES, wait,
+				(unsigned)d._window, (unsigned)d._window_max);
 			if (env.packet) env.packet.resend();
-			env.deadline = now + channelTimeoutTime(d, env.tries);
+			env.deadline = now + wait;
 		}
 		++it;
 	}
