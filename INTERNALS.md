@@ -185,10 +185,11 @@ Our deltas, by category:
   how the firehose got built in the first place.
 - `Transport.cpp` — **an announce nothing could carry is refused at ingress.**
   `announce_relay_possible()` asks, before the announce table is touched,
-  whether *any* OUT interface could re-broadcast this announce: AP mode never
-  lifts for a destination that is not ours, and split horizon excludes the
-  point-to-point interface it arrived on. A node where neither survives — an
-  access-point radio plus the TCP link the announce came in on — used to store
+  whether *any* OUT interface could re-broadcast this announce: an announce
+  from beyond an interface's community radius is never re-broadcast onto it
+  (radius 0 relays nothing), and a point-to-point interface
+  never echoes back out what arrived on it. A node where neither survives — a
+  radius-bounded radio plus the TCP link the announce came in on — used to store
   every announce it heard and retry it to the retry limit, walking the whole
   outbound path per attempt and refusing on every interface, refilled from the
   ingress faster than it drained. It is a **necessary** condition only: rate
@@ -224,15 +225,16 @@ Our deltas, by category:
   `fresh` is the forwarding input, computed by the guard pool over every announce
   we ever validated rather than over whatever we happened to keep; `retain` is
   the storage decision, true when the announce was resolved on demand (an
-  outstanding path request), arrived on an interface flagged
-  `retain_on_announce`, is claimed, or is in active use. A longer path never
+  outstanding path request), originated within the ingress interface's
+  community radius, was originated by the direct peer, is claimed, or is in
+  active use. A longer path never
   displaces a shorter one while the shorter one is still valid, and an announce
   we have already seen and already hold is not re-stored — on a mesh where
   several neighbours rebroadcast the same announce, that is most of the traffic.
-- `Interface.{h}` — **`retain_on_announce`**, set at registration the way `mode`
-  is. This is what keeps the ingest split portable while the *policy* — which
-  interfaces retain — stays outside µR, in each interface straddle's own
-  `retain_announces` setting.
+- `Interface.{h}` — **`community_radius`**, set at registration the way `mode`
+  is. This is what keeps the ingest split portable while the *policy* — how far
+  each interface's community reaches — stays outside µR, in each interface
+  straddle's own `community_radius` setting.
 
 - `Destination.cpp` — **empty aspect adds no separator.** `expand_name` appended
   `"." + aspects` unconditionally, so an app-name-only destination (e.g. rnsh's
@@ -367,7 +369,7 @@ it is now implemented, plus fork-specific behaviour for point-to-point links.
   elapsed, emitting one held announce (lowest hop count first). Queued announces
   count as *handled* in `outbound()` (a `deferred` flag), so `Packet::send` no
   longer logs a spurious "No interfaces could process" for a capped announce.
-- **Point-to-point split horizon.** A new interface property `point_to_point`
+- **Point-to-point echo suppression.** A new interface property `point_to_point`
   (`rnsd_iface_t.point_to_point`, mirrored to `Interface::_point_to_point`)
   marks links with no hidden-node problem — a single peer (TCP) or a switched
   LAN (auto). On those, `outbound()` does *not* re-broadcast a forwarded
@@ -379,18 +381,22 @@ it is now implemented, plus fork-specific behaviour for point-to-point links.
   packet's `receiving_interface()` (carried from the stored announce packet at
   retransmit time), **not** a `next_hop_interface()` path-table lookup — the
   latter misses after path culls or interface reconnects.
-- **Access-point interfaces still announce instance-local destinations.**
-  Upstream blocks *every* unattached announce on a `MODE_ACCESS_POINT`
-  interface — the node's own included — so a radio-edge node whose only
-  interface is an AP is undiscoverable *and* unreachable: its announce enters
-  no cache, so no path request for it can ever be answered. The AP branch in
-  `Transport::outbound` now exempts destinations in `_destinations`, the same
-  instance-local carve-out upstream itself grants on roaming/boundary
-  interfaces. Forwarded announces stay blocked, so the mode's airtime purpose
-  (no transport-network announce flood on the edge link) is untouched.
-- **Path-request handling is mode-aware.** Discovery/forwarding and the
-  link-maintenance `request_path` sweep skip `MODE_ACCESS_POINT` interfaces
-  (don't spray the radio edge) and honour the point-to-point split horizon. The
+- **Instance-local destinations announce everywhere.** Upstream blocks *every*
+  unattached announce on a `MODE_ACCESS_POINT` interface — the node's own
+  included — so a radio-edge node whose only interface is an AP is
+  undiscoverable *and* unreachable: its announce enters no cache, so no path
+  request for it can ever be answered. Here the announce egress gate is the
+  community radius (`Transport::outbound` blocks a forwarded announce whose
+  hops exceed the egress interface's radius), and destinations in
+  `_destinations` are exempt from it — this node's own announces are a
+  trickle and must reach every interface. The radius keeps the airtime
+  purpose: the transport network's announce flood never lands on an edge
+  link, because it arrives deeper than any radius.
+- **Path-request handling is community-aware.** Whether a request is searched
+  at all is the requestor-side gate (`path_search_possible`: an interface with
+  no community gets no errands run); a search that is taken on goes out every
+  other interface, honouring the point-to-point echo suppression.
+  The
   forwarded-request dedup table (`_discovery_pr_tags`) evicts **FIFO**
   (`_discovery_pr_tags_order`) instead of by `std::set` content order, and its
   cap (`RNS_PR_TAGS_MAX`) is 256 — the old content-ordered eviction dropped
@@ -462,14 +468,16 @@ once and then goes silent.
 the forwarding input (the guard, over every announce ever validated) and
 `retain` is the storage decision, true when a strictly-better-or-equal route
 arrives *and* one of: the announce was resolved on demand (an outstanding path
-request — the arm that keeps a non-retaining interface usable at all, or a node
-with only a cheap link would discard the path response it just asked for), the
-ingress interface carries `retain_on_announce`, the destination is claimed, or
+request — the arm that keeps a radius-0 interface usable at all, or a node
+with only a cheap link would discard the path response it just asked for), its
+origin is within the ingress interface's community radius, it was originated
+by the direct peer (hops 1 on the wire), the destination is claimed, or
 its route is in active use. A longer path never displaces a shorter valid one;
 an announce already seen and already held is not re-stored, which on a mesh
 where several neighbours rebroadcast the same announce is most of the traffic.
-The *policy* — which interfaces retain — stays outside µR, in each interface
-straddle's `retain_announces` setting, carried in at registration.
+The *policy* — how far each interface's community reaches — stays outside µR,
+in each interface straddle's `community_radius` setting, carried in at
+registration.
 
 **Claims and eviction.** The claim vocabulary lives outside the store and is
 compiled into the record at assert time (a per-consumer bit field for presence,
@@ -488,12 +496,12 @@ first within a category:
 | route used recently | `last_used` |
 
 `RDIR_CLAIM_ANSWER_FOR` is custody, not a consumer claim: it is set when the
-destination is reachable via an interface whose transit policy says we route
-for it, and it ranks with the persistent claims — without it a gateway's own
+destination is a community member — within its interface's community radius —
+and it ranks with the persistent claims — without it a gateway's own
 segment competes for slots with a large network's announce churn and loses
 continuously, because the churn is what keeps arriving. It is re-evaluated on
-every announce rather than latched, so a destination that moves to an interface
-we do not route for stops being our obligation. Eviction is a select-min pass,
+every announce rather than latched, so a destination that drifts beyond the
+radius stops being our obligation. Eviction is a select-min pass,
 not a sort index: the store allocates nothing after init, and building one is
 an allocation at exactly the wrong moment.
 

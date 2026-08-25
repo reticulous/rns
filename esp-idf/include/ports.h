@@ -253,48 +253,36 @@ typedef struct {
     uint8_t  announce_cap;  /* max % of interface bandwidth spent propagating
                                announces; 0 => rnsd applies the RNS default (2) */
     uint8_t  point_to_point; /* 1 => no hidden-node problem (single peer, e.g.
-                               TCP, or a switched LAN): enables split-horizon so
-                               forwarded announces aren't echoed back out the
+                               TCP, or a switched LAN): forwarded announces and
+                               path requests aren't echoed back out the
                                interface they arrived on. 0 (default) => shared
                                radio medium; keep re-broadcasting for hidden
                                nodes (LoRa, ESP-NOW). */
-    uint8_t  retain_announces; /* 1 => an announce heard here is worth KEEPING,
-                               not merely forwarding. The asymmetry: on an
-                               expensive or edge interface we are the
-                               destination's custodian and re-acquiring it costs
-                               airtime, so we keep what we hear (LoRa, ESP-NOW);
-                               on a cheap or vast one we keep only what was
-                               resolved on demand, claimed, in active use, or
-                               originated by the direct peer itself (hops 0 on
-                               the wire — the local neighborhood is kept even on
-                               a non-retaining interface; the relayed firehose
-                               is structurally deeper). Set from the
-                               interface's own `retain_announces` setting; the
-                               struct default of 0 means "don't retain", so a
-                               registering interface states its intent. */
-    uint8_t  policy_manual; /* 0 (default) => AUTO: this interface's transit
-                               policy is inferred, as it always was — mode-derived
-                               (access-point interfaces are excluded from relaying
-                               and from discovery) — and `route_for` below is NOT
-                               read. 1 => the operator owns the policy fields and
-                               they are read as given.
-                               NOTE the polarity, which is deliberately the
-                               opposite of `retain_announces` above: zero here
-                               must mean "behave as this build always did", so an
-                               interface straddle that predates the field, or one
-                               that simply doesn't set it, keeps stock behaviour.
-                               A straddle states its INTENT in retain_announces;
-                               it states the operator's OVERRIDE here. */
-    uint8_t  route_for;     /* Only read when policy_manual = 1. 1 => we provide
-                               transport for the nodes reachable through this
-                               interface: we relay announces towards them, we
-                               search on their behalf, and their paths get the
-                               custody lifetime. 0 => their traffic is not our
-                               business — we still talk to them as an endpoint,
-                               we just don't work for them. Answering a path
-                               request for a destination we already know is NOT
-                               gated by this: that is custody, not transit, and
-                               it is what makes a gateway a gateway. */
+    uint8_t  community_radius; /* This interface's COMMUNITY: nodes within this
+                               many hops heard on it are the ones this node
+                               works for. Within the radius, an announce is
+                               STORED (the original bytes kept, so path
+                               requests for the member can be answered from
+                               custody — the ability half of being a gateway),
+                               ranked to persist in the directory, given the
+                               custody path lifetime, and RE-BROADCAST to the
+                               rest of the community; and path requests
+                               arriving on an interface with a community
+                               (radius > 0) are searched on the requestor's
+                               behalf, out every other interface. 0 (the
+                               struct default) => no community: a pure
+                               endpoint/uplink — everything heard is forwarded
+                               and resolved on demand, nothing unrequested is
+                               stored, no relay work is done onto it, and no
+                               errands are run for it. Nodes beyond the radius
+                               are still HEARD (they show up on the mesh) and
+                               REACHABLE (on-demand resolution, the direct
+                               peer's own announces, claims and active routes
+                               are all kept regardless) — they are just not
+                               this node's responsibility. Answering a path
+                               request for a destination already in custody is
+                               never gated: custody, once taken, is served to
+                               anyone who asks. */
     uint8_t  rx_signal;     /* 1 => each inbound data frame is prefixed with a
                                4-byte signal header int16 rssi_dBm | int16 snr_dB*10
                                (both BE, INT16_MIN = absent). Set by radio ifaces

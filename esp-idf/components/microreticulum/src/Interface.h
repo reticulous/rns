@@ -83,11 +83,12 @@ namespace RNS {
 		bool _IN  = false;
 		bool _OUT = false;
 		bool _FWD = false;
-		/* Transit policy — see rnsd_iface_t. _policy_manual = false means the
-		 * policy is inferred from mode exactly as it always was, and
-		 * _route_for is not consulted. */
-		bool _policy_manual = false;
-		bool _route_for = false;
+		/* The interface's community radius — see rnsd_iface_t. Nodes within
+		 * this many hops heard on this interface are the ones this node works
+		 * for: their announces are stored and re-broadcast, their paths get
+		 * the custody lifetime, and their path requests are searched. 0 = no
+		 * community (a pure endpoint/uplink). */
+		uint8_t _community_radius = 0;
 		bool _RPT = false;
 		std::string _name;
 		size_t _rxb = 0;
@@ -121,18 +122,10 @@ namespace RNS {
 		float _announce_cap = 0.0;
 		// True for links with no hidden-node problem — a single peer (TCP) or a
 		// fully-connected medium (switched LAN) where every peer hears every
-		// other. Enables split-horizon: forwarded announces are not echoed back
+		// other. Forwarded announces are then not echoed back
 		// out the interface they were learned on. Radio interfaces (LoRa,
 		// ESP-NOW) leave this false so re-broadcasts still reach hidden nodes.
 		bool _point_to_point = false;
-		// Whether an announce heard on this interface is worth *retaining*, as
-		// opposed to merely forwarding. Set at registration, like _mode. The
-		// asymmetry it expresses: on an expensive or edge interface we are the
-		// destination's custodian and re-acquiring it costs airtime, so we keep
-		// what we hear; on a cheap or vast one we keep only what was resolved on
-		// demand, claimed, or is in active use. The policy that decides which is
-		// which lives outside µR.
-		bool _retain_on_announce = true;
 		std::list<AnnounceEntry> _announce_queue;
 		bool _is_connected_to_shared_instance = false;
 		bool _is_local_shared_instance = false;
@@ -229,8 +222,7 @@ namespace RNS {
 		inline void IN(bool IN) { assert(_impl); _impl->_IN = IN; }
 		inline void OUT(bool OUT) { assert(_impl); _impl->_OUT = OUT; }
 		inline void FWD(bool FWD) { assert(_impl); _impl->_FWD = FWD; }
-		inline void policy_manual(bool v) { assert(_impl); _impl->_policy_manual = v; }
-		inline void route_for(bool v) { assert(_impl); _impl->_route_for = v; }
+		inline void community_radius(uint8_t v) { assert(_impl); _impl->_community_radius = v; }
 		inline void RPT(bool RPT) { assert(_impl); _impl->_RPT = RPT; }
 		inline void name(const char* name) { assert(_impl); _impl->_name = name; }
 		inline void bitrate(uint32_t bitrate) { assert(_impl); _impl->_bitrate = bitrate; }
@@ -241,20 +233,16 @@ namespace RNS {
 		// registration from the rnsd-facing percentage.
 		inline void announce_cap(float announce_cap) { assert(_impl); _impl->_announce_cap = announce_cap; }
 		inline void point_to_point(bool point_to_point) { assert(_impl); _impl->_point_to_point = point_to_point; }
-		inline void retain_on_announce(bool retain) { assert(_impl); _impl->_retain_on_announce = retain; }
 	public:
 		// getters
 		inline bool IN() const { assert(_impl); return _impl->_IN; }
 		inline bool OUT() const { assert(_impl); return _impl->_OUT; }
 		inline bool FWD() const { assert(_impl); return _impl->_FWD; }
-		inline bool policy_manual() const { assert(_impl); return _impl->_policy_manual; }
-		inline bool route_for() const { assert(_impl); return _impl->_route_for; }
-		/* "Do we do transit work for this interface?" — the one question every
-		 * gate asks. On AUTO it is the legacy mode inference the caller passes
-		 * in; on MANUAL it is what the operator said, and mode has no vote. */
-		inline bool routes_for(bool inferred) const {
-			return policy_manual() ? route_for() : inferred;
-		}
+		/* "How far does this interface's community reach?" — the one number
+		 * every transit gate asks about: a node within the radius is served
+		 * (stored, answered for, searched for), one beyond it is merely
+		 * heard. */
+		inline uint8_t community_radius() const { assert(_impl); return _impl->_community_radius; }
 		inline bool RPT() const { assert(_impl); return _impl->_RPT; }
 		inline bool online() const { assert(_impl); return _impl->_online; }
 		inline std::string name() const { assert(_impl); return _impl->_name; }
@@ -278,7 +266,6 @@ namespace RNS {
 		inline double announce_allowed_at() const { assert(_impl); return _impl->_announce_allowed_at; }
 		inline float announce_cap() const { assert(_impl); return _impl->_announce_cap; }
 		inline bool point_to_point() const { assert(_impl); return _impl->_point_to_point; }
-		inline bool retain_on_announce() const { assert(_impl); return _impl->_retain_on_announce; }
 		inline size_t rxb() const { assert(_impl); return _impl->_rxb; }
 		inline size_t txb() const { assert(_impl); return _impl->_txb; }
 		// Per-packet radio signal (see InterfaceImpl). Setter used by the driver

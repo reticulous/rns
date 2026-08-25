@@ -354,8 +354,9 @@ namespace RNS {
 		 * Writer-task only, because of that clear. */
 		static bool peek_live_route(const Bytes& destination_hash, rdir_route_t& route, Interface& outbound_interface);
 		/* The lifetime a path learned on (or used over) this interface gets,
-		 * from the runtime-tunable TTLs. */
-		static uint32_t path_ttl_for(const Interface& interface);
+		 * from the runtime-tunable TTLs. A destination inside the interface's
+		 * community (hops <= community_radius) gets the custody lifetime. */
+		static uint32_t path_ttl_for(const Interface& interface, uint8_t hops);
 		static bool remove_path(const Bytes& destination_hash);
 		static bool has_path(const Bytes& destination_hash);
 		static uint8_t hops_to(const Bytes& destination_hash);
@@ -413,7 +414,8 @@ namespace RNS {
 		 * A cheap necessary condition checked before the announce table is
 		 * touched — see the definition for why it is not the whole rule. */
 		static bool announce_relay_possible(const Bytes& destination_hash,
-		                                    const Interface& received_on);
+		                                    const Interface& received_on,
+		                                    uint8_t hops);
 		/* Could a forwarded path request reach any interface at all? Same
 		 * necessary condition, checked before a discovery entry is booked. */
 		static bool path_search_possible(const Interface& requestor);

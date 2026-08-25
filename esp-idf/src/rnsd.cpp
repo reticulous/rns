@@ -128,12 +128,7 @@ public:
                                             : RNS::Type::Reticulum::ANNOUNCE_CAP;
         _announce_cap = (float)cap_pct / 100.0f;
         _point_to_point = info.point_to_point != 0;
-        _retain_on_announce = info.retain_announces != 0;
-        /* Transit policy. On AUTO (the default, and every straddle that
-         * predates the field) route_for is not read and every gate keeps
-         * inferring from mode exactly as before. */
-        _policy_manual = info.policy_manual != 0;
-        _route_for = info.route_for != 0;
+        _community_radius = info.community_radius;
     }
 protected:
     void send_outgoing(const RNS::Bytes& data) override;
@@ -3108,11 +3103,13 @@ static void rnstatusPrintIface(const iface_t& i)
     cliPrintf("Announce cap %u%%\n",
               (unsigned)(i.info.announce_cap ? i.info.announce_cap
                                              : RNS_IFACE_ANNOUNCE_CAP_DEFAULT));
-    cliPrintf("Transit policy %s\n", !i.info.policy_manual ? "auto (inferred from mode)"
-                                    : (i.info.route_for ? "manual: route for this interface"
-                                                        : "manual: do not route for this interface"));
-    cliPrintf("Split horizon %s\n", i.info.point_to_point ? "yes (point-to-point)"
-                                                          : "no (shared/hidden-node)");
+    if (i.info.community_radius)
+        cliPrintf("Community    within %u hop%s (stored, answered for, searched for)\n",
+                  (unsigned)i.info.community_radius, i.info.community_radius == 1 ? "" : "s");
+    else
+        cliPrintf("Community    none (endpoint/uplink: on-demand only)\n");
+    cliPrintf("Point-to-point %s\n", i.info.point_to_point ? "yes (no echo back to the peer)"
+                                                           : "no (shared/hidden-node)");
     cliPrintf("MTU          %u\n", (unsigned)i.info.mtu);
     cliPrintf("Bitrate      %s\n", formatBitrate(i.info.bitrate).c_str());
     cliPrintf("Traffic      %s in / %s out  (%llu pkt in / %llu out)\n",

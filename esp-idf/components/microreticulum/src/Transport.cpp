@@ -583,8 +583,8 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 
 					new_packet.hops(rec.hops);
 					// Carry the interface this announce arrived on onto the
-					// rebroadcast, so outbound()'s point-to-point split horizon
-					// can suppress echoing it back out that same interface. This
+					// rebroadcast, so outbound()'s point-to-point echo suppression
+					// can stop it going back out that same interface. This
 					// is the reliable source signal — the interface the original
 					// packet was received on — as opposed to a path lookup that
 					// can miss after evictions or interface reconnects.
@@ -960,12 +960,13 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 	}
 
 	// CBA send link-related path requests. Send per-OUT-interface rather than a
-	// single broadcast so the point-to-point split horizon in request_path can
-	// suppress re-asking a link's own peer, and so access-point (radio edge)
-	// interfaces are skipped the same way the discovery forwarders skip them.
+	// single broadcast so the point-to-point echo suppression in request_path
+	// can skip re-asking a link's own peer. These are this node's own errands,
+	// so every OUT interface is asked — the destination may as well be a
+	// community member on the radio as a node behind the uplink.
 	for (auto& destination_hash : path_requests) {
 		for (auto& [interface_hash, interface] : _interfaces) {
-			if (interface.OUT() && interface.mode() != Type::Interface::MODE_ACCESS_POINT) {
+			if (interface.OUT()) {
 				request_path(destination_hash, interface);
 			}
 		}
@@ -1194,7 +1195,7 @@ static const Bytes& ifac_salt() {
 		uint32_t now_s = (uint32_t)outbound_time;
 		if (sent && (uint32_t)(now_s - route.last_used) >= Type::Transport::PATH_LAST_USED_GRANULARITY) {
 			rdirTouchUsed(packet.destination_hash().data(),
-			              now_s + path_ttl_for(outbound_interface));
+			              now_s + path_ttl_for(outbound_interface, route.hops));
 		}
 	}
 	// If we don't have a known path for the destination, we'll
@@ -1257,25 +1258,19 @@ static const Bytes& ifac_salt() {
 				if (packet.packet_type() == Type::Packet::ANNOUNCE) {
 					if (!packet.attached_interface()) {
 						TRACE("Transport::outbound: Packet has no attached interface");
-						if (interface.mode() == Type::Interface::MODE_ACCESS_POINT) {
-							// Deviation from upstream (which blocks every unattached
-							// announce on an AP interface, own destinations included):
-							// instance-local destinations are allowed out, the same
-							// exemption the roaming/boundary branches below grant. AP
-							// mode's purpose is keeping the transport network's
-							// announce flood off the edge link; this node's own
-							// announces are a trickle, and without them an AP node
-							// whose only interface is the radio can never be
-							// discovered or path-resolved (its announce enters no
-							// cache, so no path request for it can be answered).
-							auto iter = _destinations.find(packet.destination_hash());
-							if (iter != _destinations.end()) {
-								TRACE("Allowing announce broadcast on access-point-mode interface from instance-local destination");
-							}
-							else {
-								TRACEF("Blocking announce broadcast on %s due to AP mode", interface.toString().c_str());
-								should_transmit = false;
-							}
+						/* Community radius: relay work is done for the members
+						 * on the egress interface, so a forwarded announce is
+						 * re-broadcast only within their radius — the uplink's
+						 * firehose is never sprayed across a radio, and an
+						 * interface with no community (radius 0) relays
+						 * nothing. Instance-local destinations are exempt:
+						 * this node's own announces are a trickle, and they
+						 * must reach every interface or the node can never be
+						 * discovered there. */
+						if (_destinations.find(packet.destination_hash()) == _destinations.end()
+						    && packet.hops() > interface.community_radius()) {
+							TRACEF("Blocking announce broadcast on %s beyond its community radius", interface.toString().c_str());
+							should_transmit = false;
 						}
 						else if (interface.mode() == Type::Interface::MODE_ROAMING) {
 							//local_destination = next((d for d in Transport.destinations if d.hash == packet.destination_hash), None)
@@ -1358,7 +1353,7 @@ static const Bytes& ifac_salt() {
 										interface.announce_queue = []
 */
 
-								// Split horizon, but only on interfaces with no hidden-
+								// Echo suppression, only on interfaces with no hidden-
 								// node problem (point_to_point: TCP, switched LAN).
 								// There, echoing a forwarded announce back out the
 								// interface it arrived on just returns it to the single
@@ -1371,11 +1366,11 @@ static const Bytes& ifac_salt() {
 								// so it holds even after path culls / interface
 								// reconnects.
 								const Interface& received_on = packet.receiving_interface();
-								bool split_horizon = interface.point_to_point() && received_on
+								bool p2p_echo = interface.point_to_point() && received_on
 									&& received_on.get_hash() == interface.get_hash();
 
 								bool queued_announces = (interface.announce_queue().size() > 0);
-								if (split_horizon) {
+								if (p2p_echo) {
 									should_transmit = false;
 								}
 								else if (!queued_announces && outbound_time > interface.announce_allowed_at()) {
@@ -1508,7 +1503,8 @@ static const Bytes& ifac_salt() {
 	}
 
 	// A forwarded announce (hops>0) that this node chose not to re-broadcast on
-	// any interface — AP mode, an over-full cap queue, split horizon — is a
+	// any interface — AP mode, an over-full cap queue, point-to-point echo
+	// suppression — is a
 	// routing decision, not a delivery failure. Treat it as handled so
 	// Packet::send doesn't log "No interfaces could process" for it. Own
 	// announces (hops==0) that reach no interface are still reported honestly.
@@ -2100,7 +2096,7 @@ static const Bytes& ifac_salt() {
 						/* Transiting for someone else still counts as use: it
 						 * is what makes this record worth keeping. */
 						rdirTouchUsed(packet.destination_hash().data(),
-						              (uint32_t)OS::time() + path_ttl_for(fwd_interface));
+						              (uint32_t)OS::time() + path_ttl_for(fwd_interface, fwd_route.hops));
 					}
 					else {
 						// TODO: There should probably be some kind of REJECT
@@ -2290,17 +2286,23 @@ static const Bytes& ifac_salt() {
 					/* The neighborhood arm: an announce ORIGINATED by the node
 					 * at the other end of this link (ingress already
 					 * incremented hops, so wire-hops 0 reads as 1 here) is
-					 * kept even on a non-retaining interface — the direct
+					 * kept even on an interface with no community — the direct
 					 * peer's own destinations are the local neighborhood, and
 					 * the mesh firehose is structurally >= 2 by now. The hops
 					 * field is unsigned, so only the direct peer itself could
 					 * lie its relays down to 0 — and that peer is the trust
 					 * boundary already; the bounded directory arena caps what
 					 * a hostile one could cost. */
+					/* The community arm: an announce from within the ingress
+					 * interface's community radius is this node's to keep —
+					 * custody is what lets it answer path requests for the
+					 * members. Beyond the radius (a leak from another gateway,
+					 * the uplink's firehose) nothing is stored unrequested. */
 					retain = route_better && (fresh || !have_record) &&
 					         (requested ||
 					          packet.hops() == 1 ||
-					          (packet.receiving_interface() && packet.receiving_interface().retain_on_announce()) ||
+					          (packet.receiving_interface() &&
+					           packet.hops() <= packet.receiving_interface().community_radius()) ||
 					          rdirHasClaim(packet.destination_hash().data()) ||
 					          rdirInUse(packet.destination_hash().data()));
 
@@ -2360,7 +2362,7 @@ static const Bytes& ifac_salt() {
 						 * blob ring that used to live beside it is now the
 						 * guard pool, which every announce updates whether or
 						 * not we retain anything else about the destination. */
-						uint32_t path_ttl = path_ttl_for(packet.receiving_interface());
+						uint32_t path_ttl = path_ttl_for(packet.receiving_interface(), announce_hops);
 
 						if (fresh && (Reticulum::transport_enabled() || Transport::from_local_client(packet)) && packet.context() != Type::Packet::PATH_RESPONSE) {
 							// Insert announce into announce table for retransmission
@@ -2374,7 +2376,8 @@ static const Bytes& ifac_salt() {
 							 * a clause on the announce's own line below, not a
 							 * line of its own: one announce, one line. */
 							else if (!announce_relay_possible(packet.destination_hash(),
-							                                  packet.receiving_interface())) {
+							                                  packet.receiving_interface(),
+							                                  announce_hops)) {
 								relay_note = ", not relayed (no egress)";
 							}
 							else {
@@ -2529,15 +2532,13 @@ static const Bytes& ifac_salt() {
 							ann.raw           = packet.raw().data();
 							ann.raw_len       = (uint16_t)packet.raw().size();
 							ann.hops          = announce_hops;
-							ann.edge          = packet.receiving_interface() && packet.receiving_interface().retain_on_announce();
-							/* Reached via an interface we route for → we answer
-							 * path requests for it, so it must outrank the churn
-							 * of everything we merely overhear. Auto keeps the
-							 * mode inference, so nothing is claimed until an
-							 * operator says what this node is. */
-							ann.answer_for    = packet.receiving_interface() &&
-							                    packet.receiving_interface().policy_manual() &&
-							                    packet.receiving_interface().route_for();
+							/* A community member: we answer path requests for
+							 * it, so it must outrank the churn of everything
+							 * we merely overhear. */
+							bool in_community = packet.receiving_interface() &&
+							                    announce_hops <= packet.receiving_interface().community_radius();
+							ann.edge          = in_community;
+							ann.answer_for    = in_community;
 							ann.timestamp     = (uint32_t)now;
 							ann.expires       = (uint32_t)now + path_ttl;
 
@@ -3271,12 +3272,13 @@ Deregisters an announce handler.
 	}
 }
 
-/*static*/ uint32_t Transport::path_ttl_for(const Interface& interface) {
+/*static*/ uint32_t Transport::path_ttl_for(const Interface& interface, uint8_t hops) {
 	/* A destination we are custodian of outlives one we merely heard about.
 	 * Mode gets this backwards for a gateway: it hands the SHORTEST lifetime
 	 * to the access-point radio, whose destinations are the most expensive to
-	 * re-acquire and the ones we are obliged to answer for. */
-	if (interface && interface.policy_manual() && interface.route_for())
+	 * re-acquire and the ones we are obliged to answer for. Custody is the
+	 * community: within the interface's radius, the custody lifetime. */
+	if (interface && hops <= interface.community_radius() && interface.community_radius() > 0)
 		return _custody_path_time;
 	if (interface && interface.mode() == Type::Interface::MODE_ACCESS_POINT) return _ap_path_time;
 	if (interface && interface.mode() == Type::Interface::MODE_ROAMING)      return _roaming_path_time;
@@ -3475,7 +3477,7 @@ will announce it.
 */
 ///*static*/ void Transport::request_path(const Bytes& destination_hash, const Interface& on_interface /*= {Type::NONE}*/, const Bytes& tag /*= {}*/, bool recursive /*= false*/) {
 /*static*/ void Transport::request_path(const Bytes& destination_hash, const Interface& on_interface, const Bytes& tag /*= {}*/, bool recursive /*= false*/) {
-	// Split horizon on point-to-point links: don't ask a single-peer link
+	// No echo on point-to-point links: don't ask a single-peer link
 	// (TCP, switched LAN) for a path to a destination we already learned via
 	// that very link — its one peer is exactly who told us. Genuine discovery
 	// of an unknown destination still goes out (next_hop_interface() is NONE
@@ -3877,13 +3879,10 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 		DBGF_DEMOTE("path request %s%s from local client: forwarding", destination_hash.toHex().c_str(), interface_str.c_str());
 		Bytes request_tag = Identity::get_random_hash();
 		for (auto& [hash, interface] : _interfaces) {
-			// Don't propagate path requests onto access-point interfaces. Like
-			// announces (see outbound()'s AP block), an AP interface serves leaf
-			// clients at the edge; spraying the rest of the network's path-
-			// request discovery onto it floods the (often slow) RF segment.
-			// Requests that arrive FROM an AP client are still answered directly
-			// via path responses; this only suppresses onward propagation.
-			if (interface != attached_interface && interface.mode() != Type::Interface::MODE_ACCESS_POINT) {
+			// A local client's search is this node's own errand: every OUT
+			// interface except the client's own is asked. Whose errands get
+			// run at all is the requestor-side gate in path_search_possible.
+			if (interface != attached_interface) {
 				request_path(destination_hash, interface, request_tag);
 			}
 		}
@@ -3917,14 +3916,11 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 				// Discovery still forwards out *other* interfaces (stock
 				// Reticulum behaviour); genuine multi-hop LoRa paths still
 				// propagate via normal announce flooding through transports.
-				// Access-point interfaces are skipped: like announces, we don't
-				// spray discovery onto an edge/leaf RF segment (see outbound()'s
-				// AP block). Requests from AP clients are still answered directly.
+				// Whose requests get searched at all is the requestor-side
+				// community gate in path_search_possible; a search we did
+				// take on goes out everywhere it might be answered.
 				if (interface == attached_interface) {
 					TRACEF("Transport::path_request: not requesting path on same interface %s", interface.toString().c_str());
-				}
-				else if (interface.mode() == Type::Interface::MODE_ACCESS_POINT) {
-					TRACEF("Transport::path_request: not requesting path on access-point interface %s", interface.toString().c_str());
 				}
 				else {
 					TRACEF("Transport::path_request: requesting path on interface %s", interface.toString().c_str());
@@ -4708,8 +4704,8 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 /* Spangap deviation: a necessary condition for relaying, checked at ingress.
  *
  * A node can be structurally unable to re-broadcast anything it hears — an
- * access-point radio blocks the transport flood by design, and the interface
- * an announce arrived on is excluded by split horizon. On such a node every
+ * access-point radio blocks the transport flood by design, and a point-to-point
+ * interface never echoes back out what arrived on it. On such a node every
  * heard announce was still stored in the announce table and retried until its
  * retry limit, walking the full outbound path each time and refusing on every
  * interface: pure churn, refilled from the ingress faster than it drained,
@@ -4719,30 +4715,31 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
  * novel and the work is proportional to the whole network's announce rate.
  * The fix has to be "do not take on work that cannot produce a packet".
  *
- * This is a NECESSARY condition, not the whole rule: it tests only the two
- * structural blocks that no later state can lift (OUT, AP mode, split
- * horizon). Rate caps, queue depth, and the roaming/boundary next-hop rules
+ * This is a NECESSARY condition, not the whole rule: it tests only the
+ * structural blocks that no later state can lift (OUT, the community radius,
+ * point-to-point echo). Rate caps, queue depth, and the roaming/boundary next-hop rules
  * stay where they were — they depend on state at emission time, and the
  * authoritative decision remains outbound()'s. So this never admits an
  * announce outbound() would drop for a structural reason, and never rejects
  * one outbound() might have sent. */
 /*static*/ bool Transport::announce_relay_possible(const Bytes& destination_hash,
-                                                   const Interface& received_on) {
-	/* Our own destinations are exempt from the AP-mode block (see outbound), so
-	 * they are always relayable — and they are a trickle, not a flood. */
+                                                   const Interface& received_on,
+                                                   uint8_t hops) {
+	/* Our own destinations are exempt from the community-radius block (see
+	 * outbound), so they are always relayable — a trickle, not a flood. */
 	if (_destinations.find(destination_hash) != _destinations.end()) return true;
 
 	for (auto& [hash, interface] : _interfaces) {
 		if (!interface.OUT()) continue;
-		/* On AUTO: AP mode exists to keep the transport network's announce
-		 * flood off the edge link, and for a destination that is not ours it
-		 * never lifts. On MANUAL: route_for decides, and an operator who says
-		 * "I am this segment's transport" gets to relay onto their own radio. */
-		if (!interface.routes_for(interface.mode() != Type::Interface::MODE_ACCESS_POINT))
-			continue;
-		/* Split horizon on a point-to-point link: echoing the announce back out
+		/* Relay work is done for the members on the egress interface: a
+		 * forwarded announce is re-broadcast only within their community
+		 * radius. An interface with no community (radius 0 — an uplink)
+		 * relays nothing; the world reaches its members through path
+		 * requests answered from custody. */
+		if (hops > interface.community_radius()) continue;
+		/* On a point-to-point link, echoing the announce back out
 		 * the interface it came in on returns it to the one peer that has it.
-		 * A medium fact, not policy — route_for has no vote here. */
+		 * A medium fact, not policy — the radius has no vote here. */
 		if (interface.point_to_point() && received_on &&
 		    received_on.get_hash() == interface.get_hash()) continue;
 		return true;
@@ -4752,33 +4749,34 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 
 /* Spangap deviation: the same necessary condition, for path discovery.
  *
- * Searching on someone's behalf means forwarding their request onward, and the
- * forwarding loop excludes the interface it came in on (split horizon) and
- * access-point interfaces. When those are all of them the search reaches
+ * Searching on someone's behalf means forwarding their request onward, and
+ * the forwarding loop excludes the interface it came in on (no echo on
+ * point-to-point). When that is all of them the search reaches
  * nobody — but a `_discovery_path_requests` entry was still booked, logged,
  * and later expired, once per request, for a search that never left the node.
- * A TCP-fed node with one AP radio does this for every path request the wider
- * network asks it, which is where the expiry storm came from: the cleanup was
- * rate-limited, the work never should have existed.
+ * A node whose only interface is the requestor's does this for every path
+ * request it is asked, which is where the expiry storm came from: the cleanup
+ * was rate-limited, the work never should have existed.
  *
  * Mirrors the forwarding loop's own exclusions, and nothing else — the rest of
  * request_path()'s decisions (its point-to-point learned-on check) still apply
  * per interface at send time. */
 /*static*/ bool Transport::path_search_possible(const Interface& requestor) {
 	/* Searching is asymmetric with relaying, and the asymmetry is the point.
-	 * Relaying is about the destination side — if it can reach a segment we
-	 * serve, carry it. Searching is about the REQUESTOR side: we look things
-	 * up on behalf of the nodes we are custodian of. A request from an
-	 * interface we do not route for is not our errand, however well we could
-	 * run it — otherwise the wider network's discovery load lands on our
-	 * radio, which is exactly what asking to be a gateway must not mean. */
-	if (requestor && requestor.policy_manual() && !requestor.route_for()) return false;
+	 * Relaying is about the egress side — the members listening there.
+	 * Searching is about the REQUESTOR side: we look things up on behalf of
+	 * our community. A request arriving on an interface with no community
+	 * (radius 0) is not our errand, however well we could run it — otherwise
+	 * the wider network's discovery load lands on this node, which is exactly
+	 * what being an uplink's customer must not mean. A search we do take on
+	 * goes out every other interface — the answer may as well live behind
+	 * the uplink as deeper in the community. */
+	if (requestor && !is_local_client_interface(requestor)
+	    && requestor.community_radius() == 0) return false;
 
 	for (auto& [hash, interface] : _interfaces) {
 		if (!interface.OUT()) continue;
 		if (requestor && interface == requestor) continue;
-		if (!interface.routes_for(interface.mode() != Type::Interface::MODE_ACCESS_POINT))
-			continue;
 		return true;
 	}
 	return false;
