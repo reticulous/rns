@@ -251,9 +251,54 @@ Recall last heard app_data for a destination hash.
 	}
 	Packet announce(Bytes(raw, n));
 	if (!announce.unpack()) return {Bytes::NONE};
-	const size_t prefix = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8;
+	const size_t prefix = announce_app_data_offset(announce);
 	if (announce.data().size() <= prefix) return {Bytes::NONE};
 	return announce.data().mid(prefix);
+}
+
+/*static*/ Bytes Identity::announce_ratchet(const Packet& packet) {
+	if (packet.context_flag() != Type::Packet::FLAG_SET) return {Bytes::NONE};
+	const size_t off = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8;
+	if (packet.data().size() < off + RATCHETSIZE/8 + SIGLENGTH/8) return {Bytes::NONE};
+	return packet.data().mid(off, RATCHETSIZE/8);
+}
+
+/*static*/ size_t Identity::announce_app_data_offset(const Packet& packet) {
+	size_t off = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8;
+	if (packet.context_flag() == Type::Packet::FLAG_SET) off += RATCHETSIZE/8;
+	return off;
+}
+
+/*
+Recall the ratchet a destination last announced.
+
+:param destination_hash: Destination hash as *bytes*.
+:returns: 32-byte X25519 public ratchet, or empty.
+*/
+/*static*/ Bytes Identity::get_ratchet(const Bytes& destination_hash) {
+	if (destination_hash.size() != Type::Reticulum::TRUNCATED_HASHLENGTH/8) return {Bytes::NONE};
+
+	/* The ratchet is not a directory field: it is read back out of the
+	 * retained announce, exactly as recall_app_data reads app_data. That ties
+	 * a peer's ratchet to the announce it arrived in — one lifetime, one
+	 * eviction order, nothing to expire separately — and costs an unpack on
+	 * the paths that need it. Only SINGLE-destination sends land here (a Link
+	 * carries its own ephemeral secrecy), so that is once per opportunistic
+	 * packet, not once per packet of a transfer. */
+	rdir_entry_t known;
+	if (!rdirPeekEntry(destination_hash.data(), &known)) return {Bytes::NONE};
+	uint32_t now = (uint32_t)OS::time();
+	if (now > known.last_heard && now - known.last_heard > RATCHET_EXPIRY) {
+		TRACEF("Identity::get_ratchet: announce for %s is older than the ratchet expiry", destination_hash.toHex().c_str());
+		return {Bytes::NONE};
+	}
+
+	uint8_t raw[Type::Reticulum::MTU];
+	size_t n = rdirCopyBlob(destination_hash.data(), raw, sizeof(raw));
+	if (n == 0) return {Bytes::NONE};
+	Packet announce(Bytes(raw, n));
+	if (!announce.unpack()) return {Bytes::NONE};
+	return announce_ratchet(announce);
 }
 
 /*static*/ bool Identity::validate_announce(const Packet& packet) {
@@ -261,28 +306,27 @@ Recall last heard app_data for a destination hash.
 		if (packet.packet_type() == Type::Packet::ANNOUNCE) {
 			Bytes destination_hash = packet.destination_hash();
 			//TRACEF("Identity::validate_announce: destination_hash: %s", packet.destination_hash().toHex().c_str());
-			/* A set context flag marks a RATCHETED announce: a 32-byte ratchet
-			 * key sits between the random hash and the signature, and it is
-			 * part of the signed data. Upstream announces ratchets by default
-			 * on LXMF delivery destinations, so both layouts arrive routinely.
-			 * The ratchet itself is validated and skipped — this build
-			 * encrypts to the identity key, which every receiver accepts. */
+			/* A set context flag marks a RATCHETED announce: a 32-byte
+			 * ratchet key sits between the random hash and the signature, and
+			 * it is part of the signed data. Upstream announces ratchets by
+			 * default on LXMF delivery destinations, so both layouts arrive
+			 * routinely. The ratchet stays in the announce we retain; senders
+			 * read it back with Identity::get_ratchet. */
 			const bool   ratcheted = packet.context_flag() == Type::Packet::FLAG_SET;
 			const size_t KS = KEYSIZE/8, NH = NAME_HASH_LENGTH/8, RH = RANDOM_HASH_LENGTH/8;
+			Bytes ratchet = announce_ratchet(packet);
+			if (ratcheted && !ratchet) {
+				DEBUG("Identity::validate_announce: ratcheted announce too short to hold its ratchet, rejected");
+				return false;
+			}
 			Bytes public_key  = packet.data().left(KS);
 			Bytes name_hash   = packet.data().mid(KS, NH);
 			Bytes random_hash = packet.data().mid(KS + NH, RH);
-			size_t off = KS + NH + RH;
-			Bytes ratchet;
-			if (ratcheted) {
-				ratchet = packet.data().mid(off, RATCHETSIZE/8);
-				off += RATCHETSIZE/8;
-			}
-			Bytes signature = packet.data().mid(off, SIGLENGTH/8);
-			off += SIGLENGTH/8;
+			const size_t app_off = announce_app_data_offset(packet);
+			Bytes signature = packet.data().mid(app_off - SIGLENGTH/8, SIGLENGTH/8);
 			Bytes app_data;
-			if (packet.data().size() > off) {
-				app_data = packet.data().mid(off);
+			if (packet.data().size() > app_off) {
+				app_data = packet.data().mid(app_off);
 			}
 			//TRACEF("Identity::validate_announce: app_data:         %s", app_data.toHex().c_str());
 
@@ -394,7 +438,7 @@ Encrypts information for the identity.
 :returns: Ciphertext token as *bytes*.
 :raises: *KeyError* if the instance does not hold a public key.
 */
-const Bytes Identity::encrypt(const Bytes& plaintext) const {
+const Bytes Identity::encrypt(const Bytes& plaintext, const Bytes& ratchet /*= {Bytes::NONE}*/) const {
 	assert(_object);
 	TRACE("Identity::encrypt: encrypting data...");
 	if (!_object->_pub) {
@@ -404,9 +448,20 @@ const Bytes Identity::encrypt(const Bytes& plaintext) const {
 	Bytes ephemeral_pub_bytes = ephemeral_key->public_key()->public_bytes();
 	TRACEF("Identity::encrypt: ephemeral public key: %s", ephemeral_pub_bytes.toHex().c_str());
 
-	// CRYPTO: create shared key for key exchange using own public key
+	// CRYPTO: create shared key for key exchange using the destination's
+	// ratchet when one was supplied, else its long-term public key. The salt
+	// stays the identity hash either way, so the receiver derives the same
+	// key from whichever private half opens the token.
 	//shared_key = ephemeral_key.exchange(self.pub)
-	Bytes shared_key = ephemeral_key->exchange(_object->_pub_bytes);
+	const bool ratcheted = (ratchet.size() == RATCHETSIZE/8);
+	if (ratcheted) {
+		/* Debug rather than trace: one line per opportunistic packet or
+		 * store-and-forward envelope, and the only evidence at run time that a
+		 * send got forward secrecy rather than falling back to the identity
+		 * key. Link traffic never reaches here. */
+		DEBUGF("Identity::encrypt: encrypting to ratchet %s", ratchet_id(ratchet).toHex().c_str());
+	}
+	Bytes shared_key = ephemeral_key->exchange(ratcheted ? ratchet : _object->_pub_bytes);
 	TRACEF("Identity::encrypt: shared key:           %s", shared_key.toHex().c_str());
 
 	Bytes derived_key = Cryptography::hkdf(
@@ -434,7 +489,7 @@ Decrypts information for the identity.
 :returns: Plaintext as *bytes*, or *None* if decryption fails.
 :raises: *KeyError* if the instance does not hold a private key.
 */
-const Bytes Identity::decrypt(const Bytes& ciphertext_token) const {
+const Bytes Identity::decrypt(const Bytes& ciphertext_token, const std::vector<Bytes>& ratchets /*= {}*/) const {
 	assert(_object);
 	TRACE("Identity::decrypt: decrypting data...");
 	if (!_object->_prv) {
@@ -451,6 +506,32 @@ const Bytes Identity::decrypt(const Bytes& ciphertext_token) const {
 		//peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
 		//Cryptography::X25519PublicKey::Ptr peer_pub = Cryptography::X25519PublicKey::from_public_bytes(peer_pub_bytes);
 		TRACEF("Identity::decrypt: peer public key:      %s", peer_pub_bytes.toHex().c_str());
+
+		/* A sender that heard one of our ratchets encrypted to it, and the
+		 * token says nothing about which: try each ratchet private, newest
+		 * first, and fall through to the identity key for senders that heard
+		 * no ratchet (or heard a rotated-out one). Every attempt is a full
+		 * ECDH + HKDF + token open, so the retained-ratchet count is the
+		 * ceiling on what a bad token costs us. */
+		for (const Bytes& ratchet_prv : ratchets) {
+			if (ratchet_prv.size() != RATCHETSIZE/8) continue;
+			try {
+				Bytes ratchet_shared = Cryptography::X25519PrivateKey::from_private_bytes(ratchet_prv)
+				                       ->exchange(peer_pub_bytes);
+				Cryptography::Token ratchet_token(Cryptography::hkdf(
+					DERIVED_KEY_LENGTH, ratchet_shared, get_salt(), get_context()));
+				Bytes opened = ratchet_token.decrypt(ciphertext_token.mid(Type::Identity::KEYSIZE/8/2));
+				if (opened) {
+					DEBUGF("Identity::decrypt: opened with ratchet %s",
+					       ratchet_id(ratchet_public_bytes(ratchet_prv)).toHex().c_str());
+					return opened;
+				}
+			}
+			catch (const std::exception&) {
+				// Not this ratchet — an authentication failure is the normal
+				// outcome for every ratchet but the one that was used.
+			}
+		}
 
 		// CRYPTO: create shared key for key exchange using peer public key
 		//shared_key = _object->_prv->exchange(peer_pub);

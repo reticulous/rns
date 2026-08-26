@@ -8,8 +8,11 @@
 #include "rnsd.h"
 #include "mem.h"
 #include "spangap.h"
+#include "compat.h"       /* millis() — the announce beat's clock */
 #include "ports.h"
 #include "auth.h"
+
+#include "esp_random.h"   /* announce-beat jitter */
 
 /* mR's Log.h declares free functions `info`, `warn`, `error`, `debug`, ...
  * inside namespace RNS. spangap's log.h defines `info`/`warn`/`err`/etc. as
@@ -312,6 +315,13 @@ static our_dest_t* s_our_dests = nullptr;
  * gates whether that hand-off prove happens at all. */
 static bool s_prove_incoming = true;
 
+/* Ratchet dial (s.rnsd.ratchets, default on). Off makes every hosted
+ * destination announce and decrypt exactly as it did before ratchets: senders
+ * encrypt to our identity key, with no forward secrecy outside a Link. Kept as
+ * a dial because a ratchet we advertise is one every compliant sender will use,
+ * and turning it off is the only way back if that ever needs to happen. */
+static bool s_ratchets_enabled = true;
+
 /* Path-request retry cadence: exponential backoff, not a fixed interval.
  * A parked send fires its first request immediately; ourDestRetryDelay()
  * gives the gap before each *subsequent* request, indexed by how many
@@ -497,25 +507,68 @@ static int s_iface_event_seq = 0;
  * lower alongside the rest of the protocol plumbing. Same 10 s
  * debounce-after-iface-up + periodic schedule as lxmf's announces. */
 static RNS::Destination s_probe_dest{RNS::Type::NONE};
-static TickType_t       s_rnsd_announce_due_tick  = 0;
-static TickType_t       s_rnsd_last_announce_tick = 0;
 
-/* Hosted-destination announce replay for newly registered interfaces —
- * armed by publishIfaceUp, fired from the tick, and PINNED to the new
- * interfaces via attached_interface: a reconnect on one interface must never
- * cause announces on another (a BLE peer cycling every few seconds would
- * otherwise spend LoRa airtime each time). due=0 means none pending; the
- * bitmask holds the iface slots awaiting their replay. */
+/* Hosted-destination announce replay, PINNED per interface via
+ * attached_interface: an event on one interface must never cause announces on
+ * another (a BLE peer cycling every few seconds would otherwise spend LoRa
+ * airtime each time). due=0 means none pending; the bitmask holds the iface
+ * slots awaiting their replay. Armed by publishIfaceUp, by an interface's own
+ * beat (RNSD_IFACE_AUX_ANNOUNCE), and by the coalesced application announce
+ * below; fired from the tick. */
 static TickType_t       s_dest_replay_due_tick = 0;
 static uint32_t         s_dest_replay_pending  = 0;
 static_assert(RNSD_MAX_IFACES <= 32, "replay bitmask holds one bit per iface slot");
-#define RNSD_ANNOUNCE_DEBOUNCE_MS 10000
-/* The per-interface announce replay fires much sooner: it spends only the new
+/* The per-interface announce replay fires soon: it spends only the new
  * link's own airtime, and a freshly linked peer that hears NOTHING may hang
- * up long before ten seconds — Columba's central gives a silent link ~5 s.
- * Long enough to coalesce a registration burst, short enough to beat every
- * peer's patience. */
+ * up in seconds — Columba's central gives a silent link ~5 s. Long enough to
+ * coalesce a registration burst, short enough to beat every peer's patience. */
 #define RNSD_REPLAY_DEBOUNCE_MS   1500
+
+/* An application setting a new stored announce is coalesced for a minute and
+ * then aired on EVERY interface. Boot is what this is for: lxmf, rnsh and rlpg
+ * all announce within a few seconds of the ecosystem coming up, and each one
+ * arriving separately would put four sweeps on a LoRa segment where one says
+ * exactly the same thing. A minute is long enough to gather a boot and any
+ * settings change an operator makes in one sitting, short enough that nobody
+ * watching a name change waits on it. due=0 means nothing pending. */
+static TickType_t       s_dest_announce_due_tick = 0;
+#define RNSD_ANNOUNCE_COALESCE_MS 60000
+
+/* Arm the replay for `slots`, no later than `delay_ms` from now. Several
+ * arrivals inside one debounce window merge — the bits accumulate and the
+ * earliest deadline wins — which is what turns a registration burst, or a
+ * scan that discovers three LAN peers at once, into one pass. */
+static void armDestReplay(uint32_t slots, uint32_t delay_ms)
+{
+    if (!slots) return;
+    s_dest_replay_pending |= slots;
+    TickType_t due = xTaskGetTickCount() + pdMS_TO_TICKS(delay_ms);
+    if (!due) due = 1;                     /* 0 is the "nothing pending" value */
+    if (!s_dest_replay_due_tick || (int32_t)(s_dest_replay_due_tick - due) > 0)
+        s_dest_replay_due_tick = due;
+}
+
+/* Every registered slot, for the calls whose scope is "the whole node". */
+static uint32_t ifaceSlotMask(void)
+{
+    uint32_t m = 0;
+    for (int j = 0; j < RNSD_MAX_IFACES; j++) if (s_ifaces[j].used) m |= (1u << j);
+    return m;
+}
+
+/* Slots whose registered name starts with `prefix` ("" = all). The prefix is
+ * the interface straddle's handle on its own registrations however many there
+ * are of them — see rnsd_iface_announce_t. */
+static uint32_t ifaceSlotMaskByPrefix(const char* prefix)
+{
+    if (!prefix || !prefix[0]) return ifaceSlotMask();
+    size_t n = strlen(prefix);
+    uint32_t m = 0;
+    for (int j = 0; j < RNSD_MAX_IFACES; j++)
+        if (s_ifaces[j].used && strncmp(s_ifaces[j].info.name, prefix, n) == 0)
+            m |= (1u << j);
+    return m;
+}
 
 static void publishIfaceUp(const iface_t& i)
 {
@@ -529,24 +582,14 @@ static void publishIfaceUp(const iface_t& i)
     storageSet("rnsd.iface_event_seq", ++s_iface_event_seq);
     storageEnd();
     /* The hosted destinations AND the probe reach the new interface through
-     * the pinned replay below — never through a broadcast announce, which
-     * would spend every other interface's airtime on this one's reconnect.
-     * The probe's own periodic broadcast cadence is untouched. */
-    /* The hosted destinations, because: announced before this
-     * interface existed, they are invisible on it until each client's own
-     * periodic cycle — half an hour for lxmf, which on a freshly linked BLE
-     * peer reads as a node that never speaks. Debounced like the probe, and
-     * pinned to THIS interface at fire time — no other interface hears it. */
-    {
-        int slot = (int)(&i - s_ifaces);
-        if (slot >= 0 && slot < RNSD_MAX_IFACES)
-            s_dest_replay_pending |= (1u << slot);
-        TickType_t due = xTaskGetTickCount() +
-            pdMS_TO_TICKS(RNSD_REPLAY_DEBOUNCE_MS);
-        if (!s_dest_replay_due_tick ||
-            (int32_t)(s_dest_replay_due_tick - due) > 0)
-            s_dest_replay_due_tick = due;
-    }
+     * the pinned replay — never through a broadcast announce, which would
+     * spend every other interface's airtime on this one's reconnect. They have
+     * to: announced before this interface existed, they are invisible on it
+     * until its own beat comes round — half an hour, which on a freshly linked
+     * BLE peer reads as a node that never speaks. */
+    int slot = (int)(&i - s_ifaces);
+    if (slot >= 0 && slot < RNSD_MAX_IFACES)
+        armDestReplay(1u << slot, RNSD_REPLAY_DEBOUNCE_MS);
 }
 
 static void publishIfaceDown(const iface_t& i)
@@ -675,6 +718,30 @@ static void onTransportRecv(int handle, size_t /*bytesAvail*/)
         RNS::Bytes data(pkt, n);
         i->mr_iface.handle_incoming(data);
     }
+}
+
+/* Out-of-band aux frames on RNSD_PORT_IFACE. Runs on the rnsd task (itsOnAux
+ * dispatches on the registering task), which is where the replay bookkeeping
+ * lives — so the interface straddle's side of this is a bare fire-and-forget
+ * from whatever task noticed a peer, a deadline or a button. */
+static void onIfaceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
+{
+    if (len < 1) return;
+    uint8_t op = ((const uint8_t*)data)[0];
+    if (op != RNSD_IFACE_AUX_ANNOUNCE) { warn("iface aux: unknown op 0x%02x", op); return; }
+    if (len < sizeof(rnsd_iface_announce_t)) { err("iface aux: ANNOUNCE too short (%zu)", len); return; }
+    rnsd_iface_announce_t m;
+    memcpy(&m, data, sizeof(m));
+    m.prefix[sizeof(m.prefix) - 1] = '\0';
+    uint32_t slots = ifaceSlotMaskByPrefix(m.prefix);
+    if (!slots) {
+        /* Not an error: an interface whose beat fires while it happens to have
+         * no registration — every BLE peer gone, the LAN down — asks for
+         * nothing and gets nothing. It will announce on its next registration. */
+        verb("iface aux: announce on '%s' matched no interface", m.prefix);
+        return;
+    }
+    armDestReplay(slots, RNSD_REPLAY_DEBOUNCE_MS);
 }
 
 /* ─────────────── RNSD_PORT_DEST handlers ─────────────── */
@@ -1405,6 +1472,63 @@ static void onOurDestInbound(const RNS::Bytes& plaintext, const RNS::Packet& pac
     }
 }
 
+/* ── hosted-destination ratchets ──
+ *
+ * mR keeps a destination's ratchet private keys in RAM and calls back here to
+ * persist them, because it has no storage of its own. They live under
+ * `secrets.rnsd.ratchets.<dest_hex>` as newest-first hex — the same shelf as
+ * the identity keys, never leaving the device — and are loaded before the
+ * destination goes up so mail already in flight to a pre-reboot ratchet still
+ * opens. See Type::Destination::RATCHET_COUNT for what the retained window
+ * costs in both directions. */
+
+static std::string ourDestRatchetKey(const RNS::Bytes& dest_hash)
+{
+    return std::string("secrets.rnsd.ratchets.") + dest_hash.toHex();
+}
+
+static std::vector<RNS::Bytes> ourDestRatchetsLoad(const RNS::Bytes& dest_hash)
+{
+    std::vector<RNS::Bytes> privs;
+    std::string hex = storageGetStr(ourDestRatchetKey(dest_hash).c_str(), "");
+    const size_t chars = RNSD_RATCHET_LEN * 2;
+    if (hex.size() % chars != 0) {
+        warn("ratchets for %s are malformed (%zu chars) — starting a fresh set",
+             dest_hash.toHex().c_str(), hex.size());
+        return privs;
+    }
+    for (size_t i = 0; i + chars <= hex.size(); i += chars) {
+        RNS::Bytes prv;
+        prv.assignHex((const uint8_t*)hex.data() + i, chars);
+        if (prv.size() == RNSD_RATCHET_LEN) privs.push_back(prv);
+    }
+    return privs;
+}
+
+static void ourDestRatchetsPersist(const RNS::Bytes& dest_hash,
+                                   const std::vector<RNS::Bytes>& privs)
+{
+    std::string hex;
+    hex.reserve(privs.size() * RNSD_RATCHET_LEN * 2);
+    for (const RNS::Bytes& prv : privs) hex += prv.toHex();
+    storageSet(ourDestRatchetKey(dest_hash).c_str(), hex.c_str());
+}
+
+/* The retained ratchet privates of a destination we host, for trial-decrypting
+ * a payload handed to us out of band (rnsdDecryptSelf). Empty for anything we
+ * do not host or that has ratchets off. */
+static std::vector<RNS::Bytes> ourDestRatchets(const uint8_t dest_hash[RNSD_DEST_HASH_LEN])
+{
+    if (!s_our_dests || !dest_hash) return {};
+    RNS::Bytes want(dest_hash, RNSD_DEST_HASH_LEN);
+    for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++) {
+        our_dest_t& c = s_our_dests[j];
+        if (!c.used || !c.listener_dest || c.listener_hash != want) continue;
+        return c.listener_dest.ratchets();
+    }
+    return {};
+}
+
 static int onOurDestConnect(int handle, const void* data, size_t len)
 {
     if (len != sizeof(rnsd_dest_connect_t)) {
@@ -1482,6 +1606,17 @@ static int onOurDestConnect(int handle, const void* data, size_t len)
          * hand-off prove happens at all is the s.rnsd.prove_incoming dial,
          * cached in s_prove_incoming (live-mirrored in rnsdTaskMain). */
         d.set_proof_strategy(RNS::Type::Destination::PROVE_NONE);
+        /* Forward secrecy for opportunistic traffic and for store-and-forward
+         * payloads left with a third party. Announcing a ratchet is only safe
+         * because decrypt() tries our retained privates first and the identity
+         * key after, so senders that heard no ratchet still reach us. */
+        if (s_ratchets_enabled && dtype == RNS::Type::Destination::SINGLE) {
+            RNS::Bytes dest_hash = d.hash();
+            d.enable_ratchets(ourDestRatchetsLoad(dest_hash),
+                              [dest_hash](const std::vector<RNS::Bytes>& privs) {
+                                  ourDestRatchetsPersist(dest_hash, privs);
+                              });
+        }
         slot->listener_identity = id;
         slot->listener_dest     = d;
         slot->listener_hash     = d.hash();
@@ -1596,27 +1731,29 @@ static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
             }
             RNS::Bytes app_data;
             if (n > 1) app_data.assign(buf + 1, n - 1);
-            /* Cache first: this is what a later interface registration
-             * replays, and it is also what saves an announce made before
-             * any interface exists from being lost outright. */
+            /* The opcode SETS this destination's stored announce; it does not
+             * schedule anything. The bytes are what every replay from here on
+             * carries — a later interface registration, an interface's own
+             * beat, the coalesced sweep below — and caching them first is also
+             * what saves an announce made before any interface exists from
+             * being lost outright. */
             c->last_announce_data = app_data;
             c->want_announce      = true;
             if (ifaceCount() == 0) {
-                info("announce held for %s aspect=%s — replayed when an "
+                info("announce stored for %s aspect=%s — aired when an "
                      "interface registers", c->listener_hash.toHex().c_str(),
                      c->req.aspect);
                 break;
             }
-            info("announcing %s aspect=%s app_data %s",
+            info("announce set for %s aspect=%s app_data %s",
                  c->listener_hash.toHex().c_str(), c->req.aspect,
                  formatAnnounceAppData(app_data).c_str());
-            try {
-                RNS::Packet ap = c->listener_dest.announce(app_data, /*path_response=*/false);
-                if (!(ap && ap.sent()))
-                    warn("announce for %s aspect=%s did NOT transmit — no ready OUT interface",
-                         c->listener_hash.toHex().c_str(), c->req.aspect);
-            } catch (const std::exception& e) {
-                err("our-dest: announce threw: %s", e.what());
+            /* Coalesce: a minute from the FIRST setter, not from the last, so
+             * a stream of them cannot push the sweep out indefinitely. */
+            if (!s_dest_announce_due_tick) {
+                s_dest_announce_due_tick = xTaskGetTickCount() +
+                    pdMS_TO_TICKS(RNSD_ANNOUNCE_COALESCE_MS);
+                if (!s_dest_announce_due_tick) s_dest_announce_due_tick = 1;
             }
             break;
         }
@@ -1759,18 +1896,6 @@ static std::string appDataPrintable(const RNS::Bytes& app_data) {
     return logSafe(app_data.data(), app_data.size());
 }
 
-/* True iff `n` bytes at `p` contain no control codes — i.e. plausibly a
- * UTF-8 / ASCII display name. Allows >=0x80 bytes (UTF-8 multibyte). */
-static bool isPlausibleText(const uint8_t* p, size_t n) {
-    if (n == 0) return false;
-    for (size_t i = 0; i < n; i++) {
-        uint8_t b = p[i];
-        if (b == 0x7F) return false;
-        if (b < 0x20 && b != '\t' && b != '\n' && b != '\r') return false;
-    }
-    return true;
-}
-
 /* Tiny msgpack pretty-printer — bounded recursion, bounded output size.
  * Returns true iff one valid msgpack value was decoded starting at *i.
  * Handles fixint, fixstr/str8/16/32, fixarray/array16/32, fixmap/map16/32,
@@ -1910,10 +2035,12 @@ static std::string appDataMsgPack(const RNS::Bytes& app_data) {
  * single log line. Recognises (in order):
  *   - empty                                      → "(0B)"
  *   - pure msgpack                               → "(NB) mp=…"
- *   - 32B ratchet || msgpack                     → "(NB) ratchet=… mp=…"
- *   - 32B ratchet || UTF-8 text                  → "(NB) ratchet=… name=\"…\""
  *   - version byte || msgpack || trailing ratchet→ "(NB) v=XX mp=… ratchet=…"
  *   - otherwise                                  → "(NB)=\"<printable>\""
+ *
+ * An announce's own ratchet is a field ahead of the signature, not part of
+ * app_data, and is logged separately — the trailing-ratchet shape above is one
+ * client's app_data dialect, not that field.
  *
  * Used by both incoming announces (AnnounceDebugLogger) and outgoing
  * announces (our-dest ANNOUNCE / probe dest) so they format the
@@ -1932,19 +2059,6 @@ static std::string formatAnnounceAppData(const RNS::Bytes& app_data)
     std::string mp = appDataMsgPack(app_data);
     if (!mp.empty()) {
         out += "mp=" + mp;
-        return out;
-    }
-    if (app_data.size() >= 32 &&
-        !(mp = appDataMsgPackAt(app_data, 32)).empty()) {
-        RNS::Bytes ratchet(app_data.data(), 32);
-        out += "ratchet=" + ratchet.toHex() + " mp=" + mp;
-        return out;
-    }
-    if (app_data.size() >= 32 &&
-        isPlausibleText(app_data.data() + 32, app_data.size() - 32)) {
-        RNS::Bytes ratchet(app_data.data(), 32);
-        std::string name = logSafe(app_data.data() + 32, app_data.size() - 32);
-        out += "ratchet=" + ratchet.toHex() + " name=\"" + name + "\"";
         return out;
     }
     if (app_data.size() >= 33 &&
@@ -1970,6 +2084,7 @@ public:
                            const RNS::Identity& announced_identity,
                            const RNS::Bytes& app_data,
                            const RNS::Bytes& name_hash,
+                           const RNS::Bytes& ratchet,
                            uint8_t hops) override {
         (void)name_hash;
         /* Announces are everyone else's traffic and busy TCP peers deliver
@@ -1982,9 +2097,11 @@ public:
         if (lvl < ESP_LOG_VERBOSE) return;
 
         std::string body = formatAnnounceAppData(app_data);
-        verb("announce dest=%s id=%s hops=%u app_data %s",
+        verb("announce dest=%s id=%s hops=%u ratchet=%s app_data %s",
              destination_hash.toHex().c_str(),
-             announced_identity.hexhash().c_str(), (unsigned)hops, body.c_str());
+             announced_identity.hexhash().c_str(), (unsigned)hops,
+             ratchet ? RNS::Identity::ratchet_id(ratchet).toHex().c_str() : "-",
+             body.c_str());
         if (app_data.size() > 0)
             verb("announce hex %s", app_data.toHex().c_str());
     }
@@ -1999,7 +2116,14 @@ static std::shared_ptr<AnnounceDebugLogger> s_announce_logger;
  * apply that subscriber's aspect filter and forward the event over its
  * ITS handle as one packet:
  *
- *     hops(1) | dest_hash(16) | identity_hash(16) | pubkey(64) | app_data(N)
+ *     hops(1) | dest_hash(16) | identity_hash(16) | pubkey(64) |
+ *     ratchet(32) | app_data(N)
+ *
+ * The ratchet is the announce's own field — all-zero when the destination
+ * advertises none — and never part of app_data. A subscriber that wants
+ * forward secrecy on what it sends this peer hands the dest hash to
+ * rnsdEncryptFor, which looks the ratchet up for itself; the field is here
+ * so a subscriber can also show or record it without a call back into rnsd.
  *
  * Drop-on-full (itsSend timeout=0) — slow consumers lose announces,
  * never block the rnsd task. Same fan-out shape as spangap-core's
@@ -2015,8 +2139,8 @@ struct announce_sub_t {
     uint8_t name_hash[RDIR_NAME_HASH_LEN];   /* aspect compiled, once */
 };
 
-/* hops(1) | dest(16) | identity_hash(16) | pubkey(64) | app_data(N) */
-#define RNSD_ANNOUNCE_FRAME_MAX (1 + 16 + 16 + RNSD_PUBKEY_LEN + 1024)
+/* hops(1) | dest(16) | identity_hash(16) | pubkey(64) | ratchet(32) | app_data(N) */
+#define RNSD_ANNOUNCE_FRAME_MAX (1 + 16 + 16 + RNSD_PUBKEY_LEN + RNSD_RATCHET_LEN + 1024)
 static announce_sub_t s_announce_subs[RNSD_MAX_ANNOUNCE_SUBS];
 
 static announce_sub_t* announceSubAlloc(void) {
@@ -2031,6 +2155,7 @@ public:
                            const RNS::Identity& announced_identity,
                            const RNS::Bytes& app_data,
                            const RNS::Bytes& name_hash,
+                           const RNS::Bytes& ratchet,
                            uint8_t hops) override
     {
         /* Build the frame once. RNS announce app_data is bounded by mR's
@@ -2062,6 +2187,12 @@ public:
         std::memcpy(frame + o, dest_hash.data(), 16);                 o += 16;
         std::memcpy(frame + o, announced_identity.hash().data(), 16); o += 16;
         std::memcpy(frame + o, pubkey.data(), RNSD_PUBKEY_LEN);       o += RNSD_PUBKEY_LEN;
+        /* All-zero = this destination advertises no ratchet. */
+        if (ratchet.size() == RNSD_RATCHET_LEN)
+            std::memcpy(frame + o, ratchet.data(), RNSD_RATCHET_LEN);
+        else
+            std::memset(frame + o, 0, RNSD_RATCHET_LEN);
+        o += RNSD_RATCHET_LEN;
         if (app_n > 0) std::memcpy(frame + o, app_data.data(), app_n);
         size_t frame_n = o + app_n;
 
@@ -2105,8 +2236,14 @@ static void rnsdProbeDestUp(void)
         s_probe_dest.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
         info("probe dest up: %s (auto-proves incoming packets)",
              s_probe_dest.hash().toHex().c_str());
-        s_rnsd_announce_due_tick = xTaskGetTickCount() +
-            pdMS_TO_TICKS(RNSD_ANNOUNCE_DEBOUNCE_MS);
+        /* The probe rides every replay (replayOurDestAnnounces airs it
+         * alongside the hosted destinations), so turning it on mid-run needs
+         * only the sweep an application announce would get. */
+        if (!s_dest_announce_due_tick) {
+            s_dest_announce_due_tick = xTaskGetTickCount() +
+                pdMS_TO_TICKS(RNSD_ANNOUNCE_COALESCE_MS);
+            if (!s_dest_announce_due_tick) s_dest_announce_due_tick = 1;
+        }
     } catch (const std::exception& e) {
         err("probe dest construct threw: %s", e.what());
     }
@@ -2119,25 +2256,6 @@ static void rnsdProbeDestDown(void)
     catch (const std::exception& e) { warn("deregister_destination threw: %s", e.what()); }
     s_probe_dest = RNS::Destination(RNS::Type::NONE);
     info("probe dest down");
-}
-
-static void sendProbeAnnounce(void)
-{
-    if (!s_probe_dest) return;
-    /* Hold announces until at least one interface is up — with none registered
-     * nothing reaches the air, so announcing just churns and logs a false success. */
-    if (ifaceCount() == 0) { verb("probe announce held — no interface up"); return; }
-    RNS::Bytes empty;
-    info("announcing %s aspect=rnstransport.probe app_data %s",
-         s_probe_dest.hash().toHex().c_str(),
-         formatAnnounceAppData(empty).c_str());
-    try {
-        s_probe_dest.announce(empty, /*path_response=*/false);
-        TickType_t t = xTaskGetTickCount();
-        s_rnsd_last_announce_tick = (t == 0) ? 1 : t;
-    } catch (const std::exception& e) {
-        err("probe announce threw: %s", e.what());
-    }
 }
 
 static void onRespondToProbesChange(const char* /*key*/, const char* val)
@@ -3449,10 +3567,15 @@ static TickType_t nextDeadline(void)
     TickType_t now = xTaskGetTickCount();
     TickType_t due = s_lastPublishTick + pdMS_TO_TICKS(s_tickPeriodMs);
     /* A pending per-interface announce replay must not wait for a backed-off
-     * cadence: a freshly linked peer hearing nothing hangs up in seconds. */
+     * cadence: a freshly linked peer hearing nothing hangs up in seconds. The
+     * coalesced application announce is not urgent, but it does have to land
+     * on an idle node, where nothing else would wake us for a minute. */
     if (s_dest_replay_due_tick != 0 &&
         (int32_t)(s_dest_replay_due_tick - due) < 0)
         due = s_dest_replay_due_tick;
+    if (s_dest_announce_due_tick != 0 &&
+        (int32_t)(s_dest_announce_due_tick - due) < 0)
+        due = s_dest_announce_due_tick;
     if (due <= now) return 0;
     return due - now;
 }
@@ -3620,6 +3743,7 @@ bool rnsdDestinationHashFromPubkey(const uint8_t pubkey[RNSD_PUBKEY_LEN],
 }
 
 bool rnsdEncryptFor(const uint8_t pubkey[RNSD_PUBKEY_LEN],
+                    const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                     const uint8_t* in, size_t in_len,
                     uint8_t* out, size_t* out_len)
 {
@@ -3627,7 +3751,10 @@ bool rnsdEncryptFor(const uint8_t pubkey[RNSD_PUBKEY_LEN],
     try {
         RNS::Identity id(false);
         id.load_public_key(RNS::Bytes(pubkey, RNSD_PUBKEY_LEN));
-        RNS::Bytes token = id.encrypt(RNS::Bytes(in, in_len));
+        RNS::Bytes ratchet;
+        if (dest_hash)
+            ratchet = RNS::Identity::get_ratchet(RNS::Bytes(dest_hash, RNSD_DEST_HASH_LEN));
+        RNS::Bytes token = id.encrypt(RNS::Bytes(in, in_len), ratchet);
         if (!token || token.size() == 0) return false;
         if (token.size() > in_len + RNSD_ENCRYPT_OVERHEAD) return false;
         std::memcpy(out, token.data(), token.size());
@@ -3640,6 +3767,7 @@ bool rnsdEncryptFor(const uint8_t pubkey[RNSD_PUBKEY_LEN],
 }
 
 bool rnsdDecryptSelf(const char* identity_key,
+                     const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                      const uint8_t* in, size_t in_len,
                      uint8_t* out, size_t* out_len)
 {
@@ -3647,7 +3775,13 @@ bool rnsdDecryptSelf(const char* identity_key,
     RNS::Identity id(RNS::Type::NONE);
     if (!loadIdentityFromStorage(identity_key, id)) return false;
     try {
-        RNS::Bytes plain = id.decrypt(RNS::Bytes(in, in_len));
+        /* Ratchets belong to the destination, not the identity: a payload
+         * deposited on a node days ago was encrypted to whichever ratchet
+         * that destination was advertising then, so every retained one is
+         * tried before the identity key. */
+        std::vector<RNS::Bytes> ratchets;
+        if (dest_hash) ratchets = ourDestRatchets(dest_hash);
+        RNS::Bytes plain = id.decrypt(RNS::Bytes(in, in_len), ratchets);
         if (!plain || plain.size() == 0) return false;
         if (plain.size() > in_len) return false;
         std::memcpy(out, plain.data(), plain.size());
@@ -3852,6 +3986,37 @@ int rnsdChannelOpen(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
     return itsConnect("rnsd", RNSD_PORT_CHANNEL,
                       &req, sizeof(req), pdMS_TO_TICKS(2000),
                       ref, on_recv, on_disconnect);
+}
+
+/* ─────────────── the announce beat (rnsd.h) ─────────────── */
+
+void rnsdIfaceAnnounceNow(const char* prefix)
+{
+    rnsd_iface_announce_t m = {};
+    m.op = RNSD_IFACE_AUX_ANNOUNCE;
+    if (prefix) safeStrncpy(m.prefix, prefix, sizeof(m.prefix));
+    /* Short timeout, no retry, result ignored: the worst case is one skipped
+     * announce on a node whose rnsd task is momentarily backed up, and the
+     * next beat covers it. A caller on the storage task must not block here. */
+    itsSendAux("rnsd", RNSD_PORT_IFACE, &m, sizeof(m), pdMS_TO_TICKS(50));
+}
+
+void rnsdAnnounceBeat(uint32_t* next_ms, int interval_min, const char* prefix)
+{
+    if (!next_ms) return;
+    if (interval_min <= 0) { *next_ms = 0; return; }   /* off: re-arms when turned back on */
+
+    /* ±10 %, so a fleet flashed and powered up together drifts apart instead of
+     * colliding on the same second for ever. */
+    uint32_t base = (uint32_t)interval_min * 60u * 1000u;
+    uint32_t jit  = base / 10u;
+    uint32_t gap  = base - jit + (jit ? (esp_random() % (2u * jit)) : 0u);
+
+    uint32_t now = millis();
+    if (*next_ms == 0) { *next_ms = now + gap; return; }   /* first call arms only */
+    if ((int32_t)(now - *next_ms) < 0) return;
+    *next_ms = now + gap;
+    rnsdIfaceAnnounceNow(prefix);
 }
 
 bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
@@ -6676,6 +6841,7 @@ static void rnsdTaskMain(void*)
     itsServerOnConnect(RNSD_PORT_IFACE, onTransportConnect);
     itsServerOnDisconnect(RNSD_PORT_IFACE, onTransportDisconnect);
     itsServerOnRecv(RNSD_PORT_IFACE, onTransportRecv);
+    itsOnAux(RNSD_PORT_IFACE, onIfaceAux);   /* "announce on these, now" */
 
     if (!itsServerPortOpen(RNSD_PORT_DEST, ITS_PACKET,
                            /*maxHandles=*/RNSD_MAX_OUR_DESTS,
@@ -6788,6 +6954,30 @@ static void rnsdTaskMain(void*)
      * per-destination proof strategy. */
     NOW_AND_ON_CHANGE("s.rnsd.prove_incoming", {
         s_prove_incoming = storageGetInt(key, 1) != 0;
+    });
+    /* Ratchets, live: a hosted destination picks the setting up at connect,
+     * and a change reaches the ones already up. Turning them off keeps the
+     * stored privates — mail already in flight to an advertised ratchet is
+     * still openable when they come back on. */
+    NOW_AND_ON_CHANGE("s.rnsd.ratchets", {
+        bool on = storageGetInt(key, 1) != 0;
+        if (on == s_ratchets_enabled) return;
+        s_ratchets_enabled = on;
+        if (!s_our_dests) return;
+        for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++) {
+            our_dest_t& c = s_our_dests[j];
+            if (!c.used || !c.listener_dest) continue;
+            if (c.listener_dest.type() != RNS::Type::Destination::SINGLE) continue;
+            if (on) {
+                RNS::Bytes dest_hash = c.listener_hash;
+                c.listener_dest.enable_ratchets(ourDestRatchetsLoad(dest_hash),
+                                                [dest_hash](const std::vector<RNS::Bytes>& privs) {
+                                                    ourDestRatchetsPersist(dest_hash, privs);
+                                                });
+            }
+            else c.listener_dest.disable_ratchets();
+        }
+        info("ratchets %s for hosted destinations", on ? "enabled" : "disabled");
     });
     /* Path table cap. Enforced by Transport::cull_path_table() at the
      * announce-insert site, evicting never-used-outbound paths first (oldest
@@ -6942,11 +7132,22 @@ static void rnsdTaskMain(void*)
          * so delivery detection and window-freeing are prompt. */
         channelPollAll();
 
-        /* The per-interface announce replay checks on EVERY wake, not in the
-         * cadence-gated block below: its deadline is seconds and the block's
-         * cadence backs off to a minute when the node is idle. */
+        /* Both announce deadlines are checked on EVERY wake, not in the
+         * cadence-gated block below: the replay's is seconds and the block's
+         * cadence backs off to a minute when the node is idle.
+         *
+         * The coalesced application announce is folded into the replay rather
+         * than aired itself: same bytes, same per-interface pinning, same
+         * debounce — a sweep that lands mid-window simply joins the pass that
+         * was already coming. */
+        TickType_t wake = xTaskGetTickCount();
+        if (s_dest_announce_due_tick != 0 &&
+            (int32_t)(wake - s_dest_announce_due_tick) >= 0) {
+            s_dest_announce_due_tick = 0;
+            armDestReplay(ifaceSlotMask(), 0);
+        }
         if (s_dest_replay_due_tick != 0 &&
-            (int32_t)(xTaskGetTickCount() - s_dest_replay_due_tick) >= 0) {
+            (int32_t)(wake - s_dest_replay_due_tick) >= 0) {
             s_dest_replay_due_tick = 0;
             replayOurDestAnnounces();
         }
@@ -7021,31 +7222,6 @@ static void rnsdTaskMain(void*)
                 channelTick();
                 rnsdDirPersistTick(now);
 
-                /* Rnsd-hosted announces — debounce fire + periodic check.
-                 * sendProbeAnnounce() is a no-op when the destination is
-                 * down, so flipping probe at runtime works cleanly. Cheap
-                 * either way (tick compare + maybe an mR announce). */
-                if (s_rnsd_announce_due_tick != 0 &&
-                    (int32_t)(now - s_rnsd_announce_due_tick) >= 0) {
-                    s_rnsd_announce_due_tick = 0;
-                    sendProbeAnnounce();
-                }
-                if (s_probe_dest &&
-                    s_rnsd_last_announce_tick != 0) {
-                    int announce_s = storageGetInt("s.rnsd.announce.interval", 1800);
-                    /* Signed comparison: the sendX() helpers re-read
-                     * xTaskGetTickCount() after their mR announce()
-                     * (which takes a few ms), so s_rnsd_last_announce_tick
-                     * can be *just past* the outer `now`. Unsigned
-                     * `now - last` then underflows to ~UINT32_MAX and
-                     * spuriously passes the threshold — causing a
-                     * second announce right after the debounce fire. */
-                    if (announce_s > 0 &&
-                        (int32_t)(now - s_rnsd_last_announce_tick) >=
-                            (int32_t)pdMS_TO_TICKS(announce_s * 1000)) {
-                        sendProbeAnnounce();
-                    }
-                }
             } else {
 #if 0  /* route publishing to our storage disabled */
                 publishPathTable();

@@ -27,6 +27,7 @@
 #include <string>
 #include <memory>
 #include <mutex>
+#include <vector>
 #include <cassert>
 
 namespace RNS {
@@ -100,8 +101,16 @@ namespace RNS {
 		inline const Bytes& get_salt() const { assert(_object); return _object->_hash; }
 		inline const Bytes get_context() const { return {Bytes::NONE}; }
 
-		const Bytes encrypt(const Bytes& plaintext) const;
-		const Bytes decrypt(const Bytes& ciphertext_token) const;
+		/* With a 32-byte ratchet, the ECDH target is that ephemeral key
+		 * instead of the identity's long-term public key — everything else
+		 * about the token is identical, so a ratcheted token is opened by the
+		 * same trial in decrypt() below. Anything but 32 bytes is ignored and
+		 * the identity key used. */
+		const Bytes encrypt(const Bytes& plaintext, const Bytes& ratchet = {Bytes::NONE}) const;
+		/* Ratchets are the destination's own ratchet PRIVATE keys, newest
+		 * first. There is no selector in the token, so this is a trial
+		 * decrypt: each ratchet in turn, then the identity key. */
+		const Bytes decrypt(const Bytes& ciphertext_token, const std::vector<Bytes>& ratchets = {}) const;
 		const Bytes sign(const Bytes& message) const;
 		bool validate(const Bytes& signature, const Bytes& message) const;
 		// CBA following default for reference value requires inclusiion of header
@@ -119,6 +128,34 @@ namespace RNS {
 		 * that need app_data for every announce should take it from the
 		 * announce itself — the fan-out carries it. */
 		static Bytes recall_app_data(const Bytes& destination_hash);
+
+		/* Announce tail layout. A ratcheted announce — context flag set —
+		 * carries a 32-byte X25519 ratchet between the random hash and the
+		 * signature, so everything behind the random hash moves. Every reader
+		 * of an announce's tail goes through these two rather than assuming a
+		 * layout; both fail closed on a packet too short to hold the field. */
+		static Bytes announce_ratchet(const Packet& packet);
+		static size_t announce_app_data_offset(const Packet& packet);
+
+		/* The ratchet a destination last advertised: empty when it advertises
+		 * none, when we hold no announce for it, or when that announce is
+		 * older than RATCHET_EXPIRY. Senders encrypt to this in place of the
+		 * destination's identity key (Destination::encrypt), which is what
+		 * gives forward secrecy outside a Link. */
+		static Bytes get_ratchet(const Bytes& destination_hash);
+
+		/* The 10-byte id upstream uses to name a ratchet in logs and on
+		 * packets. Not a selector — the receiver still trial-decrypts. */
+		static inline Bytes ratchet_id(const Bytes& ratchet_pub) {
+			return full_hash(ratchet_pub).left(Type::Identity::NAME_HASH_LENGTH/8);
+		}
+		static inline Bytes ratchet_public_bytes(const Bytes& ratchet_prv) {
+			return Cryptography::X25519PrivateKey::from_private_bytes(ratchet_prv)
+			       ->public_key()->public_bytes();
+		}
+		static inline Bytes generate_ratchet() {
+			return Cryptography::X25519PrivateKey::generate()->private_bytes();
+		}
 
 		/*
 		Get a SHA-256 hash of passed data.

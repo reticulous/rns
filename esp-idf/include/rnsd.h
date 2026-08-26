@@ -38,6 +38,7 @@ constexpr size_t RNSD_PUBKEY_LEN     = 64;   /* Ed25519(32) + X25519(32) public 
 constexpr size_t RNSD_PRIVKEY_LEN    = 64;   /* Ed25519(32) + X25519(32) private key */
 constexpr size_t RNSD_SIG_LEN        = 64;   /* Ed25519 signature */
 constexpr size_t RNSD_HASH_LEN       = 32;   /* SHA-256 */
+constexpr size_t RNSD_RATCHET_LEN    = 32;   /* X25519 announce ratchet, public half */
 
 /* ──────────────── task bring-up ──────────────── */
 
@@ -158,25 +159,40 @@ bool rnsdDestinationHashFromPubkey(const uint8_t pubkey[RNSD_PUBKEY_LEN],
  * mR Identity token encryption (ephemeral X25519 ECDH + HKDF +
  * AES-128-CBC + HMAC), the same construction RNS uses for opportunistic
  * packet payloads — so a token encrypted here is decryptable by any RNS
- * identity holder, and vice versa. Encryption is to the STATIC identity
- * key (this mR has no ratchets), so no forward secrecy; the intended use
- * is store-and-forward payloads that must be opaque to the forwarder.
+ * identity holder, and vice versa. The intended use is store-and-forward
+ * payloads that must be opaque to the forwarder.
  * Pure-crypto: runs inline on the caller's task. */
 
 /** Encrypt `in` for the identity whose 64-byte public key is `pubkey`.
  *  `out` must have room for `in_len + RNSD_ENCRYPT_OVERHEAD` bytes;
  *  `*out_len` receives the token size. Returns false on malformed key or
- *  crypto failure. */
+ *  crypto failure.
+ *
+ *  `dest_hash` names the destination the payload is for, so this can
+ *  encrypt to the ratchet that destination last announced (forward
+ *  secrecy) instead of its long-term key. Pass null only when there is no
+ *  destination to name — a payload encrypted to the static key is
+ *  readable forever by anyone who later obtains the recipient's identity,
+ *  which for store-and-forward mail sitting on a third party is exactly
+ *  the exposure ratchets exist to close. The recipient trial-decrypts, so
+ *  either choice interoperates. */
 #define RNSD_ENCRYPT_OVERHEAD 96   /* ephemeral pub 32 + IV 16 + pad ≤16 + HMAC 32 */
 bool rnsdEncryptFor(const uint8_t pubkey[RNSD_PUBKEY_LEN],
+                    const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                     const uint8_t* in, size_t in_len,
                     uint8_t* out, size_t* out_len);
 
 /** Decrypt a token produced by rnsdEncryptFor (or any RNS Identity
  *  encryption) with the private identity at `identity_key`. `out` must
  *  have room for `in_len` bytes; `*out_len` receives the plaintext size.
- *  Returns false if the token is malformed or not for this identity. */
+ *  Returns false if the token is malformed or not for this identity.
+ *
+ *  `dest_hash` names one of our hosted destinations; its retained ratchet
+ *  private keys are tried before the identity key, which is what makes a
+ *  ratchet-encrypted payload readable. Pass null for a payload that
+ *  cannot have been ratcheted. */
 bool rnsdDecryptSelf(const char* identity_key,
+                     const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                      const uint8_t* in, size_t in_len,
                      uint8_t* out, size_t* out_len);
 
@@ -313,6 +329,46 @@ void rnsdSetRxReportCap(const uint8_t dest_hash[RNSD_DEST_HASH_LEN], bool capabl
  *  unknown (no announce with a caps element heard since boot) or not capable.
  *  Safe from any task. */
 bool rnsdGetRxReportCap(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
+
+/* ──────────────── the announce beat ────────────────
+ *
+ * How often this node says who it is belongs to the MEDIUM, not to any
+ * application. An application's job is to keep its stored announce current —
+ * `RNSD_DEST_ANNOUNCE` sets it, and rnsd holds the bytes; when to put those
+ * bytes on the air is the interface's call, because only the interface knows
+ * what airtime costs there. So lxmf, rnsh and rlpg carry no timer, and each
+ * interface straddle drives its own beat from its own setting.
+ *
+ * rnsd never schedules an announce on its own. It announces when:
+ *
+ *   - an interface registers (the pinned replay, debounced ~1.5 s),
+ *   - an interface asks, through the two calls below,
+ *   - an application sets a new stored announce — coalesced for a minute and
+ *     then sent on every interface, so a boot that brings up four applications
+ *     spends one sweep rather than four.
+ *
+ * Both calls are fire-and-forget and safe from any task, including a storage
+ * subscription hosted on the storage task (which is what an "Announce now"
+ * button's sentinel handler is). */
+
+/** Replay every hosted destination's stored announce onto the interfaces whose
+ *  registered name starts with `prefix` — `"lora/0"` for one radio, `"lora"`
+ *  for every radio, `"ble"` for every Bluetooth peer, `"tcp"` for every
+ *  connection inbound and out, `""` for the lot. See rnsd_iface_announce_t. */
+void rnsdIfaceAnnounceNow(const char* prefix);
+
+/** The beat itself, for an interface straddle to call from its own loop:
+ *  fires rnsdIfaceAnnounceNow(prefix) once every `interval_min` minutes ± 10 %,
+ *  the jitter being what stops a fleet powered up together from announcing in
+ *  lockstep forever.
+ *
+ *  `*next_ms` is caller-owned state, zero-initialised. The first call ARMS it
+ *  rather than announcing — the registration replay has just covered this
+ *  interface, and repeating it a tick later would be pure noise. `interval_min`
+ *  0 means never on the interface's own account, which is not a long interval:
+ *  the node then announces only when an application changes what it says or
+ *  somebody presses the button. */
+void rnsdAnnounceBeat(uint32_t* next_ms, int interval_min, const char* prefix);
 
 /* ──────────────── destination / link client API ────────────────
  *

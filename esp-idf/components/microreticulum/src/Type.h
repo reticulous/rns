@@ -243,6 +243,30 @@ namespace RNS { namespace Type {
 
 		const uint8_t PR_TAG_WINDOW = 30;
 
+		/*
+		Ratchet retention for a destination we host. RATCHET_COUNT *
+		RATCHET_INTERVAL is one window read two ways, and the two pull opposite
+		directions:
+
+		- A sender keeps a ratchet it heard for up to Identity::RATCHET_EXPIRY
+		  (30 days) and encrypts to it all that time. Anything we have rotated
+		  out is unreadable, so a short window loses mail from peers that
+		  haven't heard us lately.
+		- Every retained ratchet private is a key that opens past traffic. A
+		  device seized today gives up everything sent to it inside the window,
+		  so a long window is forward secrecy deferred rather than achieved.
+
+		32 * 12 h = 16 days, between upstream's 10.7 days (512 * 30 min) and the
+		sender-side expiry, at 1 kB of key material per destination.
+
+		The count is also what a decrypt costs: there is no selector in a token,
+		so opening one means an ECDH per ratchet until one works, and a sender
+		that used no ratchet at all pays the whole set before the identity key
+		is reached. That is the third reason not to keep upstream's 512.
+		*/
+		static const uint16_t RATCHET_COUNT    = 32;
+		static const uint32_t RATCHET_INTERVAL = 60*60*12;
+
 	}
 
 	namespace Link {

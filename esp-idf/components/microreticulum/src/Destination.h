@@ -219,6 +219,34 @@ namespace RNS {
 		virtual const Bytes decrypt(const Bytes& data);
 		virtual const Bytes sign(const Bytes& message);
 
+		/*
+			Ratchets: forward secrecy for packets sent to this destination
+			outside a Link (a Link performs its own ephemeral exchange, so it
+			needs none). Enabling makes announce() advertise the newest
+			ratchet's public half — an extra 32 bytes, flagged by the
+			announce's context flag — rotate on Type::Destination::
+			RATCHET_INTERVAL, and makes decrypt() try every retained ratchet
+			before the identity key.
+
+			`privs` are our own ratchet PRIVATE keys, newest first, as loaded
+			from wherever the embedder keeps them; empty starts a fresh set.
+			mR has no storage of its own, so `persist` is called with the new
+			set on every rotation and the embedder writes it back — a ratchet
+			that does not survive a reboot black-holes every message already
+			in flight to it.
+		*/
+		void enable_ratchets(const std::vector<Bytes>& privs,
+		                     std::function<void(const std::vector<Bytes>&)> persist = nullptr);
+		void disable_ratchets();
+		/* Generates a ratchet if the interval has elapsed (or none is held),
+		   persists, and reports whether the set changed. announce() calls this
+		   for itself; nothing else has to drive it. */
+		bool rotate_ratchets();
+		inline bool ratchets_enabled() const { assert(_object); return _object->_ratchets_enabled; }
+		inline const std::vector<Bytes>& ratchets() const { assert(_object); return _object->_ratchets; }
+		/* The public half we are currently advertising, or empty. */
+		Bytes latest_ratchet() const;
+
 		// CBA
 		bool has_link(const Link& link);
 		void remove_link(const Link& link);
@@ -277,6 +305,15 @@ namespace RNS {
 			Bytes _hash;
 			Bytes _name_hash;
 			std::string _hexhash;
+
+			/* Our own ratchet private keys, newest first, and the clock that
+			 * paces rotation. Only meaningful on an IN destination — an OUT
+			 * destination encrypts to the *peer's* ratchet, which is read out
+			 * of their announce (Identity::get_ratchet) and never held here. */
+			bool _ratchets_enabled = false;
+			std::vector<Bytes> _ratchets;
+			double _latest_ratchet_time = 0;
+			std::function<void(const std::vector<Bytes>&)> _ratchet_persist;
 
 			// CBA TODO when is _default_app_data a "callable"?
 			Bytes _default_app_data;

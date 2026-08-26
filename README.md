@@ -169,7 +169,7 @@ themselves at runtime, so it has zero compile-time knowledge of which exist.
 
 | Port | Name | Purpose |
 |---|---|---|
-| 1 | `RNSD_PORT_IFACE` | Interface registration + the inbound/outbound packet pipe. |
+| 1 | `RNSD_PORT_IFACE` | Interface registration + the inbound/outbound packet pipe; aux `RNSD_IFACE_AUX_ANNOUNCE` (`rnsdIfaceAnnounceNow`). |
 | 2 | `RNSD_PORT_MAP` | Browser network-map feed (announce/path/link/iface events). |
 | 3 | `RNSD_PORT_CTL` | Browser/CLI control (list dests, force announce, rotate identity). |
 | 4 | `RNSD_PORT_DEST` | Hosted-destination API (`rnsdDestOpen`); type-tagged frames both ways. |
@@ -183,6 +183,39 @@ themselves at runtime, so it has zero compile-time knowledge of which exist.
 hand-offs; these are not client-facing.) Opcode tables for the framed ports
 (`RNSD_DEST_*`, link aux, resource aux) are in
 [`include/ports.h`](esp-idf/include/ports.h).
+
+## The announce beat — who schedules saying who we are
+
+    app  → rnsd   RNSD_DEST_ANNOUNCE <app_data>      "this is my announce now"
+    rnsd            … coalesce 60 s, then every interface
+    iface→ rnsd   RNSD_IFACE_AUX_ANNOUNCE "lora/0"   "say it on mine"
+    rnsd → iface  <announce packet>                  pinned to that interface
+
+An application's job is to keep its **stored announce** current; rnsd holds the
+bytes. **When** those bytes go on the air is each interface's call, because only
+the interface knows what airtime costs on its medium — so `lxmf`, `rnsh` and
+`rlpg` carry no announce timer and no interval setting, and every interface pane
+carries one plus an **Announce now** button.
+
+rnsd never schedules an announce on its own. It airs one when:
+
+- **an interface registers** — every hosted destination's stored announce is
+  replayed onto it, pinned to that interface, ~1.5 s after registration. This is
+  what tells a Bluetooth peer or a TCP connection who we are within seconds of
+  its arriving, and why those media need nothing else per-peer;
+- **an interface asks** — `rnsdIfaceAnnounceNow(prefix)`, addressed by
+  registered-name prefix so one call covers however many registrations a
+  straddle holds (`ble` reaches every peer, `tcp` every connection in and out,
+  `lora/0` one radio). `rnsdAnnounceBeat()` is the interval on top of it;
+- **an application sets a new announce** — coalesced for a minute and then aired
+  on every interface, so a boot that brings up four applications spends one
+  sweep rather than four.
+
+AutoInterface is the one medium with peers underneath a single registration, so
+it asks for a replay itself when a LAN peer appears. That replay reaches every
+peer rather than just the new one: outbound there is already a unicast fan-out,
+and a few hundred bytes each on a switched link is not worth the plumbing to
+address it.
 
 ## The community radius — whom we work for
 
@@ -291,7 +324,6 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 |---|---|---|
 | `s.rnsd.enable` | `1` | Master switch — is this node on the mesh at all. **Read once at boot**: when `0`, rnsd brings up no Transport/ports and never sets `rns.ready`, so interfaces and clients never start. **Changing it requires a reboot.** |
 | `s.rnsd.transport_enabled` | `0` | Act as a Reticulum transport node (forward for others). Live (no reboot). |
-| `s.rnsd.announce.interval` | `1800` | Seconds between periodic destination announces. |
 | `s.rnsd.announce.table_max` | `100` | Slots in the announce retransmission queue. Read once at Transport start: the queue is one fixed ring, so raising it later clamps rather than growing. |
 | `s.rnsd.hashlist_max` | `100` | Packet-hashlist (dedup) capacity cap (`Transport::hashlist_maxsize`). |
 | `s.rnsd.path.max` | `100` | Soft cap on resident directory records with a route. The directory's own slot count is the hard bound; this holds the resident set below it. |
@@ -313,6 +345,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.log.trace` | `0` | Add microReticulum's per-call step narration to `log rnsd verbose`. Off, verbose gives one line per event; on, it narrates the steps inside each one — a dozen lines per packet, which on a busy TCP link is the load rather than a description of it. Flips live. |
 | `s.rnsd.respond_to_probes` | `1` | Host `rnstransport.probe` and answer probes (PROVE_ALL). |
 | `s.rnsd.prove_incoming` | `1` | Emit delivery proofs for inbound packets we receive. |
+| `s.rnsd.ratchets` | `1` | Advertise a rotating ratchet key on every hosted destination's announces, so senders encrypt to it instead of our long-term identity key and past traffic stays unreadable if that key later leaks. Costs 32 bytes per announce. Live — a change reaches destinations already up. Off is interoperable in both directions: senders fall back to the identity key, and we still encrypt to a peer's ratchet when they advertise one. |
 | `s.rnsd.proof_timeout_s` | `60` | Deadline for an outbound delivery-proof receipt, stamped onto the µR receipt too so Transport keeps it validatable for exactly as long as rnsd waits. |
 | `s.rnsd.link.path_timeout_s` | `30` | Path-request / link-request retry budget. |
 | `s.rnsd.link.request_timeout_s` | `15` | Request/response (page fetch) timeout. |
@@ -354,6 +387,13 @@ Single-shot debug triggers — write a value and rnsd consumes it on its own tas
 
 `secrets.rnsd.identity` — the 128-hex private key of rnsd's default identity
 (used by `rnprobe` and any consumer that passes `""` for `identity_key`).
+
+`secrets.rnsd.ratchets.<dest_hex>` — one per hosted destination: its retained
+ratchet private keys, newest first, as hex. Written on every rotation and read
+back before the destination goes up, because a ratchet that does not survive a
+reboot black-holes every message already in flight to it. Deleting one costs
+whatever was encrypted to those ratchets and nothing else — the destination
+generates a fresh set on its next announce.
 
 ## CLI
 

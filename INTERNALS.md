@@ -605,10 +605,15 @@ the framing details:
   (optional dotted aspect filter). rnsd registers one internal `AnnounceHandler`
   with an empty filter at boot and fans each announce out to matching
   subscribers as one packet-mode message:
-  `hops(1) | dest_hash(16) | identity_hash(16) | pubkey(64) | app_data(N)`.
+  `hops(1) | dest_hash(16) | identity_hash(16) | pubkey(64) | ratchet(32) |
+  app_data(N)`.
   The public key rides along because without it a subscriber cannot cache
   anything actionable and must call back into a node-global identity map to
   send — the structural reason that map had to be large in the first place.
+  The `ratchet` field is the announce's own ratchet, all-zero when the peer
+  advertises none (§4.2). It is a field, never a prefix on `app_data`: rnsd
+  slices the tail through `Identity::announce_ratchet()` /
+  `announce_app_data_offset()` so no subscriber has to guess at a layout.
   The per-subscriber aspect filter is the announce's **carried name hash**
   matched against one compiled at subscribe time: `validate_announce` has
   already proven `dest_hash == full_hash(carried_name_hash ‖ identity)[:16]`,
@@ -673,6 +678,109 @@ the leading 16 bytes before the Reticulum `Packet` payload on send, and prepends
 `destination.hash` on receive — consumers always see self-contained frames. The
 **DIRECT / Link path does NOT strip or prepend.** Don't "unify" the two: the
 opportunistic strip/prepend is required there and wrong on the Link path.
+
+### 4.1 The announce beat
+
+    app  → rnsd   RNSD_DEST_ANNOUNCE <app_data>      set my stored announce
+    rnsd            … 60 s coalesce, then every interface
+    iface→ rnsd   RNSD_IFACE_AUX_ANNOUNCE "lora/0"   air it on mine
+    rnsd → iface  <announce packet>                  pinned via attached_interface
+
+`RNSD_DEST_ANNOUNCE` **sets** an our-dest's announce (`last_announce_data` +
+`want_announce`); it schedules nothing. Everything that airs one goes through
+`replayOurDestAnnounces()`, which walks a bitmask of interface slots and emits
+each hosted destination's stored bytes — plus the probe destination — **pinned**
+to that slot's `mr_iface`. Three things arm it, all through `armDestReplay()`:
+
+| trigger | delay | slots |
+|---|---|---|
+| `publishIfaceUp` — a registration | 1.5 s | the one that registered |
+| `RNSD_IFACE_AUX_ANNOUNCE` — an interface's beat or button | 1.5 s | every slot whose name starts with the prefix |
+| `RNSD_DEST_ANNOUNCE` — an application changed what it says | 60 s | every registered slot |
+
+The bits accumulate and the earliest deadline wins, so a registration burst or a
+scan that finds three LAN peers at once collapses into one pass.
+
+Two separate deadlines, deliberately. `s_dest_replay_due_tick` is the urgent one
+(a freshly linked peer that hears nothing hangs up in seconds — Columba's
+central gives a silent link ~5 s); `s_dest_announce_due_tick` is the minute-long
+application coalesce, held apart so a peer arriving mid-window still gets its own
+1.5 s replay instead of dragging the whole node's sweep forward. Both are checked
+on **every** wake and both pull `nextDeadline()` in — the housekeeping cadence
+backs off to a minute on an idle node, which would otherwise swallow them.
+
+**rnsd holds no interval.** How often a node says who it is is a property of the
+medium, so it lives in each interface straddle (`rnsdAnnounceBeat`, ±10 % jitter)
+and its own setting. Applications hold none either: `lxmf`, `rnsh` and `rlpg`
+announce once at bring-up and thereafter only when what they advertise changes.
+The probe destination is not special — it rides every replay rather than keeping
+the private cadence it used to have.
+
+Addressing by **name prefix** rather than by handle is what makes one call per
+straddle enough: `ble` matches every per-peer registration, `tcp` matches
+`tcp/<n>` and `tcp_in/<addr:port>` alike, `lora/0` matches one radio, `""`
+matches the lot. A prefix nothing matches is a no-op, not an error — an
+interface whose beat fires while it happens to hold no registration is a normal
+state, and it will announce on its next one.
+
+### 4.2 Ratchets
+
+    peer  → us    announce  … random_hash · ratchet(32) · signature · app_data
+                                            └ context_flag = FLAG_SET
+    us    → peer  DATA      ephemeral_pub · token(ECDH(ephemeral, ratchet))
+    peer            tries each retained ratchet private, then its identity key
+
+A ratchet is an ephemeral X25519 key a destination advertises in its announces
+and rotates. Senders encrypt to it instead of the destination's long-term
+identity key, so traffic already sent stays unreadable when that identity key
+later leaks. Links need none — their own handshake is ephemeral both ways — so
+this is about **opportunistic packets** and about **store-and-forward payloads**
+(`rnsdEncryptFor`), which sit on someone else's node until collected and are
+therefore the exposure that matters most.
+
+**Reading a peer's ratchet.** The ratchet is a field of the announce, never part
+of `app_data`, and the context flag is what says it is there. Everything that
+slices an announce tail goes through `Identity::announce_ratchet()` /
+`announce_app_data_offset()` — `validate_announce` (the ratchet is inside the
+signature), `recall_app_data`, and the fan-out in `Transport::inbound`. Nothing
+stores a ratchet separately: `Identity::get_ratchet(dest)` reads it back out of
+the retained raw announce, so a peer's ratchet has exactly the lifetime of the
+announce it arrived in and shares one eviction order with routing.
+`Destination::encrypt` calls it for every SINGLE OUT send, which is why it costs
+an unpack rather than a cache — one per opportunistic packet, never per packet
+of a transfer.
+
+**Advertising ours.** `Destination::enable_ratchets(privs, persist)` turns it on
+for a hosted destination; `announce()` rotates on
+`Type::Destination::RATCHET_INTERVAL`, puts the newest public half between the
+random hash and the signature, covers it in the signed data, and sets the
+context flag. The flag follows the bytes, not the setting — flagging an announce
+that carries no ratchet would fail its signature everywhere.
+
+mR has no storage of its own, so rnsd holds the keys: `ourDestRatchetsLoad` /
+`ourDestRatchetsPersist` keep newest-first hex at
+`secrets.rnsd.ratchets.<dest_hex>`, loaded before the destination goes up so
+mail already in flight to a pre-reboot ratchet still opens, and rewritten from
+the persist callback on every rotation. `s.rnsd.ratchets` (default 1) gates it,
+live: flipping it reaches destinations already up, and turning it off keeps the
+stored privates.
+
+**Opening what arrives.** `Identity::decrypt(token, ratchets)` trial-decrypts —
+each retained ratchet private, newest first, then the identity key. There is no
+selector in the token, so the retained count is the ceiling on what a junk token
+costs. `Destination::decrypt` passes the destination's own set;
+`rnsdDecryptSelf(identity_key, dest_hash, …)` looks the set up by destination
+hash for payloads handed to us out of band (RLPG envelopes, propagation-node
+blobs).
+
+**Ratchet enforcement is deliberately absent.** Upstream can refuse packets
+encrypted to the identity key; doing that here would drop mail from every sender
+that has not heard a current announce, and upstream leaves it off by default
+too.
+
+`RATCHET_COUNT × RATCHET_INTERVAL` is one window read two ways — how far back a
+sender's stale announce can still reach us, and how far back a seized device
+gives up its traffic. See `Type.h` for the numbers and the trade.
 
 ## 5. Link lifecycle
 
@@ -1218,10 +1326,12 @@ ones so they read the same:
 
 1. empty → `(0B)`
 2. pure msgpack → `(NB) mp=…`
-3. 32-byte ratchet `||` msgpack → `ratchet=… mp=…`
-4. 32-byte ratchet `||` UTF-8 text → `ratchet=… name="…"`
-5. version byte `||` msgpack `||` trailing 32-byte ratchet → `v=XX mp=… ratchet=…`
-6. none of the above → printable-bytes fallback `="…"`
+3. version byte `||` msgpack `||` trailing 32-byte ratchet → `v=XX mp=… ratchet=…`
+4. none of the above → printable-bytes fallback `="…"`
+
+Shape 3's trailing ratchet is one client's app_data dialect. The announce's own
+ratchet is a separate field ahead of the signature (§4.2), logged on its own —
+it never appears in app_data, so no shape here looks for one in front.
 
 The `mp=` rendering uses `mpDecode()`, a self-contained bounded msgpack
 pretty-printer (recursion depth ≤ 8, output truncated at 800 chars, covers

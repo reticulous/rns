@@ -308,6 +308,34 @@ typedef struct {
 static_assert(sizeof(rnsd_iface_t) <= ITS_MAX_MSG_DATA,
               "rnsd_iface_t must fit ITS_MAX_MSG_DATA");
 
+/* ---- RNSD_PORT_IFACE aux opcodes ---- */
+
+enum : uint8_t {
+    RNSD_IFACE_AUX_ANNOUNCE = 0x01,  /* payload: rnsd_iface_announce_t */
+};
+
+/** "Say who we are on these interfaces, now" (RNSD_PORT_IFACE aux). Sent by
+ *  rnsdIfaceAnnounceNow(); rnsd replays every hosted destination's stored
+ *  announce onto each matching interface, pinned to it, through the same
+ *  debounced path a fresh registration uses.
+ *
+ *  Addressed by NAME PREFIX rather than by handle, because the caller is an
+ *  interface straddle and its unit of thought is the medium, not the
+ *  registration: BLE registers one interface per peer and TCP one per
+ *  connection, so "announce on Bluetooth" is `ble` and "announce on TCP" is
+ *  `tcp` (which also catches `tcp_in/…`). An exact name — `lora/0`, `auto` —
+ *  is simply the prefix that matches one. Empty matches every interface, which
+ *  is what the coalesced application announce uses.
+ *
+ *  Fire-and-forget, safe from any task: there is no reply, and a request for a
+ *  prefix nothing matches is a no-op rather than an error. */
+typedef struct {
+    uint8_t  op;            /* RNSD_IFACE_AUX_ANNOUNCE */
+    char     prefix[24];    /* registered-name prefix; "" = every interface */
+} rnsd_iface_announce_t;
+static_assert(sizeof(rnsd_iface_announce_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_iface_announce_t must fit ITS_MAX_MSG_DATA");
+
 /* ---- RNSD_PORT_DEST frame opcodes ---- */
 
 enum : uint8_t {

@@ -2576,16 +2576,18 @@ static const Bytes& ifac_salt() {
 							 * which is what stalled the browser transport during
 							 * announce bursts. */
 							const Bytes& announce_data = packet.data();
-							const size_t announce_prefix = Type::Identity::KEYSIZE/8 +
-							                               Type::Identity::NAME_HASH_LENGTH/8 +
-							                               Type::Identity::RANDOM_HASH_LENGTH/8 +
-							                               Type::Identity::SIGLENGTH/8;
+							/* Ratcheted announces put a 32-byte ratchet ahead
+							 * of the signature, so app_data does not start at
+							 * a fixed offset — Identity owns that layout. */
+							const size_t announce_prefix = Identity::announce_app_data_offset(packet);
 							Identity announce_identity(false);
 							Bytes announce_name_hash;
 							Bytes announce_app_data;
+							Bytes announce_ratchet;
 							if (announce_data.size() >= announce_prefix) {
 								announce_identity.load_public_key(announce_data.left(Type::Identity::KEYSIZE/8));
 								announce_name_hash = announce_data.mid(Type::Identity::KEYSIZE/8, Type::Identity::NAME_HASH_LENGTH/8);
+								announce_ratchet   = Identity::announce_ratchet(packet);
 								if (announce_data.size() > announce_prefix)
 									announce_app_data = announce_data.mid(announce_prefix);
 							}
@@ -2609,6 +2611,7 @@ static const Bytes& ifac_salt() {
 											announce_identity,
 											announce_app_data,
 											announce_name_hash,
+											announce_ratchet,
 											packet.hops()
 										);
 									}

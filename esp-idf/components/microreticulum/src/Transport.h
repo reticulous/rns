@@ -70,7 +70,12 @@ namespace RNS {
 		// only stored for the ones this node retains — asking the routing layer
 		// would report "unreachable" for everything heard on an interface that
 		// forwards without keeping.
-		virtual void received_announce(const Bytes& destination_hash, const Identity& announced_identity, const Bytes& app_data, const Bytes& name_hash, uint8_t hops) = 0;
+		//
+		// `ratchet` is the 32-byte X25519 ratchet the announce carried, or
+		// empty for a destination that advertises none. It is a field of the
+		// announce, never part of app_data — a handler that wants to encrypt
+		// to the peer with forward secrecy takes it from here.
+		virtual void received_announce(const Bytes& destination_hash, const Identity& announced_identity, const Bytes& app_data, const Bytes& name_hash, const Bytes& ratchet, uint8_t hops) = 0;
 		std::string& aspect_filter() { return _aspect_filter; }
 		// The aspect filter compiled to its name hash, once, at construction.
 		const Bytes& name_hash_filter() const { return _name_hash_filter; }

@@ -229,6 +229,12 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 		}
 
 		Bytes announce_data;
+		/* Set once a ratchet is actually in announce_data. Flagging an
+		 * announce that carries none would mis-slice it at every receiver and
+		 * fail its signature — so the flag follows the bytes, not the
+		 * setting. Cached path responses were built under the setting in force
+		 * at the time, which is why enable/disable clears that cache. */
+		bool ratcheted = false;
 
 /*
 		// CBA TEST
@@ -268,6 +274,7 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 			// multiple available paths, and to choose the best one.
 			//z TRACEF("Using cached announce data for answering path request with tag %s", RNS.prettyhexrep(tag).c_str());
 			announce_data << _object->_path_responses[tag].second;
+			ratcheted = _object->_ratchets_enabled;
 		}
 		else {
 			Bytes destination_hash = _object->_hash;
@@ -288,6 +295,17 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 				new_app_data = _object->_default_app_data;
 			}
 
+			/* Rotation is driven from here, as upstream does it: the interval
+			 * gate means a burst of per-interface announces airs one ratchet,
+			 * and a destination that never announces never rotates — nobody
+			 * could have heard a new ratchet anyway. */
+			Bytes ratchet;
+			if (_object->_ratchets_enabled) {
+				rotate_ratchets();
+				ratchet = latest_ratchet();
+				ratcheted = (bool)ratchet;
+			}
+
 			Bytes signed_data;
 			//TRACEF("Destination::announce: hash:         %s", _object->_hash.toHex().c_str());
 			//TRACEF("Destination::announce: public key:   %s", _object->_identity.get_public_key().toHex().c_str());
@@ -296,6 +314,9 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 			//TRACEF("Destination::announce: app data:     %s", new_app_data.toHex().c_str());
 			//TRACEF("Destination::announce: app data text:%s", new_app_data.toString().c_str());
 			signed_data << _object->_hash << _object->_identity.get_public_key() << _object->_name_hash << random_hash;
+			if (ratchet) {
+				signed_data << ratchet;
+			}
 			if (new_app_data) {
 				signed_data << new_app_data;
 			}
@@ -304,7 +325,11 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 			Bytes signature(_object->_identity.sign(signed_data));
 			//TRACEF("Destination::announce: signature:    %s", signature.toHex().c_str());
 
-			announce_data << _object->_identity.get_public_key() << _object->_name_hash << random_hash << signature;
+			announce_data << _object->_identity.get_public_key() << _object->_name_hash << random_hash;
+			if (ratchet) {
+				announce_data << ratchet;
+			}
+			announce_data << signature;
 
 			if (new_app_data) {
 				announce_data << new_app_data;
@@ -331,7 +356,11 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 		//TRACE("Destination::announce: creating announce packet...");
 		//p announce_packet = RNS.Packet(self, announce_data, RNS.Packet.ANNOUNCE, context = announce_context, attached_interface = attached_interface)
 		//Packet announce_packet(*this, announce_data, Type::Packet::ANNOUNCE, announce_context, Type::Transport::BROADCAST, Type::Packet::HEADER_1, nullptr, attached_interface);
-		Packet announce_packet(*this, attached_interface, announce_data, Type::Packet::ANNOUNCE, announce_context, Type::Transport::BROADCAST, Type::Packet::HEADER_1);
+		/* The context flag is what tells a receiver the announce carries a
+		 * ratchet — the field itself is unmarked. */
+		Packet announce_packet(*this, attached_interface, announce_data, Type::Packet::ANNOUNCE, announce_context, Type::Transport::BROADCAST, Type::Packet::HEADER_1,
+		                       {Bytes::NONE}, true,
+		                       ratcheted ? Type::Packet::FLAG_SET : Type::Packet::FLAG_UNSET);
 
 		if (send) {
 			TRACE("Destination::announce: sending announce packet...");
@@ -485,6 +514,87 @@ TRACE("***** Accepting link request");
 	}
 }
 
+void Destination::enable_ratchets(const std::vector<Bytes>& privs,
+                                  std::function<void(const std::vector<Bytes>&)> persist /*= nullptr*/) {
+	assert(_object);
+	if (_object->_type != SINGLE) {
+		WARNINGF("Destination::enable_ratchets: %s is not a SINGLE destination, ignored", toString().c_str());
+		return;
+	}
+	_object->_ratchets.clear();
+	for (const Bytes& prv : privs) {
+		if (prv.size() != Type::Identity::RATCHETSIZE/8) continue;
+		_object->_ratchets.push_back(prv);
+		if (_object->_ratchets.size() >= Type::Destination::RATCHET_COUNT) break;
+	}
+	_object->_ratchet_persist    = persist;
+	_object->_ratchets_enabled   = true;
+	/* Loaded ratchets carry no rotation time — treating them as freshly
+	 * rotated would hold the current one for a whole interval past every
+	 * reboot, so instead the next announce rotates and the loaded set stays
+	 * available for decrypting what is already in flight. */
+	_object->_latest_ratchet_time = 0;
+	/* Cached path responses predate the setting change and would go out with
+	 * the wrong context flag. */
+	_object->_path_responses.clear();
+	/* Info, not debug: which destinations advertise a rotating key is a
+	 * security property of the node, and it is a handful of lines at boot. */
+	INFOF("Destination::enable_ratchets: %s enabled with %u retained ratchet(s)",
+	      toString().c_str(), (unsigned)_object->_ratchets.size());
+}
+
+void Destination::disable_ratchets() {
+	assert(_object);
+	_object->_ratchets_enabled = false;
+	_object->_ratchets.clear();
+	_object->_ratchet_persist = nullptr;
+	_object->_latest_ratchet_time = 0;
+	_object->_path_responses.clear();
+}
+
+bool Destination::rotate_ratchets() {
+	assert(_object);
+	if (!_object->_ratchets_enabled) return false;
+	double now = Utilities::OS::time();
+	if (!_object->_ratchets.empty() &&
+	    now < _object->_latest_ratchet_time + (double)Type::Destination::RATCHET_INTERVAL) {
+		return false;
+	}
+	Bytes ratchet;
+	try {
+		ratchet = Identity::generate_ratchet();
+	}
+	catch (const std::exception& e) {
+		ERRORF("Destination::rotate_ratchets: could not generate a ratchet: %s", e.what());
+		return false;
+	}
+	_object->_ratchets.insert(_object->_ratchets.begin(), ratchet);
+	if (_object->_ratchets.size() > Type::Destination::RATCHET_COUNT) {
+		_object->_ratchets.resize(Type::Destination::RATCHET_COUNT);
+	}
+	_object->_latest_ratchet_time = now;
+	/* Twice a day per destination, and the one line that says forward secrecy
+	 * is actually turning over — info, so it needs no debug level to see. */
+	INFOF("Destination::rotate_ratchets: %s rotated to ratchet %s (%u retained)",
+	      toString().c_str(),
+	      Identity::ratchet_id(Identity::ratchet_public_bytes(ratchet)).toHex().c_str(),
+	      (unsigned)_object->_ratchets.size());
+	if (_object->_ratchet_persist) _object->_ratchet_persist(_object->_ratchets);
+	return true;
+}
+
+Bytes Destination::latest_ratchet() const {
+	assert(_object);
+	if (!_object->_ratchets_enabled || _object->_ratchets.empty()) return {Bytes::NONE};
+	try {
+		return Identity::ratchet_public_bytes(_object->_ratchets.front());
+	}
+	catch (const std::exception& e) {
+		ERRORF("Destination::latest_ratchet: %s", e.what());
+		return {Bytes::NONE};
+	}
+}
+
 /*
 Encrypts information for ``RNS.Destination.SINGLE`` or ``RNS.Destination.GROUP`` type destination.
 
@@ -500,7 +610,12 @@ Encrypts information for ``RNS.Destination.SINGLE`` or ``RNS.Destination.GROUP``
 	}
 
 	if (_object->_type == SINGLE && _object->_identity) {
-		return _object->_identity.encrypt(data);
+		/* Encrypt to the ratchet this destination last announced when we hold
+		 * one — that is the whole of forward secrecy for traffic outside a
+		 * Link. A peer that announces none, or whose announce we no longer
+		 * hold, gets the identity key as before; the receiver trial-decrypts
+		 * either way, so there is nothing to negotiate. */
+		return _object->_identity.encrypt(data, Identity::get_ratchet(_object->_hash));
 	}
 
 // TODO
@@ -537,7 +652,7 @@ Decrypts information for ``RNS.Destination.SINGLE`` or ``RNS.Destination.GROUP``
 	}
 
 	if (_object->_type == SINGLE && _object->_identity) {
-		return _object->_identity.decrypt(data);
+		return _object->_identity.decrypt(data, _object->_ratchets);
 	}
 
 /*
