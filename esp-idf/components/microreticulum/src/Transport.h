@@ -342,6 +342,11 @@ namespace RNS {
 		static void deregister_destination(const Destination& destination);
 		static void register_link(Link& link);
 		static void activate_link(Link& link);
+		/** The registered recipient link carrying `link_id`, or NONE. A link id
+		 *  is the hash of the link request that made it, so a retransmitted
+		 *  request names a link we already hold — and must not make a second
+		 *  one. Recipient links live in _active_links from registration. */
+		static Link find_active_link(const Bytes& link_id);
 		static void register_announce_handler(HAnnounceHandler handler);
 		static void deregister_announce_handler(HAnnounceHandler handler);
 		static bool is_interface_from_hash(const Bytes& interface_hash);
@@ -506,6 +511,13 @@ namespace RNS {
 		inline static size_t announce_table_slots() { return _announce_slots; }
 		inline static size_t announce_queue_bytes() { return (size_t)_announce_slots * sizeof(AnnounceRec); }
 		inline static size_t hashlist_size()       { return _packet_hashlist.size(); }
+		/** Remember a packet hash for duplicate detection. Every insertion goes
+		 *  through here, because the cull evicts by insertion order and a hash
+		 *  the set knows about but the order list does not would never be
+		 *  evicted at all. */
+		inline static void remember_hash(const Bytes& hash) {
+			if (_packet_hashlist.insert(hash).second) _packet_hashlist_order.push_back(hash);
+		}
 		inline static size_t reverse_table_size()  { return _reverse_table.size(); }
 		inline static size_t link_table_size()     { return _link_table.size(); }
 		inline static size_t tunnels_count()       { return _tunnels.size(); }
@@ -526,6 +538,7 @@ namespace RNS {
 		static std::set<Link> _pending_links;		// Links that are being established
 		static std::set<Link> _active_links;		// Links that are active
 		static std::set<Bytes> _packet_hashlist;	// A list of packet hashes for duplicate detection
+		static std::list<Bytes> _packet_hashlist_order;	// insertion order for FIFO eviction of _packet_hashlist (std::set orders by content, not recency)
 		static std::list<PacketReceipt> _receipts;	// Receipts of all outgoing packets for proof processing
 
 		static AnnounceRec* _announce_ring;		// Announces waiting to be retransmitted

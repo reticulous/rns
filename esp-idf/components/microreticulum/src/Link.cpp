@@ -204,6 +204,28 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 			Link link({Type::NONE}, nullptr, nullptr, owner, data.left(ECPUBSIZE/2), data.mid(ECPUBSIZE/2, ECPUBSIZE/2));
 			link.set_link_id(packet);
 
+			/* A link id is the hash of the request that made it, so a
+			 * RETRANSMITTED request — the initiator never saw our proof, or the
+			 * duplicate filter dropped the hash it was suppressing by — names a
+			 * link we already hold. Building a second one would give it its own
+			 * ephemeral keys and send a second, different proof: the sets are
+			 * keyed by object address, not by link id, so both survive, inbound
+			 * data is delivered to BOTH, and whichever one the initiator did not
+			 * key on logs "Token HMAC was invalid" for every packet until the
+			 * session ends. Answer the retransmission the only way that is
+			 * idempotent — re-prove the link that already exists. */
+			RNS::Link existing = Transport::find_active_link(link.link_id());
+			if (existing) {
+				if (existing.status() != Type::Link::ACTIVE) {
+					DEBUGF("Repeated link request %s, re-proving the existing link", link.link_id().toHex().c_str());
+					existing.prove();
+				}
+				else {
+					DEBUGF("Repeated link request %s for an active link, ignored", link.link_id().toHex().c_str());
+				}
+				return {Type::NONE};
+			}
+
 			if (data.size() == ECPUBSIZE + LINK_MTU_SIZE) {
 				DEBUG("Link request includes MTU signalling"); // TODO: Remove debug
 				try {

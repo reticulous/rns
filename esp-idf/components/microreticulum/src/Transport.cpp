@@ -102,6 +102,7 @@ using namespace RNS::Persistence;
 /*static*/ std::set<Link> Transport::_pending_links;
 /*static*/ std::set<Link> Transport::_active_links;
 /*static*/ std::set<Bytes> Transport::_packet_hashlist;
+/*static*/ std::list<Bytes> Transport::_packet_hashlist_order;
 /*static*/ std::list<PacketReceipt> Transport::_receipts;
 
 /*static*/ Transport::AnnounceRec* Transport::_announce_ring = nullptr;
@@ -637,11 +638,18 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 				}
 			}
 
-			// Cull the packet hashlist if it has reached its max size
-			if (_packet_hashlist.size() > _hashlist_maxsize) {
-				std::set<Bytes>::iterator iter = _packet_hashlist.begin();
-				std::advance(iter, _packet_hashlist.size() - _hashlist_maxsize);
-				_packet_hashlist.erase(_packet_hashlist.begin(), iter);
+			// Cull the packet hashlist if it has reached its max size. Oldest
+			// first (FIFO via _packet_hashlist_order), for the same reason the
+			// path-request tags below evict that way: std::set orders by hash
+			// CONTENT, so erasing from its begin() drops entries at random with
+			// respect to age — a hash inserted moments ago is as likely to go as
+			// one from minutes back. Duplicate suppression then becomes a
+			// lottery, and the packet it fails to suppress may be a link
+			// request, which is answered by building a SECOND link with the
+			// same id (see Link::validate_request).
+			while (_packet_hashlist.size() > _hashlist_maxsize && !_packet_hashlist_order.empty()) {
+				_packet_hashlist.erase(_packet_hashlist_order.front());
+				_packet_hashlist_order.pop_front();
 			}
 
 			// Cull the path request tags list if it has reached its max size.
@@ -1457,7 +1465,7 @@ static const Bytes& ifac_salt() {
 					TRACE("Transport::outbound: Packet transmission allowed");
 					if (!stored_hash) {
 						// CBA ACCUMULATES
-						_packet_hashlist.insert(packet.packet_hash());
+						remember_hash(packet.packet_hash());
 						stored_hash = true;
 					}
 
@@ -1869,7 +1877,7 @@ static const Bytes& ifac_salt() {
 		}
 		if (remember_packet_hash) {
 			// CBA ACCUMULATES
-			_packet_hashlist.insert(packet.packet_hash());
+			remember_hash(packet.packet_hash());
 		}
 
 		// CBA Currently this packet cache is a noop since it's not forced
@@ -2167,7 +2175,7 @@ static const Bytes& ifac_salt() {
 						transmit(outbound_interface, new_raw);
 						link_entry._timestamp = OS::time();
 						// Deferred hashlist insertion for link transport packets
-						_packet_hashlist.insert(packet.packet_hash());
+						remember_hash(packet.packet_hash());
 					}
 					else {
 						//p pass
@@ -3087,6 +3095,13 @@ static const Bytes& ifac_salt() {
 		// CBA ACCUMULATES
 		_active_links.insert(link);
 	}
+}
+
+/*static*/ Link Transport::find_active_link(const Bytes& link_id) {
+	for (auto& link : _active_links) {
+		if (link.link_id() == link_id) return link;
+	}
+	return {Type::NONE};
 }
 
 /*static*/ void Transport::activate_link(Link& link) {
