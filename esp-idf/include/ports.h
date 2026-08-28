@@ -40,8 +40,14 @@ constexpr uint16_t RNSD_PORT_DGRAM = 5;
  *  matching connected subscriber as one packet-mode ITS message of
  *  shape:
  *
- *      hops(1) | dest_hash(16) | identity_hash(16) |
- *      app_data_len(2 BE) | app_data(N)
+ *      hops(1) | dest_hash(16) | identity_hash(16) | pubkey(64) |
+ *      ratchet(32) | app_data(N)
+ *
+ *  app_data runs to the end of the message — there is no length field,
+ *  because a packet-mode handle already carries the boundary. The public
+ *  key rides along so a subscriber can act on an announce without calling
+ *  back into rnsd; the ratchet is the announce's own field (all-zero when
+ *  the destination advertises none) and is never part of app_data.
  *
  *  Per-slot drop-on-full (timeout=0) — slow consumers lose announces,
  *  not announces stall the rnsd task. Same fan-out shape as
@@ -499,3 +505,12 @@ static_assert(sizeof(rnsd_announces_connect_t) <= ITS_MAX_MSG_DATA,
  * Resource handoffs. */
 constexpr uint16_t LXMF_LINK_INBOX_PORT        = 100;  /* inbound Link forwards */
 constexpr uint16_t LXMF_LINK_RESOURCE_AUX_PORT = 101;  /* Resource handoff */
+
+/* ---- netgraph task ports ---- */
+
+/** Inbound netgraph sync Channels. netgraph hosts the node's
+ *  `netgraph.discovery` destination and calls rnsdDestListenChannels() on it,
+ *  so rnsd back-connects each accepted Channel here with an
+ *  `rnsd_link_incoming_t`. The handle then carries the DIGEST / WANT /
+ *  RECORD_PART / DONE messages of the record exchange (netgraph.h). */
+constexpr uint16_t NETGRAPH_SYNC_PORT = 140;

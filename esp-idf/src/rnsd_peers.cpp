@@ -76,7 +76,7 @@ uint32_t    s_pubNodes = 0;    /* node slots currently published, one bit each *
  * shown as its hash, which is the honest answer rather than a missing one. */
 const char* const kAspects[] = {
     "lxmf.delivery", "lxmf.propagation", "nomadnetwork.node",
-    "rnstransport.probe", "rnsh", "rlpg.mailbox",
+    "rnstransport.probe", "rnsh", "rlpg.mailbox", "netgraph.discovery",
 };
 constexpr int kAspectCount = (int)(sizeof(kAspects) / sizeof(kAspects[0]));
 uint8_t s_aspectHash[kAspectCount][RNSD_NAME_HASH_LEN];
@@ -124,6 +124,30 @@ const char* rnsdAspectLabel(const uint8_t name_hash[RNSD_NAME_HASH_LEN]) {
     return nullptr;
 }
 
+/* A display name is TEXT. app_data is not: an application is free to put any
+ * bytes there, and one of them — a netgraph record, led by 0xF5 precisely so it
+ * cannot be mistaken for text — would otherwise be sniffed as a name and put
+ * mojibake in every peer listing. So every candidate below is checked for valid
+ * UTF-8 and refused outright when it is not, rather than trusted because it
+ * happened to land where a name goes. */
+static bool utf8Ok(const uint8_t* q, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        uint8_t b = q[i];
+        size_t need;
+        if      (b < 0x80)           need = 0;
+        else if ((b & 0xE0) == 0xC0) need = 1;
+        else if ((b & 0xF0) == 0xE0) need = 2;
+        else if ((b & 0xF8) == 0xF0) need = 3;
+        else return false;                          /* continuation byte, or 0xF5-0xFF */
+        if (need && i + need >= len) return false;  /* sequence runs off the end */
+        for (size_t k = 1; k <= need; k++)
+            if ((q[i + k] & 0xC0) != 0x80) return false;
+        i += need + 1;
+    }
+    return true;
+}
+
 /* LXMF wraps the display name in a msgpack array whose first element it is,
  * optionally behind the 32-byte ratchet; NomadNet and older clients send raw
  * UTF-8. Only the first element is ever wanted, so this is a deliberately small
@@ -135,14 +159,19 @@ void rnsdAnnounceName(const uint8_t* p, size_t n, char* out, size_t outsz) {
 
     auto plausible = [&](size_t off, size_t len) {
         if (off >= n || !len) return false;
-        for (size_t k = 0; k < len && off + k < n; k++) {
+        if (off + len > n) len = n - off;
+        for (size_t k = 0; k < len; k++) {
             uint8_t b = p[off + k];
             if (b == 0x7F || (b < 0x20 && b != '\t' && b != '\n' && b != '\r')) return false;
         }
-        return true;
+        return utf8Ok(p + off, len);
     };
     auto copy = [&](const uint8_t* q, size_t len) {
         if (len >= outsz) len = outsz - 1;
+        /* Shrink to the longest valid-UTF-8 prefix: that trims the partial
+         * sequence a buffer-length truncation may have left, and collapses a
+         * candidate that was never text at all to the empty name. */
+        while (len && !utf8Ok(q, len)) len--;
         std::memcpy(out, q, len);
         out[len] = '\0';
     };
@@ -720,6 +749,21 @@ void rnsdPillSet(const char* id, char letter, int count, const char* color, int 
     std::snprintf(key, sizeof key, "rns.pill.%s.color", id); storageSet(key, color ? color : "888888");
     std::snprintf(key, sizeof key, "rns.pill.%s.order", id); storageSet(key, order);
     storageEnd();
+}
+
+void rnsdPillColor(const char* id, const char* color, int order, const char* title)
+{
+    if (!id || !*id) return;
+    char key[64];
+    storageBegin();
+    std::snprintf(key, sizeof key, "rns.pill.%s.color", id); storageSet(key, color ? color : "888888");
+    std::snprintf(key, sizeof key, "rns.pill.%s.order", id); storageSet(key, order);
+    /* The class slug is the fallback everywhere that reads this, so a straddle
+     * with nothing better to say publishes nothing rather than a duplicate. */
+    std::snprintf(key, sizeof key, "rns.pill.%s.title", id); storageSet(key, title && *title ? title : "");
+    storageEnd();
+    /* No `text`: both renderers gate on it, so this publishes a palette entry
+     * and not a pill. */
 }
 
 void rnsdPillClear(const char* id)

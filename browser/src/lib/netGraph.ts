@@ -1,65 +1,97 @@
 /**
- * netGraph — rnsd's neighbourhood, as a graph.
+ * netGraph — the community's graph, as the device resolved it.
  *
- * Reads the standardised tables rnsd publishes (`rnsd.nodes.*`, `rnsd.peers.*`)
- * and turns them into vertices and edges. Nothing device-specific and no
- * per-medium knowledge: a medium added tomorrow appears here the moment rnsd
- * files its peers, because every one of them fills the same shape.
+ * The device holds every node's self-report, joins them on evidence and
+ * publishes the result as `netgraph.*` rows. This module reads those rows and
+ * nothing else: vertices from `netgraph.nodes.*`, edges from `netgraph.links.*`,
+ * per-node interfaces from `netgraph.ifs.*`. There is no join here, and no
+ * per-medium knowledge — a medium added tomorrow appears the moment the device
+ * files it, because the record format has one shape for all of them.
  *
- * ONE VERTEX PER PHYSICAL NODE, NOT PER INTERFACE. rnsd files a node per
- * (interface, peer) — the same device reached over LoRa and over Bluetooth is
- * two rows there, correctly, because those are two different links. On a graph
- * they are one circle with two lines to it, and the join is EVIDENCE rather than
- * a guess: a destination hash is a cryptographic identity, so two rnsd nodes
- * that have announced the same destination are the same device. Nothing else
- * merges them.
+ * WHAT IS DRAWN IS THE WHOLE COMMUNITY, not this node's neighbourhood: an edge
+ * between two other nodes is here because both of them said so, over a mesh
+ * this browser is not on. The one thing this device knows that nobody else can
+ * — a neighbour that has attached but never announced — arrives as a local-only
+ * vertex in the same rows.
  *
- * Each rnsd node then contributes its own EDGE, coloured by the medium it sits
- * on — so parallel links stay visible as parallel lines.
+ * An edge whose far end names a destination no record claims is kept and
+ * marked: `b` is -1 and `bref` is the four-byte prefix that went unmatched. It
+ * gets a small unlabelled stub vertex, so a node's degree stays honest while
+ * the record that would name the other end is still missing.
  */
 import { useDeviceStore } from 'spangap-browser/stores/device'
 
-/** The interface CLASS behind a registered name: `lora/0` → `lora`,
- *  `tcp_in/1.2.3.4#0` → `tcp`, `ble/aabbccdd` → `ble`. It is what keys the
- *  status-line pill, which is where the colour comes from. */
-export function ifaceClass(iface: string): string {
-  return (iface || '').split('/')[0].split('_')[0]
+export interface GraphIface {
+  cls: string
+  name: string
+  /** The class's own configuration fields, pipe-separated, verbatim. Opaque to
+   *  everyone but that class — rendered as it arrived. */
+  detail: string
 }
 
 export interface GraphEdge {
-  /** Index into `nodes`. */
+  /** Indices into `nodes`. One LINK, not one report: where both endpoints filed
+   *  the same link, their two rows are merged here and `from`/`to` is simply
+   *  the direction of the first one seen. */
+  from: number
   to: number
-  iface: string
+  /** The reporting sides' own interface names — one entry when only one end
+   *  filed it, two when both did. */
+  ifaces: string[]
   cls: string
   color: string
+  /** Either endpoint is a transport node, as the other described it. */
   transport: boolean
-  label: string
-  /** Destinations announced over this link. */
-  peers: number
-  heard: number
-  rssi: string
-  snr: string
+  /** Freshest bucket either side measured: 0 ≤ 5 min, 1 ≤ 1 h, 2 ≤ 6 h, 3 older.
+   *  `null` where nobody measured one — an uplink is dialled rather than heard,
+   *  and a local-only neighbour has never announced. Not a zero: "just now" is
+   *  a claim, and we would be making it up. */
+  fresh: number | null
+  /** Only one end reports this link — which is only a FACT about a link whose
+   *  far end is something that files records at all. An uplink's far end is
+   *  outside the community and a local-only vertex has never announced; neither
+   *  will ever report, so one-endedness there is the definition rather than an
+   *  observation, and saying it would read as a fault. */
+  oneWay: boolean
+  /** Nobody reported this link — it was inferred from the routing table, which
+   *  is all a node that does not speak netgraph ever gives us. Drawn dotted: a
+   *  route is evidence of adjacency, not a statement of one. */
+  inferred: boolean
 }
 
 export interface GraphNode {
   /** Stable across redraws so the layout can keep a vertex where it was. */
   key: string
-  /** Announced name where one is known, else the transport address, else the
-   *  destination hash. Never empty — a circle with no caption is a mystery. */
+  /** Never empty — a circle with no caption is a mystery. */
   label: string
   /** Longer identification for the detail panel. */
   addresses: string[]
-  dests: { dest: string; aspect: string; name: string; heard: number }[]
+  ifs: GraphIface[]
   transport: boolean
   us: boolean
-  /** Newest `heard` across everything filed under it, device unix-seconds. */
-  heard: number
+  /** The device says the record behind this vertex is getting old. */
+  stale: boolean
+  /** Record timestamp, device unix-seconds. 0 for a local-only vertex. */
+  ts: number
+  /** A placeholder for the far end of an edge no record has claimed yet. */
+  stub: boolean
+  /** What this vertex IS, which decides how it is drawn:
+   *  - `member` — speaks for itself through a record.
+   *  - `local`  — a neighbour of the viewing node that has never announced, so
+   *               only that node can see it.
+   *  - `uplink` — not in the community at all: the far end of a standing
+   *               connection out, named only by its transport address.
+   *  - `stub`   — a peer some record named whose own record has not arrived.
+   *  - `routed` — routing knows it and nobody has heard it speak for itself:
+   *               a node that does not run netgraph at all. */
+  kind: 'member' | 'local' | 'uplink' | 'stub' | 'routed'
 }
 
 export interface Graph {
   nodes: GraphNode[]
-  /** Edges out of the local node, one per link. Index 0 of `nodes` is us. */
   edges: GraphEdge[]
+  /** Index of this device, or -1 before its own record exists. */
+  self: number
 }
 
 function s(v: unknown): string { return v === undefined || v === null ? '' : String(v) }
@@ -71,155 +103,135 @@ export function buildGraph(): Graph {
   const device = useDeviceStore()
   const pill = (cls: string) => `#${s(device.get(`rns.pill.${cls}.color`)) || '888888'}`
 
-  /* rnsd's own tables, read as published. Node indices are TABLE SLOTS (a peer
-   * names its node by one), so the walk is over slots and holes are normal. */
-  const slots = num(device.get('rnsd.nodes.slots'))
-  type RnsdNode = {
-    slot: number; iface: string; label: string; transport: boolean; heard: number
-  }
-  const rnsdNodes: RnsdNode[] = []
+  const me = s(device.get('netgraph.self'))
+  const slots = num(device.get('netgraph.nodes.slots'))
+
+  const nodes: GraphNode[] = []
+  /* Row index → vertex index. They coincide for published rows, but the stub
+   * vertices appended below do not exist in the rows, so the map is what keeps
+   * the edge endpoints honest. */
+  const rowToNode = new Map<number, number>()
+
   for (let i = 0; i < slots; i++) {
-    const t = device.get(`rnsd.nodes.${i}`)
-    if (!t || !s(t.iface)) continue
-    rnsdNodes.push({
-      slot: i,
-      iface: s(t.iface),
-      label: s(t.label),
+    const t = device.get(`netgraph.nodes.${i}`)
+    if (!t) continue
+    const id = s(t.id)
+    const name = s(t.name)
+    const label = s(t.label)
+
+    const ifs: GraphIface[] = []
+    const nifs = num(device.get(`netgraph.ifs.${i}.count`))
+    for (let k = 0; k < nifs; k++) {
+      const f = device.get(`netgraph.ifs.${i}.${k}`)
+      if (!f) continue
+      ifs.push({ cls: s(f.cls), name: s(f.name), detail: s(f.detail) })
+    }
+
+    const addresses: string[] = []
+    if (id) addresses.push(id)
+    if (label && label !== id) addresses.push(label)
+
+    const kindRaw = s(t.kind)
+    const kind = (kindRaw === 'uplink' || kindRaw === 'local' || kindRaw === 'routed')
+    ? kindRaw : 'member'
+
+    rowToNode.set(i, nodes.length)
+    nodes.push({
+      key: id || `${kind}:${label}:${i}`,
+      /* Best evidence first: what it called itself, then the address it was
+       * reached at, then the identity it announced under. An uplink only ever
+       * has the address. */
+      label: name || label || (id ? id.slice(0, 8) : '?'),
+      addresses,
+      ifs,
       transport: num(t.transport) !== 0,
-      heard: num(t.heard),
+      us: !!id && id === me,
+      stale: num(t.stale) !== 0,
+      ts: num(t.ts),
+      stub: false,
+      kind,
     })
   }
 
-  const nPeers = num(device.get('rnsd.peers.count'))
-  type RnsdPeer = {
-    node: number; iface: string; dest: string; aspect: string; name: string
-    heard: number; rssi: string; snr: string
-  }
-  const peers: RnsdPeer[] = []
-  for (let i = 0; i < nPeers; i++) {
-    const t = device.get(`rnsd.peers.${i}`)
-    if (!t || !s(t.dest)) continue
-    peers.push({
-      node: t.node === undefined ? -1 : num(t.node),
-      iface: s(t.iface),
-      dest: s(t.dest),
-      aspect: s(t.aspect),
-      name: s(t.name),
-      heard: num(t.heard),
-      rssi: s(t.rssi),
-      snr: s(t.snr),
-    })
-  }
-
-  /* ── the join ──
-   * A "unit" is one thing at the far end of one link: an rnsd node, or an
-   * unattributed peer on a medium that cannot say who transmitted (a radio),
-   * which stands for a node of its own because that is all that is known.
-   * Units that share a destination hash are one device. */
-  interface Unit {
-    id: string
-    iface: string
-    label: string
-    transport: boolean
-    heard: number
-    dests: RnsdPeer[]
-  }
-  const units: Unit[] = rnsdNodes.map(n => ({
-    id: `n${n.slot}`,
-    iface: n.iface,
-    label: n.label,
-    transport: n.transport,
-    heard: n.heard,
-    dests: [],
-  }))
-  const bySlot = new Map<number, Unit>()
-  rnsdNodes.forEach((n, i) => bySlot.set(n.slot, units[i]))
-
-  for (const p of peers) {
-    const u = p.node >= 0 ? bySlot.get(p.node) : undefined
-    if (u) { u.dests.push(p); if (p.heard > u.heard) u.heard = p.heard; continue }
-    units.push({
-      id: `p${p.dest}@${p.iface}`,
-      iface: p.iface,
-      label: '',
-      transport: false,
-      heard: p.heard,
-      dests: [p],
-    })
-  }
-
-  /* Union-find over the destination hashes. A hash seen under two units makes
-   * them one device; a unit with no destinations joins nothing, which is right —
-   * an attached peer that has not announced has proved nothing about itself. */
-  const parent = units.map((_, i) => i)
-  const find = (i: number): number => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i] } return i }
-  const union = (a: number, b: number) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[rb] = ra }
-  const seenDest = new Map<string, number>()
-  units.forEach((u, i) => {
-    for (const d of u.dests) {
-      const prev = seenDest.get(d.dest)
-      if (prev === undefined) seenDest.set(d.dest, i)
-      else union(prev, i)
-    }
-  })
-
-  /* ── vertices ──
-   * Index 0 is always this device, whether or not anything is attached: a graph
-   * of a neighbourhood with no centre is a graph of somebody else's. */
-  const me = s(device.get('rnsd.identity_hash'))
-  const nodes: GraphNode[] = [{
-    key: 'us',
-    label: s(device.get('s.net.hostname')) || 'this node',
-    addresses: me ? [me] : [],
-    dests: [],
-    transport: num(device.get('s.rnsd.transport_enabled')) !== 0,
-    us: true,
-    heard: 0,
-  }]
+  /* ── links ──
+   * A link between two nodes is reported TWICE, once by each end, because each
+   * end only ever writes about itself. That is the right thing for the device
+   * to store — it is two independent statements — but it is one line on a
+   * picture, so the two are merged here. The key is the unordered vertex pair
+   * plus the medium: two nodes joined over both LoRa and Bluetooth stay two
+   * lines, which is the fact worth seeing.
+   *
+   * Rows arriving in the same direction are NOT merged, so a node with two
+   * radios on the same class still contributes two lines. */
   const edges: GraphEdge[] = []
+  const stubs = new Map<string, number>()
+  const seen = new Map<string, number[]>()   // pair+cls → edge indices
+  const nLinks = num(device.get('netgraph.links.count'))
+  for (let j = 0; j < nLinks; j++) {
+    const t = device.get(`netgraph.links.${j}`)
+    if (!t) continue
+    const from = rowToNode.get(num(t.a))
+    if (from === undefined) continue
 
-  const groupIndex = new Map<number, number>()   // union root → vertex index
-  for (let i = 0; i < units.length; i++) {
-    const root = find(i)
-    let vi = groupIndex.get(root)
-    if (vi === undefined) {
-      vi = nodes.length
-      groupIndex.set(root, vi)
-      nodes.push({
-        key: units[root].id, label: '', addresses: [], dests: [],
-        transport: false, us: false, heard: 0,
-      })
+    let to: number | undefined
+    if (num(t.b) >= 0) {
+      to = rowToNode.get(num(t.b))
+    } else {
+      const ref = s(t.bref)
+      if (!ref) continue
+      to = stubs.get(ref)
+      if (to === undefined) {
+        to = nodes.length
+        stubs.set(ref, to)
+        nodes.push({
+          key: `stub:${ref}`, label: ref, addresses: [ref], ifs: [],
+          transport: false, us: false, stale: false, ts: 0, stub: true,
+          kind: 'stub',
+        })
+      }
     }
-    const v = nodes[vi]
-    const u = units[i]
-    if (u.transport) v.transport = true
-    if (u.heard > v.heard) v.heard = u.heard
-    if (u.label && !v.addresses.includes(u.label)) v.addresses.push(u.label)
-    for (const d of u.dests)
-      if (!v.dests.some(x => x.dest === d.dest))
-        v.dests.push({ dest: d.dest, aspect: d.aspect, name: d.name, heard: d.heard })
+    if (to === undefined) continue
 
-    const cls = ifaceClass(u.iface)
+    const cls = s(t.cls)
+    const iface = s(t.iface)
+    /* Empty means "nobody measured one", which is not the same as bucket 0. */
+    const fresh = s(t.fresh) === '' ? null : num(t.fresh)
+    const transport = num(t.transport) !== 0
+    const inferred = num(t.inferred) !== 0
+
+    const key = from < to ? `${from}-${to}-${cls}` : `${to}-${from}-${cls}`
+    const bucket = seen.get(key) ?? []
+    /* Merge into the first edge in this bucket that is the OTHER way round and
+     * has not been paired up yet — that one is this same link, seen from its
+     * far end. */
+    const mate = bucket.find(i => edges[i].from === to && edges[i].oneWay)
+    if (mate !== undefined) {
+      const e = edges[mate]
+      e.oneWay = false
+      e.ifaces.push(iface)
+      if (transport) e.transport = true
+      /* The freshest either side measured — and a measurement beats none. */
+      if (fresh !== null && (e.fresh === null || fresh < e.fresh)) e.fresh = fresh
+      continue
+    }
+    bucket.push(edges.length)
+    seen.set(key, bucket)
     edges.push({
-      to: vi,
-      iface: u.iface,
-      cls,
-      color: pill(cls),
-      transport: u.transport,
-      label: u.label,
-      peers: u.dests.length,
-      heard: u.heard,
-      rssi: u.dests.find(d => d.rssi)?.rssi ?? '',
-      snr: u.dests.find(d => d.snr)?.snr ?? '',
+      from, to, ifaces: [iface], cls, color: pill(cls),
+      transport, fresh, oneWay: true, inferred,
     })
   }
 
-  /* A caption for every vertex, best evidence first: what it called itself, then
-   * the address it was reached at, then the hash it announced under. */
-  for (const v of nodes) {
-    if (v.us) continue
-    const named = v.dests.find(d => d.name)
-    v.label = named?.name || v.addresses[0] || (v.dests[0]?.dest.slice(0, 8) ?? '?')
+  /* One-endedness is only an observation about a link between two things that
+   * REPORT. An uplink's far end is outside the community and a local-only
+   * vertex has never announced — neither will ever file a record, so a link to
+   * one is one-ended by construction and saying so would read as a fault. */
+  for (const e of edges) {
+    const far = nodes[e.to]
+    if (e.inferred) { e.oneWay = false; continue }
+    if (far && (far.kind === 'uplink' || far.kind === 'local')) e.oneWay = false
   }
-  return { nodes, edges }
+
+  const self = nodes.findIndex(n => n.us)
+  return { nodes, edges, self }
 }

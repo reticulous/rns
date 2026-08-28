@@ -141,6 +141,28 @@ Our deltas, by category:
   **Pitfall:** the trailer is inert to validation (signature covers only the
   hash), but a *vanilla* receiver length-rejects the longer proof — so rnsd only
   emits it under the per-peer negotiation in rnsd §5.7, never blindly.
+- `Link.cpp`/`Transport.h`/`Transport.cpp` — **one link per link id.** A link id
+  is the hash of the link request that made it, so a retransmitted request —
+  the initiator never saw our proof, or the duplicate filter below let it
+  through — names a link we already hold. `Link::validate_request` built a
+  second one regardless, with its own ephemeral keys and its own LRPROOF; since
+  `Link::operator<` orders by object address rather than by link id, neither
+  `_active_links` nor `Destination::_links` deduplicates, so both survived. The
+  DATA dispatch in `Transport::inbound` hands a packet to *every* active link
+  whose id matches, so whichever twin the initiator did not key on logged
+  "Token token HMAC was invalid" for every packet of the session while the
+  other carried it fine. `validate_request` now looks the id up
+  (`Transport::find_active_link`) and answers a repeat by re-proving the
+  existing link, which is what makes retransmission idempotent.
+- `Transport.{h,cpp}` — **the packet hashlist evicts oldest-first.**
+  `_packet_hashlist` is a `std::set<Bytes>`, and the cull erased from its
+  `begin()` — the *lowest hashes*, which is unrelated to age: a hash inserted
+  moments ago was as likely to go as one from minutes back. At the 100-entry
+  cap that made duplicate suppression a lottery, and the packet it failed to
+  suppress could be a link request (above). A `_packet_hashlist_order` list
+  gives the FIFO the cull needs, the same shape `_discovery_pr_tags` already
+  used; every insertion goes through `Transport::remember_hash` so the two
+  structures cannot drift.
 - `Link.cpp`/`Transport.cpp` — **links follow the peer across interfaces.**
   `Link::receive` treated a link packet arriving on an interface other than
   `_attached_interface` as hostile ("Someone might be trying to manipulate your
@@ -762,6 +784,18 @@ frames. These are the destinations *we* host — the code calls them **our-dests
 is Reticulum **opportunistic packets** (single packet, no Link). ("Mailbox" was
 an earlier in-house name; it isn't Reticulum vocabulary and collided with ITS's
 own "mailbox" message-queue term, so it's gone.)
+
+**Six slots, and asking which they are.** `RNSD_MAX_OUR_DESTS` is 6: a
+fully-loaded node hosts `lxmf.delivery` (one per lxmf identity slot), `rnsh`,
+`rlpg.mailbox` and `netgraph.discovery` at once, so four leaves no headroom.
+`rnsdHostedDestsForEach()` walks them — plus the transport probe where it is up
+— as flat `{dest, aspect}` bytes rather than µR objects. The walk is backed by a
+snapshot rebuilt under a mutex at each of the four points the set can change (an
+our-dest opening or closing, the probe dial either way), because its callers are
+on other tasks and `our_dest_t` holds `RNS::Destination` and `RNS::Bytes` that
+only the rnsd task may touch. It exists because a peer's report of a link names
+the *destination* it heard, so joining that report to a node means asking each
+node which destinations are its own — see the netgraph section of the README.
 
 **Concurrent path searches with backpressure.** Each in-flight `OUT_PACKET` that
 lacks a path occupies one slot in a per-connection pending table. While the path
@@ -1392,7 +1426,9 @@ per destination.
 
 The shared RNS UI lives in this straddle: `modules/rnsd.ts` (Pinia store +
 `rnsd:1` DataChannel exposing the directory, identity, and announces),
-`panels/NodesWindow.vue` (live nodes) and `panels/MapWindow.vue` (map of
+`panels/NodesWindow.vue` (live nodes), `panels/NetGraphWindow.vue` (the
+community's graph — a pure renderer over the `netgraph.*` rows the device
+resolves; it joins nothing) and `panels/MapWindow.vue` (map of
 GPS-announcing peers). The rows on the Settings → Reticulum Mesh page itself
 are generated from the `settings:` block in [`straddle.yaml`](straddle.yaml), so
 there is no hand-written pane. Interface-specific UI is **not** here — each interface

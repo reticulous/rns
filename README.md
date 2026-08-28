@@ -41,10 +41,12 @@ rns/
 ├── esp-idf/
 │   ├── include/
 │   │   ├── rnsd.h        public C API (rnsdLinkOpen, rnsdRecallPubkey, …)
+│   │   ├── netgraph.h    the distributed graph: boot hook + iface detail contribution
 │   │   └── ports.h       ITS port constants + frame opcodes shared with consumers
 │   ├── src/
 │   │   ├── rnsd.cpp            the rnsd task: identity, Transport, iface table, links
-│   │   └── rnsd_peers.cpp      the neighbourhood: nodes, their peers, the shared `n` printer
+│   │   ├── rnsd_peers.cpp      the neighbourhood: nodes, their peers, the shared `n` printer
+│   │   └── netgraph.cpp        the community's graph: record, store, resolver, sync
 │   ├── conditional/spangap-lcd/
 │   │   └── …/rnsd_pills_lcd.cpp   the status-bar pills, where there is a display
 │   └── components/
@@ -53,7 +55,7 @@ rns/
 ├── browser/
 │   └── src/
 │       ├── modules/rnsd.ts            self-registering pinia module + RPC
-│       ├── lib/netGraph.ts            the neighbourhood as vertices + edges
+│       ├── lib/netGraph.ts            netgraph.* rows as vertices + edges
 │       ├── lib/forceLayout.ts         where the vertices go (the one seam)
 │       ├── panels/RnsdPanel.vue       Reticulum Settings panel
 │       ├── panels/NetGraphWindow.vue  the NetGraph dock app
@@ -362,19 +364,201 @@ shared rather than re-implemented per interface. `RNSD_PEER_ROW_FMT` /
 medium's neighbourhood lines up in the same columns, this printer's and
 iface-lora's alike.
 
-## NetGraph — the neighbourhood as a picture
+## netgraph — every node holds the community's whole graph
 
-A dock app in this straddle's browser half: this node in the middle, one circle
-per node around it, **one line per link**. It is drawn entirely from the
-published tables above, so it needs no per-medium knowledge and a medium added
-tomorrow appears the moment rnsd files its peers.
+```
+push (continuous, unsolicited, mesh-wide):
+  every node:  ANNOUNCE netgraph.discovery   app_data = own record, abridged
 
-Two things it does that a plain node-link drawing does not, and the reason for
-each:
+sync (on demand, over one Reticulum Channel between two nodes):
+  I → R   DIGEST        every (origin, seq) I hold
+  R → I   RECORD_PART*  records I lack or hold older
+  R → I   WANT          origins R lacks or holds older
+  I → R   RECORD_PART*  those records
+  both    DONE          then the initiator closes the channel
+```
+
+The neighbourhood tables above say who *this* node can hear. **netgraph** makes
+the whole community's picture a dataset every node holds: each one publishes a
+small self-report of its own links and interfaces, gossips it mesh-wide, and
+resolves the union of everyone's reports into node and link tables under
+`netgraph.*`. The browser app, the display and any on-device logic then read a
+complete network view without a browser ever being involved.
+
+It is a client of rnsd like any other ([`esp-idf/src/netgraph.cpp`](esp-idf/src/netgraph.cpp)),
+and it adds no protocol machinery to rnsd: the push path is `rnsdDestOpen` +
+`RNSD_DEST_ANNOUNCE` on one side and the announce fan-out on the other; the sync
+path is `rnsdChannelOpen` and `rnsdDestListenChannels`.
+
+### The rules that make it simple
+
+- **One writer per record.** A record is one node's self-report *about itself*.
+  No node ever writes into another's. "Newer seq wins" is the entire conflict
+  story, and the graph is the union of the records plus a local-only overlay for
+  neighbours that have never announced.
+- **Records are atomic wholes.** Ingest replaces everything held for an origin
+  in one step — no partial update, ever. That is what makes unsigned
+  re-serialization by a relay safe and lets a record's internal references stay
+  record-scoped.
+- **Records are unsigned.** A first-hand one arrives as announce `app_data` and
+  is covered by the announce's own signature; a relayed one travels over an
+  encrypted Link between community members. A member can fabricate, and a
+  signature never prevented that — so a record must never be handed to a party
+  that does not trust the whole community.
+- **Configuration goes in a record; measurements do not.** Frequency, spreading
+  factor, interface names, whether a link exists: yes. RSSI, SNR, negotiated
+  budgets, counters: no. The test for a field is whether a change to it deserves
+  waking the whole mesh.
+- **A merely-heard peer is not a link.** A peer enters the link list only once
+  an announce has been decoded from it — the same evidence that creates an rnsd
+  peer row. The odd packet caught when the wind was right stays local.
+
+### The record
+
+The pipe-text form below **is** the specification; the packed wire form is a
+mechanical tokenization of it — same lines, same fields, same order.
+
+```
+n|Kitchen T-Deck|t
+dt|3|a1b2c3d4 9f3e2a11 77ab01cd
+if|lora|lora/0|868.5|7|125|5|s
+ln|lora/0|37|9f3e2a11.0.t 8ab2c3d4.1 7c1d99f0.2 …
+if|tcp|tcp_in/10.0.0.4#0
+ln|tcp_in/10.0.0.4#0|1|55aa66bb.0.t
+```
+
+- `n` — what this node calls itself (may be empty) and its flags; `t` means it
+  is an RNS transport node. The name is the device's hostname, falling back to
+  the LXMF display name where no hostname is set — a vertex here is a device,
+  and the hostname is the name its operator gave that device. `|`, newline and
+  control characters become spaces when the record is built, which is the whole
+  escaping story: a consumer may split on `|` unconditionally.
+- `dt` — this node's own announced destination hashes, as 4-byte prefixes. This
+  is the **join evidence**: another record's `ln` cell naming one of these is a
+  link to this node.
+- `if` — one per interface: the class word behind the status-line pill, the
+  registered instance name, then class-owned configuration fields, opaque to
+  everyone but that class's straddle and rendered verbatim.
+- `ln` — the links on one interface, referenced by interface **name**, never by
+  position. Second field is the TRUE link count; then at most K cells (all of
+  them in the full record, the freshest K in an announce). A cell is
+  `prefix.freshbucket[.t]` — the peer's 4-byte destination prefix, a freshness
+  bucket relative to the record's own timestamp (0 ≤ 5 min, 1 ≤ 1 h, 2 ≤ 6 h,
+  3 older), `t` for a transport node. Only peers that have announced get a cell;
+  one known solely by its transport address is counted and not listed, because
+  no other node could join it to anything anyway.
+- `up` — a way OUT of the community: `up|<class>|<iface>|<address>`, one per
+  radius-0 point-to-point interface whose far end rnsd has named. **The
+  community radius is not a display filter** — it says how far to go looking for
+  nodes to *serve*, where to stop reaching, and nothing about what is worth
+  drawing. It is used here only to decide what the far end IS: rnsd keeps no
+  peer rows for a radius-0 interface, so there can never be destination-level
+  evidence about what is over there and it can only ever be an address. That
+  earns it a box rather than a member circle — but it is drawn either way, and
+  anything this misses (more uplinks than a record can carry, say) reaches the
+  graph through the local overlay instead. It gets a line
+  of its own rather than an `ln` cell, because an `ln` cell means "a community
+  peer, joinable by its destination prefix" and an uplink is the opposite of
+  that — no prefix, no record, ever. Keeping the two apart is what stops a
+  resolver trying to join the outside world to a member. rnsd already takes this
+  position: it declares a node for such an interface regardless of the radius,
+  because *whether we serve a peer's mesh is a policy; that there is somebody at
+  the other end of the wire is a fact*.
+- Detail lines (`lora|if|lora/0|…`) — class-owned extra lines, scoped by
+  reference to an `if`. None are defined today; the rule exists so a straddle
+  can add one without touching core code, and so a node that does not know the
+  class still carries the line intact.
+- Exactly two separator levels below the field, ever: space for list cells, `.`
+  for subfields within a cell. Nothing nests further.
+
+Forward tolerance is structural rather than negotiated: an unknown first field
+is skipped and carried verbatim, and unknown trailing fields on a known line are
+ignored. There are no capability bits and no schema version — all community
+nodes flash together.
+
+The packed form is `magic 0xF5 | origin:16 | seq:u32 LE | flags:u8`, then
+repeated `len:u16 LE | tag:u8 | body` where `len` counts the tag and body
+together, so one number skips a line whether or not its tag is understood.
+Everything count-dominant is binary; the one-off descriptive fields (`if`
+parameters, detail lines) stay UTF-8 text even packed, so expanding a record
+back to text needs no per-medium decoder anywhere. `0xF5` is an invalid UTF-8
+lead byte on purpose: nothing that sniffs announce `app_data` for a display name
+can mistake a record for one.
+
+`seq` doubles as the record's build timestamp — device unix seconds, guarded
+monotonic and persisted, so a reboot with a bad clock cannot re-issue an old seq
+and have the community reject the node's own news about itself.
+
+### What each node publishes
+
+Under `netgraph.*` (ephemeral, so browser-synced automatically), written inside
+one `storageBegin`/`storageEnd` bracket so a reader sees one coalesced patch:
+
+```
+netgraph.self                own origin hash, hex
+netgraph.nodes.slots         walk bound
+netgraph.nodes.<i>.id        origin hash hex ("" = local-only vertex)
+netgraph.nodes.<i>.name      display name (may be "")
+netgraph.nodes.<i>.label     transport-address label, for local-only vertices
+netgraph.nodes.<i>.kind      member | local | uplink
+netgraph.nodes.<i>.transport 0/1
+netgraph.nodes.<i>.ts        record timestamp (= seq); 0 for local-only
+netgraph.nodes.<i>.stale     1 past half the horizon
+netgraph.links.count
+netgraph.links.<j>.a         node slot of the reporting side
+netgraph.links.<j>.b         node slot of the peer, -1 unresolved
+netgraph.links.<j>.bref      peer prefix hex, when b = -1
+netgraph.links.<j>.cls       interface class word ("lora")
+netgraph.links.<j>.iface     reporting side's interface name
+netgraph.links.<j>.fresh     bucket 0-3, EMPTY where nobody measured one
+netgraph.links.<j>.transport 0/1 (peer side, as reported)
+netgraph.ifs.<i>.count       interface lines node <i> reports
+netgraph.ifs.<i>.<k>.cls/.name/.detail
+```
+
+Both directions of a link are published — each endpoint reports it
+independently, and those are two separate statements, not one fact written
+twice. A *renderer* merges them into one line; the rows keep them apart, which
+is what lets it say "only one end reports this". A cell whose prefix no record
+claims is kept as a **pending edge** (`b` = -1) rather than dropped, so a node's
+degree stays honest while the record that would name the other end is still
+missing.
+
+### An interface contributes its own fields
+
+[`netgraph.h`](esp-idf/include/netgraph.h) exposes `netgraphContributeIface(cls,
+cb)`. At rebuild the builder calls the class's callback to fill the class-owned
+tail of its `if` line — pipe-separated text, configuration only. iface-lora
+registers one and supplies frequency, spreading factor, bandwidth, coding rate
+and whether SUPE is on. A straddle never sees a record: it contributes fields
+and the builder composes, which is the `rnsdPillSet` relationship one layer up.
+
+## NetGraph — the community as a picture
+
+A dock app in this straddle's browser half: one circle per node, **one line per
+link** — including links between two other nodes, over a mesh this browser is
+not on. It draws `netgraph.*` and nothing else; every join behind the picture
+happened on the device, which is the only place that holds every node's own
+report of itself.
+
+**Nothing is pinned, and this device is the red circle.** A community graph has
+no natural centre. Pinning the viewing node to the middle drags the rest into
+whatever shape that leaves — a node at the end of a chain lands inside a
+triangle of its own neighbours, which is a picture of the pin rather than of the
+network. Where you are is said by colour instead, which costs the layout
+nothing.
+
+Two more things it does that a plain node-link drawing does not, and the reason
+for each:
 
 - **Lines take the medium's colour** — the same `rns.pill.<class>.color` its
-  status-line pill uses, read live. One vocabulary for "which medium" on every
-  surface, and no palette in the app.
+  status-line pill uses, read live, and the legend names it with the
+  `rns.pill.<class>.title` that straddle publishes beside it. One vocabulary for
+  "which medium" on every surface, and no palette and no table of media in the
+  app. This is why an interface straddle publishes its colour from boot rather
+  than from the moment its medium is switched on: a LoRa link between two other
+  nodes is still a LoRa link on a node whose own radio is off, and drawing it in
+  the fallback grey would say something false about the network.
 - **Parallel links are parallel arcs.** A peer reachable over both LoRa and
   Bluetooth is a peer that stays reachable, and that is the interesting fact on
   a mesh; one line between the circles would hide exactly it. The bundle between
@@ -382,32 +566,104 @@ each:
   the straight line would have been, so one link is straight and two bow either
   side.
 
-**One circle is one physical node, not one interface.** rnsd files a node per
-(interface, peer) — correctly, since those are two different links — and the app
-joins them on **evidence**: a destination hash is a cryptographic identity, so
-two rnsd nodes that have announced the same destination are the same device.
-Nothing else merges them, and a node that has announced nothing joins nothing,
-because it has proved nothing about itself.
+**Two reports, one line.** Each node writes only about itself, so a link between
+two of them arrives as two rows. They are merged per (node pair, medium), and a
+link only one end reports says so in its tooltip rather than by being drawn
+differently — on a settled mesh that usually means the other end's record has
+not landed yet, which is not worth its own visual language.
 
-A dashed line is a link whose last announce is over an hour old — "was here and
-has gone quiet" being a different thing from "not here". A second ring around a
-circle is a transport node, which is the one property that changes what the
-graph *means*: an edge through it reaches further than itself.
+**Nothing is said that nobody measured.** An uplink was dialled rather than
+heard, and a local-only neighbour has never announced, so neither carries a
+freshness bucket — `fresh` is published EMPTY rather than 0, on the same
+principle as rnsd's `rssi`/`snr`: the field is part of the shape and its
+emptiness is the answer, which a zero would not be. Neither is reported as
+"one end reporting" either: their far ends do not file records at all, so
+one-endedness there is the definition rather than an observation, and stating
+it would read as a fault.
+
+A dashed line is a link the reporter last heard over an hour ago, or one whose
+reporting record is itself getting old — "was here and has gone quiet" being a
+different thing from "not here". A second ring around a circle is a transport
+node, which is the one property that changes what the graph *means*: an edge
+through it reaches further than itself. A small hollow circle with no caption is
+a **stub**: the far end of a link whose own record has not arrived yet.
+
+**A box, not a circle, is outside the community.** An uplink's far end — the
+host at the end of a dialled TCP connection, say — is drawn as a rectangle with
+its address inside it, outlined in the colour of the medium that reaches it. The
+shape says "not one of us"; the colour says "over what". It never merges with a
+member and is never joined to anything: its address is the only name it will
+ever have, and two nodes naming the *same* address share one box, which asserts
+nothing beyond what both records literally say. It is written whole, in a
+smaller face than the captions, and the box grows to hold it: half a `host:port`
+names nothing, and an elision is indistinguishable from an address that really
+is that short. A long one costs room in the picture — the operator's lever for
+that is a shorter interface name.
 
 **Captions look for a clear spot.** Straight under the circle is where a caption
 belongs, but on a graph that is the busiest space on the canvas — every line to
 the node converges there. So each label is tried in a ring of eight spots
 (below, above, the sides, the diagonals) against the sampled edge curves, the
 other circles, the canvas edge and the captions already placed, and takes the
-first that is clear. One with nowhere clear to go keeps the conventional spot
+first that is clear. The spots are measured from the outermost thing drawn at
+the vertex, so a transport node's caption clears its second ring rather than
+brushing it. One with nowhere clear to go keeps the conventional spot
 and is drawn on a black knockout instead: a dense graph genuinely has no clear
 spot, and moving a caption far enough to find one makes it read as belonging to
 a different circle.
 
-`browser/src/lib/netGraph.ts` is the model, `panels/NetGraphWindow.vue` the
-drawing, and `lib/forceLayout.ts` is the one seam — a spring embedder small
-enough to carry inline for a graph this size, replaceable by a layout library
-without touching anything else.
+**Crossings are minimised, not left to chance.** A spring embedder has no term
+for them and cannot grow one — whether two edges cross is a property of the
+whole drawing, not a force between two vertices — so three connected nodes plus
+one outlier would put the outlier on whichever side its starting angle chose,
+and half the time its single edge cut straight through the triangle. So the
+springs settle the shape and then an untangling pass relocates one vertex at a
+time to whichever position around its neighbours crosses fewest edges, retrying
+from a different starting arrangement while a fault survives. It is a local
+search, so it does not guarantee a flat drawing of every graph that has one, but
+it clears the shapes a neighbourhood actually makes.
+
+**Wide angles where there is a choice.** Below the two faults, the search
+prefers the arrangement whose narrowest fan of edges at any vertex is widest —
+which is what stops a triangle being drawn as a sliver that reads as one line
+rather than three. An angular-resolution *force* was tried for this and removed:
+gentle, it barely moved the worst angle; strong enough to matter, it fought the
+springs into new crossings and drove the worst angle to zero. The search reaches
+~55° where the force reached ~9°, and costs no crossings to do it, because it
+can refuse a move that breaks something a force can only shove at.
+
+**Even lengths where nothing else decides.** A 200 px line beside a 40 px one
+reads as a statement about distance, and nothing in a record is a distance — so
+evenness is the honest default, and a chain of nodes comes out as a chain of
+equal links. Two mechanisms: a relaxation pass pulls every edge toward the
+drawing's mean length, half the correction at each end, moving only along the
+edge so the shape the springs settled on is not rotated; and evenness is the
+last of the four ranking criteria, below every fault and below the angles, so
+the untangler prefers the arrangement whose lines most nearly agree. The pass
+runs before the untangler and again after it — relocating a vertex is exactly
+what leaves one edge long and one short — with the second run reverted if it
+would cost a crossing or put an edge through a circle.
+
+**The frame follows the window.** The layout runs in fixed graph units, but the
+viewBox is the drawing's own bounds grown to the panel's shape, so the picture
+fills the window and keeps filling it through a resize without the simulation
+re-running and the vertices jumping under the hand doing the resizing. It stops
+shrinking below a floor: a two-vertex community has bounds a few tens of units
+across, and a frame that tight would blow its captions up into headlines.
+
+**An edge never passes through a circle.** That is ranked above crossings and is
+the one thing the layout will spend crossings to avoid. Two edges crossing is a
+drawing that could be clearer; an edge running through a node it does not end at
+is a drawing that is *wrong* — it reads as a connection that is not in the data,
+and no amount of looking tells the reader otherwise. It is also exactly what a
+crossings-only search reaches for, since flattening a triangle onto a line is a
+cheap way to stop its edges crossing anything. The clearance comes from the
+drawer, which is the half that knows how big a circle is.
+
+`browser/src/lib/netGraph.ts` reads the rows, `panels/NetGraphWindow.vue` is the
+drawing, and `lib/forceLayout.ts` is the one seam — small enough to carry inline
+for a graph this size, replaceable by a layout library without touching anything
+else.
 
 ## Status-line pills
 
@@ -427,10 +683,19 @@ composes the text, and owns only the keys both renderers read:
 | `rns.pill.<id>.text` | The finished pill, e.g. `L3`. **Empty = no pill** (emptied rather than deleted, because a delete fires no change callback and the display's renderer would never learn it had gone). |
 | `rns.pill.<id>.color` | `rrggbb` for the class. |
 | `rns.pill.<id>.order` | Left-to-right placement — each straddle passes its own settings `order:`, so the pills read in the same sequence the Interfaces pane lists them. |
+| `rns.pill.<id>.title` | The medium in an operator's words — `LoRa`, `AutoInterface (LAN)` — for the surfaces that name a medium instead of abbreviating it to a letter, such as the NetGraph legend. Empty where the class slug already reads as the operator's word, and every reader falls back to that slug. |
 
 An interface straddle calls `rnsdPillSet(id, letter, count, color, order)` /
 `rnsdPillClear(id)` and contributes nothing else; the browser component and the
 on-device status-bar indicator both live here.
+
+**A pill is about this node; a colour is about the medium.** Both renderers gate
+on `text`, so `rnsdPillColor(id, color, order, title)` publishes the colour, the
+placement and the name with no pill — every straddle calls it once from `onInit`, whether or
+not its medium is ever switched on here. The network graph is the reason: it
+draws the whole community's links, including media this node does not run, and a
+class whose colour had never been published would fall back to grey and read as
+some other medium.
 
 ## The directory
 
@@ -526,6 +791,13 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.net.up_wait_s` | `20` | Boot barrier: how long to wait for the network at startup. |
 | `s.rns.boot_min_s` | `10` | Mesh-safety boot window, floor: seconds from boot before the ecosystem may come up and first transmit. Always served — a boot-looping node must not be able to spam the shared medium with re-announces, and nothing cancels this part. |
 | `s.rns.boot_max_s` | `300` | Same window, ceiling: how much longer an *unattended* node holds. Cancelled by `sys.human_detected` — the first keystroke on a console, USB host on the console, screen wake, or click in the web UI drops the rest of the hold, since someone at the controls is not a bootloop. |
+| `s.netgraph.enable` | `1` | Run the distributed network graph. Live — a change starts or stops the component and takes the `netgraph.*` rows down with it. |
+| `s.netgraph.rebuild_floor_s` | `600` | Minimum seconds between rebuilds of this node's own record. The floor is what stops a node joining a busy neighbourhood from re-flooding its record once per neighbour: a burst of changes coalesces into one rebuild. |
+| `s.netgraph.announce_cells` | `8` | Maximum link cells per `ln` line in the ANNOUNCED form. Fewer are used automatically if the record still will not fit the airtime budget; the full record always carries all of them. |
+| `s.netgraph.link_horizon_h` | `6` | A link not heard for this long leaves the record. A neighbour currently attached but never heard from is not stale — its lifetime is the interface's statement that it is reachable. |
+| `s.netgraph.horizon_h` | `24` | Records older than this are dropped, never stored, and never offered in a digest. Half of it is the point at which a node is published as `stale`. |
+| `s.netgraph.sync_min` | `30` | Anti-entropy ceiling in minutes: one Channel exchange against one rotating neighbour. The interval is adaptive between 30 s and this — an exchange that taught this node nothing doubles it, one that brought a record halves it — and it counts exchanges a NEIGHBOUR initiated too, since being visited answers the same question as visiting. Each wait is shortened by up to a quarter at random, so nodes that back off together do not end up dialling in lockstep. |
+| `s.netgraph.store_kb` | `24` | Byte cap on the record store. Over it, the stalest-received record goes first; our own is never evicted. RAM only — a rebooted node backfills faster than flash-wear accounting would be worth. |
 
 ### Runtime state & telemetry (written)
 
@@ -552,11 +824,15 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.peers.<i>.{iface,node,dest,aspect,name,hops,heard,announces,rssi,snr}` | One direct peer — a destination one hop away (below). |
 | `rnsd.nodes.slots` | How far a reader iterates the node table. |
 | `rnsd.nodes.<i>.{iface,key,label,transport,heard,peers}` | One node — the thing at the far end (below). |
-| `rns.pill.<id>.{text,color,order}` | One interface class's status-line pill; `text` empty = no pill. Written by the interface straddles through `rnsdPillSet`. |
+| `rns.pill.<id>.{text,color,order,title}` | One interface class's status-line pill, plus the colour and operator-facing name of the medium itself; `text` empty = no pill. Written by the interface straddles through `rnsdPillSet` / `rnsdPillColor`. |
+| `netgraph.{self,nodes.*,links.*,ifs.*}` | The whole community's graph, resolved from every node's own record (see the netgraph section above). Taken down wholesale when the component stops. |
+| `s.netgraph.seq` | State, not a setting: the last sequence number this node issued for its own record. Persisted so a reboot with a bad clock cannot re-issue an old one. |
 
-Together these are the graph: **nodes** are the vertices and **peers** the
-destinations hanging off them, in the same shape whatever medium they arrived
-over.
+Together these are this node's own neighbourhood: **nodes** are the things one
+hop away and **peers** the destinations hanging off them, in the same shape
+whatever medium they arrived over. netgraph composes its record from exactly
+these two tables, which is why a medium added tomorrow reaches the community's
+graph without writing a line of code for it.
 
 A peer's `iface` is the registered interface name (`lora/0`, `tcp_in/…`), `node`
 the index of the node that announced it — or `-1` on a shared medium that cannot
@@ -615,6 +891,11 @@ rnsd clink <dest_hash> [aspect]   open a consumer-API link (debug)
 rnsd clink send <text> | close
 rnsd clink listen <aspect> | off  host a destination, accept inbound links
 rnsd creq <dest_hash> <path>      request/response smoke test (page fetch)
+
+netgraph                          record store: origins, seqs, ages, bytes, sync state
+netgraph d[ump] [<prefix>]        records expanded to pipe text
+netgraph s[ync]                   run a record exchange now
+netgraph r[ebuild]                rebuild and announce our own record
 
 rnstatus [filter] [-t] [-j]       interfaces & traffic — node header + per-iface block
 rnpath [dest] [-n N|-a] [-s] [-j] routing path table (dest prefix-matches the hash)

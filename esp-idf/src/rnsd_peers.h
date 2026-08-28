@@ -53,10 +53,17 @@ void rnsdPeersTick(void);
 
 /** The registered interface table, in registration order — implemented in
  *  rnsd.cpp, where the table lives. `radius` is the interface's community
- *  radius, which is what decides whether it has a neighbourhood at all. */
+ *  radius, which is what decides whether it has a neighbourhood at all.
+ *
+ *  Lock-free, single-writer: the table is only ever written on the rnsd task,
+ *  and this reads it in place. Off that task it is therefore ADVISORY — a name
+ *  read while a slot is being recycled can be torn, and the answer is right
+ *  again the next time it is asked. Fine for a listing or for composing a
+ *  network-graph record; never state to act on. */
 void rnsdIfaceWalk(void (*cb)(const char* name, uint8_t radius, void* ctx), void* ctx);
 
 /** One interface's community radius, 0 for an unregistered name. Also in
  *  rnsd.cpp: the listing needs it per node, to tell "nobody has announced yet"
- *  from "this is an uplink and its destinations are deliberately not tracked". */
+ *  from "this is an uplink and its destinations are deliberately not tracked".
+ *  Same lock-free, advisory-off-task read as rnsdIfaceWalk. */
 uint8_t rnsdIfaceRadius(const char* name);

@@ -503,6 +503,57 @@ const char* rnsdAspectLabel(const uint8_t name_hash[RNSD_NAME_HASH_LEN]);
  *  NomadNet and older clients send raw UTF-8. Always NUL-terminates. */
 void rnsdAnnounceName(const uint8_t* app_data, size_t n, char* out, size_t outsz);
 
+/* ──────────────── what this node announces ────────────────
+ *
+ * The mirror of the neighbourhood above: not who is out there, but which
+ * addresses THIS node has been heard announcing. A peer's report of a link
+ * names the destination it heard, so joining that report to a node means
+ * asking each node which destinations are its own — which is this walk. */
+
+/** One destination this node hosts. */
+typedef struct {
+    uint8_t dest[RNSD_DEST_HASH_LEN];
+    char    aspect[RNSD_PEER_ASPECT_MAX];  /* "lxmf.delivery", "rnstransport.probe" */
+} rnsd_hosted_dest_t;
+
+/** Walk every destination this node currently hosts — those opened through
+ *  rnsdDestOpen plus rnsd's own transport probe where it is up. Returns how
+ *  many were visited. The callback runs on the caller's task against a private
+ *  copy, so this is safe from any task; it must not call back in. */
+int rnsdHostedDestsForEach(void (*cb)(const rnsd_hosted_dest_t*, void*), void* ctx);
+
+/* ──────────────── the routing table, as evidence ────────────────
+ *
+ * What the path table knows that the neighbourhood does not: nodes nobody has
+ * told us about directly. A stock RNS node announces its destinations and
+ * nothing else — no self-report, no record — so routing is the only evidence
+ * it exists at all, and the only evidence of where it hangs off.
+ *
+ * The identity is the useful part. A destination is one address of a node; the
+ * identity behind it is the node, and it is the same value a network-graph
+ * record is originated by — so a routed destination can be matched to a node
+ * that DOES speak for itself, or stood up as one that does not, without
+ * guessing. */
+typedef struct {
+    uint8_t dest[RNSD_DEST_HASH_LEN];
+    uint8_t identity[RNSD_IDENT_HASH_LEN];   /* valid iff have_identity */
+    uint8_t via[RNSD_DEST_HASH_LEN];         /* next hop's transport id */
+    char    iface[RNSD_PEER_IFACE_MAX];      /* the interface we would send on */
+    uint8_t hops;
+    bool    have_identity;                   /* the announce carried a usable key */
+    bool    have_route;
+} rnsd_dir_entry_t;
+
+/** Walk every destination the directory holds — routed or not. Returns how many
+ *  were visited. The callback runs on the caller's task against a private copy,
+ *  so this is safe from any task; it must not call back in.
+ *
+ *  The identity is why this exists. Every other table in the system speaks in
+ *  DESTINATIONS, and a destination is one address of a node rather than the
+ *  node; this is the one place that says which node an address belongs to, for
+ *  every address this device has ever heard. */
+int rnsdDirForEach(void (*cb)(const rnsd_dir_entry_t*, void*), void* ctx);
+
 /* ──────────────── status-line pills ────────────────
  *
  * One pill per interface CLASS in the top status line, on the display and in
@@ -521,6 +572,7 @@ void rnsdAnnounceName(const uint8_t* app_data, size_t n, char* out, size_t outsz
  *     rns.pill.<id>.text   "L3"      the finished pill; empty = no pill
  *     rns.pill.<id>.color  "ffd400"  rrggbb, the class's colour
  *     rns.pill.<id>.order  4         left-to-right placement
+ *     rns.pill.<id>.title  "LoRa"    the medium in an operator's words
  */
 
 /** Publish (or update) this class's pill. `id` is a short stable slug owned by
@@ -532,6 +584,25 @@ void rnsdPillSet(const char* id, char letter, int count, const char* color, int 
 
 /** Take this class's pill down — the interface is disabled. */
 void rnsdPillClear(const char* id);
+
+/** Publish this class's colour, placement and title WITHOUT a pill. Call once
+ *  from the straddle's onInit, with the same `color`/`order` its rnsdPillSet
+ *  uses.
+ *
+ *  `title` is the medium as an OPERATOR says it — "LoRa", "TCP",
+ *  "AutoInterface (LAN)" — for the legends and listings that name a medium
+ *  rather than abbreviating it to a pill. The class slug is a program's word
+ *  for the medium and reads like one; only the straddle knows the other. A
+ *  static string, and empty where the slug is already the operator's word.
+ *
+ *  A pill is about this node: it appears when the medium is switched on here.
+ *  A COLOUR is about the medium itself, and the network graph draws media this
+ *  node does not run — a LoRa link between two other nodes is still a LoRa
+ *  link, and rendering it grey because this node has no radio switched on says
+ *  something false about the network. So the colour is published from the
+ *  moment the straddle is staged and the pill still only from the moment the
+ *  class is enabled; both renderers gate on `text`, which this never writes. */
+void rnsdPillColor(const char* id, const char* color, int order, const char* title);
 
 /* ──────────────── destination / link client API ────────────────
  *

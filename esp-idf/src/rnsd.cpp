@@ -253,7 +253,11 @@ typedef struct {
 static_assert(sizeof(rnsd_channel_connect_t) <= ITS_MAX_MSG_DATA,
               "rnsd_channel_connect_t must fit ITS_MAX_MSG_DATA");
 
-#define RNSD_MAX_OUR_DESTS    4
+/* Hosted IN destinations. lxmf.delivery, rnsh, rlpg.mailbox and
+ * netgraph.discovery are all standing hosts on a fully-loaded node, and lxmf
+ * hosts one per identity slot, so the table has to leave headroom above the
+ * four an application-only node needs. */
+#define RNSD_MAX_OUR_DESTS    6
 /* Per-conn pending path-search slots. Each holds one parked OUT_PACKET (its
  * full LXM wire, ~≤500B) whose path hasn't resolved yet, so multiple sends to
  * different peers can search for routes concurrently instead of evicting one
@@ -851,6 +855,51 @@ static void onIfaceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
         return;
     }
     armDestReplay(slots, RNSD_REPLAY_DEBOUNCE_MS);
+}
+
+/* ─────────────── hosted-destination snapshot ───────────────
+ *
+ * Which addresses this node announces from, as flat bytes behind a lock, so any
+ * task can ask without touching an mR object the rnsd task owns. Rebuilt in
+ * full whenever the set changes — it is at most a handful of rows and the
+ * change points are rare (a destination opening or closing, the probe dial). */
+
+static rnsd_hosted_dest_t s_hosted[RNSD_MAX_OUR_DESTS + 1];
+static int                s_hosted_n = 0;
+static std::mutex         s_hosted_mtx;
+
+static void hostedDestsRefresh(void)
+{
+    rnsd_hosted_dest_t snap[RNSD_MAX_OUR_DESTS + 1];
+    int n = 0;
+    for (int j = 0; j < RNSD_MAX_OUR_DESTS && s_our_dests; j++) {
+        our_dest_t& c = s_our_dests[j];
+        if (!c.used || !c.listener_hash) continue;
+        std::memcpy(snap[n].dest, c.listener_hash.data(), RNSD_DEST_HASH_LEN);
+        safeStrncpy(snap[n].aspect, c.req.aspect, sizeof(snap[n].aspect));
+        n++;
+    }
+    if (s_probe_dest) {
+        std::memcpy(snap[n].dest, s_probe_dest.hash().data(), RNSD_DEST_HASH_LEN);
+        safeStrncpy(snap[n].aspect, "rnstransport.probe", sizeof(snap[n].aspect));
+        n++;
+    }
+    std::lock_guard<std::mutex> lk(s_hosted_mtx);
+    std::memcpy(s_hosted, snap, sizeof(rnsd_hosted_dest_t) * (size_t)n);
+    s_hosted_n = n;
+}
+
+int rnsdHostedDestsForEach(void (*cb)(const rnsd_hosted_dest_t*, void*), void* ctx)
+{
+    rnsd_hosted_dest_t snap[RNSD_MAX_OUR_DESTS + 1];
+    int n;
+    {
+        std::lock_guard<std::mutex> lk(s_hosted_mtx);
+        n = s_hosted_n;
+        std::memcpy(snap, s_hosted, sizeof(rnsd_hosted_dest_t) * (size_t)n);
+    }
+    if (cb) for (int i = 0; i < n; i++) cb(&snap[i], ctx);
+    return n;
 }
 
 /* ─────────────── RNSD_PORT_DEST handlers ─────────────── */
@@ -1743,6 +1792,7 @@ static int onOurDestConnect(int handle, const void* data, size_t len)
             snprintf(k, sizeof(k), "rnsd.dest.%d.dest", idx);
             storageSet(k, d.hash().toHex().c_str());
         }
+        hostedDestsRefresh();
     } catch (const std::exception& e) {
         err("our-dest connect: Destination ctor threw: %s", e.what());
     }
@@ -1775,6 +1825,7 @@ static void onOurDestDisconnect(int ref)
     c.listener_dest     = RNS::Destination(RNS::Type::NONE);
     c.listener_hash     = RNS::Bytes();
     for (auto& p : c.pending) p = our_dest_pending_t{};
+    hostedDestsRefresh();
 }
 
 static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
@@ -2370,6 +2421,7 @@ static void rnsdProbeDestUp(void)
         s_probe_dest.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
         info("probe dest up: %s (auto-proves incoming packets)",
              s_probe_dest.hash().toHex().c_str());
+        hostedDestsRefresh();
         /* The probe rides every replay (replayOurDestAnnounces airs it
          * alongside the hosted destinations), so turning it on mid-run needs
          * only the sweep an application announce would get. */
@@ -2389,6 +2441,7 @@ static void rnsdProbeDestDown(void)
     try { RNS::Transport::deregister_destination(s_probe_dest); }
     catch (const std::exception& e) { warn("deregister_destination threw: %s", e.what()); }
     s_probe_dest = RNS::Destination(RNS::Type::NONE);
+    hostedDestsRefresh();
     info("probe dest down");
 }
 
@@ -3122,6 +3175,43 @@ static void cliRnsd(const char* args)
         return;
     }
     cliPrintf("unknown subcommand. try `rnsd -h`\n");
+}
+
+/* ─────────────── the routing table, as evidence ─────────────── */
+
+/* rdirForEach hands out stable copies and holds no lock across the callback,
+ * which is what makes this safe from any task — the same property rnpath
+ * already relies on from the CLI task. The identity is derived here rather
+ * than handed out as a public key: the caller wants to know WHICH NODE, and a
+ * 64-byte key is not that answer. */
+static void rnsdDirCollect(const rdir_entry_t* e, void* vctx)
+{
+    struct ctx_t { void (*cb)(const rnsd_dir_entry_t*, void*); void* ctx; int n; };
+    ctx_t* c = (ctx_t*)vctx;
+
+    rnsd_dir_entry_t p{};
+    p.have_route = e->has_route;
+    std::memcpy(p.dest, e->dest, RNSD_DEST_HASH_LEN);
+    if (e->has_route) {
+        p.hops = e->route.hops;
+        std::memcpy(p.via, e->route.received_from, RNSD_DEST_HASH_LEN);
+    }
+    if (e->has_pubkey)
+        p.have_identity = rnsdIdentityHashFromPubkey(e->pubkey, p.identity);
+    if (e->has_route) try {
+        RNS::Interface i = RNS::Transport::find_interface_from_hash_prefix(e->route.iface_hash);
+        if (i) safeStrncpy(p.iface, ifaceShortName(i.toString()).c_str(), sizeof(p.iface));
+    } catch (const std::exception&) { p.iface[0] = '\0'; }
+    c->cb(&p, c->ctx);
+    c->n++;
+}
+
+int rnsdDirForEach(void (*cb)(const rnsd_dir_entry_t*, void*), void* ctx)
+{
+    if (!cb) return 0;
+    struct ctx_t { void (*cb)(const rnsd_dir_entry_t*, void*); void* ctx; int n; } c{ cb, ctx, 0 };
+    rdirForEach(rnsdDirCollect, &c);
+    return c.n;
 }
 
 /* ─────────────── rnpath ─────────────── */
