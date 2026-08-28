@@ -6,6 +6,7 @@
  * (interfaces deliver real packets through to Transport::inbound).
  */
 #include "rnsd.h"
+#include "rnsd_peers.h"
 #include "mem.h"
 #include "spangap.h"
 #include "compat.h"       /* millis() — the announce beat's clock */
@@ -157,6 +158,14 @@ struct iface_t {
  * our packet rates. RNS::Interface has a non-trivial ctor, so we use
  * placement-new on each slot. */
 static iface_t* s_ifaces = nullptr;
+
+/* The peer the packet currently being processed came from, valid only for the
+ * duration of one handle_incoming — see the strip in onTransportRecv. Null when
+ * the medium cannot say. `s_noOrigin` is the all-zero key a point-to-point
+ * interface's single node is filed under. */
+static const uint8_t  s_noOrigin[RNSD_NODE_KEY_LEN] = {};
+static uint8_t        s_rxOriginBuf[RNSD_NODE_KEY_LEN];
+static const uint8_t* s_rxOrigin = nullptr;
 
 static TaskHandle_t s_task = nullptr;
 static std::unique_ptr<RNS::Identity> s_identity;
@@ -395,6 +404,14 @@ static iface_t* ifaceAlloc(void)
     return nullptr;
 }
 
+static iface_t* ifaceFindByName(const char* name)
+{
+    for (int j = 0; j < RNSD_MAX_IFACES; j++)
+        if (s_ifaces[j].used && strcmp(s_ifaces[j].info.name, name) == 0)
+            return &s_ifaces[j];
+    return nullptr;
+}
+
 /* Count registered interfaces. Announces are pointless (and misleading in the
  * log) with zero interfaces — nothing is on air — so senders gate on this. */
 static int ifaceCount(void)
@@ -581,6 +598,18 @@ static void publishIfaceUp(const iface_t& i)
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.announce_cap", i.info.name); storageSet(key, (int)(i.info.announce_cap ? i.info.announce_cap : RNS_IFACE_ANNOUNCE_CAP_DEFAULT));
     storageSet("rnsd.iface_event_seq", ++s_iface_event_seq);
     storageEnd();
+    /* A point-to-point interface IS one node, and it is reachable the moment it
+     * registers — so it is a row in the neighbourhood from now, under whatever
+     * address the straddle gave, rather than from its first announce. A
+     * multi-peer interface declares its peers itself, with RNSD_IFACE_AUX_PEER.
+     *
+     * Not gated on the community radius. Whether we serve a peer's mesh is a
+     * policy; that there is somebody at the other end of the wire is a fact, and
+     * an uplink an operator dialled is exactly the peer they most want named
+     * back at them. The radius decides only whether its DESTINATIONS are
+     * tracked, which the listing says out loud. */
+    if (i.info.point_to_point && !i.info.rx_origin)
+        rnsdNodeDeclare(i.info.name, nullptr, i.info.peer_label, true);
     /* The hosted destinations AND the probe reach the new interface through
      * the pinned replay — never through a broadcast announce, which would
      * spend every other interface's airtime on this one's reconnect. They have
@@ -596,6 +625,34 @@ static void publishIfaceDown(const iface_t& i)
 {
     char key[80];
     snprintf(key, sizeof(key), "rnsd.ifaces.%s.up", i.info.name); storageSet(key, 0);
+    /* Its neighbourhood goes with it. A BLE peer and a TCP connection are each
+     * their own interface, so this is the only thing that ever says a peer has
+     * left — nothing announces a departure. */
+    rnsdPeersIfaceGone(i.info.name);
+}
+
+/* The registered interface table, for rnsd_peers' printer and publisher. Read
+ * from the CLI task as well as rnsd's own, on the same terms as `rnstatus`:
+ * the table is written only on the rnsd task and a slot is claimed before it is
+ * filled, so a reader sees a consistent name or an unused slot. */
+void rnsdIfaceWalk(void (*cb)(const char* name, uint8_t radius, void* ctx), void* ctx)
+{
+    if (!s_ifaces || !cb) return;
+    for (int j = 0; j < RNSD_MAX_IFACES; j++) {
+        const iface_t& i = s_ifaces[j];
+        if (!i.used) continue;
+        cb(i.info.name, i.info.community_radius, ctx);
+    }
+}
+
+uint8_t rnsdIfaceRadius(const char* name)
+{
+    if (!s_ifaces || !name) return 0;
+    for (int j = 0; j < RNSD_MAX_IFACES; j++) {
+        const iface_t& i = s_ifaces[j];
+        if (i.used && strcmp(i.info.name, name) == 0) return i.info.community_radius;
+    }
+    return 0;
 }
 
 /* ─────────────── ITS callbacks ─────────────── */
@@ -604,6 +661,18 @@ static int onTransportConnect(int handle, const void* data, size_t len)
 {
     if (len < sizeof(rnsd_iface_t)) {
         err("register: payload too small (%zu)", len);
+        return -1;
+    }
+    /* One name, one interface. Transport keys _interfaces on a hash of the
+     * name alone (Interface::get_hash), and its insert keeps the entry already
+     * there — so a second interface of the same name never reaches Transport
+     * and silently transmits nothing, while rnsd's own table shows two. Refuse
+     * the duplicate here, where it can be said out loud. */
+    char rname[sizeof(rnsd_iface_t::name)];
+    safeStrncpy(rname, ((const rnsd_iface_t*)data)->name, sizeof(rname));
+    if (iface_t* dup = ifaceFindByName(rname)) {
+        err("register: iface=%s already registered (slot %d) — refusing duplicate",
+            rname, (int)(dup - s_ifaces));
         return -1;
     }
     iface_t* slot = ifaceAlloc();
@@ -691,10 +760,37 @@ static void onTransportRecv(int handle, size_t /*bytesAvail*/)
      * Transport::inbound copies it onto the decoded packet — and mR onto the
      * Link, so it reaches Link/Resource callbacks too, not just this packet. */
     const uint8_t* pkt = pktbuf;
+    /* Which peer under this interface sent it. Stashed for the length of the
+     * inbound call rather than threaded through mR: Transport::inbound and every
+     * handler it calls run synchronously on this task, in this call stack, so
+     * "the packet being processed" is a well-defined thing here and nowhere
+     * else. A point-to-point interface sets no prefix — its single peer is the
+     * interface — and a shared medium has none to give. */
+    s_rxOrigin = nullptr;
+    if (i->info.rx_origin) {
+        if (n >= RNSD_NODE_KEY_LEN) {
+            std::memcpy(s_rxOriginBuf, pktbuf, RNSD_NODE_KEY_LEN);
+            /* All-zero is "the sender is unknown", which a shared radio has to
+             * be able to say: it can name the transmitter of an announce it
+             * parsed and not of a packet it merely relayed. The frame still
+             * carries the field, so the strip stays a fixed offset. */
+            bool known = false;
+            for (size_t k = 0; k < RNSD_NODE_KEY_LEN; k++) known |= s_rxOriginBuf[k] != 0;
+            s_rxOrigin = known ? s_rxOriginBuf : nullptr;
+            pkt += RNSD_NODE_KEY_LEN; n -= RNSD_NODE_KEY_LEN;
+        } else {
+            warn("%s: rx_origin frame shorter than its key (%zu B)", i->info.name, n);
+            return;
+        }
+    } else if (i->info.point_to_point) {
+        s_rxOrigin = s_noOrigin;   /* the interface IS the node */
+    }
+    /* After the origin key, where an interface carries both: the prefixes are
+     * stripped in the order they are written. */
     if (i->info.rx_signal && i->mr_iface) {
         if (n >= 4) {
-            int16_t rssi = (int16_t)(((uint16_t)pktbuf[0] << 8) | pktbuf[1]);
-            int16_t snr  = (int16_t)(((uint16_t)pktbuf[2] << 8) | pktbuf[3]);
+            int16_t rssi = (int16_t)(((uint16_t)pkt[0] << 8) | pkt[1]);
+            int16_t snr  = (int16_t)(((uint16_t)pkt[2] << 8) | pkt[3]);
             bool none = (rssi == INT16_MIN);
             i->mr_iface.r_stat_rssi(none ? RNS::Type::NaN<float> : (float)rssi);
             i->mr_iface.r_stat_snr (none ? RNS::Type::NaN<float> : snr / 10.0f);
@@ -718,6 +814,10 @@ static void onTransportRecv(int handle, size_t /*bytesAvail*/)
         RNS::Bytes data(pkt, n);
         i->mr_iface.handle_incoming(data);
     }
+    /* The stash is valid for exactly that call. Transport::inbound is also
+     * reached by a cache replay, which has no arriving frame behind it and must
+     * not inherit the last one's peer. */
+    s_rxOrigin = nullptr;
 }
 
 /* Out-of-band aux frames on RNSD_PORT_IFACE. Runs on the rnsd task (itsOnAux
@@ -728,6 +828,15 @@ static void onIfaceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
 {
     if (len < 1) return;
     uint8_t op = ((const uint8_t*)data)[0];
+    if (op == RNSD_IFACE_AUX_PEER) {
+        if (len < sizeof(rnsd_iface_peer_t)) { err("iface aux: PEER too short (%zu)", len); return; }
+        rnsd_iface_peer_t p;
+        memcpy(&p, data, sizeof(p));
+        p.iface[sizeof(p.iface) - 1] = '\0';
+        p.label[sizeof(p.label) - 1] = '\0';
+        rnsdNodeDeclare(p.iface, p.key, p.label, p.up != 0);
+        return;
+    }
     if (op != RNSD_IFACE_AUX_ANNOUNCE) { warn("iface aux: unknown op 0x%02x", op); return; }
     if (len < sizeof(rnsd_iface_announce_t)) { err("iface aux: ANNOUNCE too short (%zu)", len); return; }
     rnsd_iface_announce_t m;
@@ -2085,8 +2194,10 @@ public:
                            const RNS::Bytes& app_data,
                            const RNS::Bytes& name_hash,
                            const RNS::Bytes& ratchet,
-                           uint8_t hops) override {
+                           uint8_t hops,
+                           const RNS::Interface& receiving_interface) override {
         (void)name_hash;
+        (void)receiving_interface;
         /* Announces are everyone else's traffic and busy TCP peers deliver
          * hundreds of them, so all output here is verb() — debug level
          * stays readable. Gate against the verbose level up front so the
@@ -2156,8 +2267,31 @@ public:
                            const RNS::Bytes& app_data,
                            const RNS::Bytes& name_hash,
                            const RNS::Bytes& ratchet,
-                           uint8_t hops) override
+                           uint8_t hops,
+                           const RNS::Interface& receiving_interface) override
     {
+        /* The neighbourhood, before the fan-out: every announce passes here
+         * already, and this one handler is what gives every interface — LoRa,
+         * TCP, Bluetooth, the LAN, whatever is added next — the same direct-peer
+         * table without any of them writing code for it. The table itself
+         * decides what is worth keeping; the signal is the receiving
+         * interface's own last-packet sample, which is still this packet's on
+         * this call stack (Transport::inbound stamped the packet from it a few
+         * frames up). */
+        if (receiving_interface && name_hash.size() == RNSD_NAME_HASH_LEN) {
+            float rssi = receiving_interface.r_stat_rssi();
+            float snr  = receiving_interface.r_stat_snr();
+            bool  sig  = !RNS::Type::isNan(rssi) || !RNS::Type::isNan(snr);
+            rnsdPeersObserve(receiving_interface.name().c_str(),
+                             receiving_interface.community_radius(), hops,
+                             s_rxOrigin,
+                             dest_hash.data(), name_hash.data(),
+                             app_data.size() ? app_data.data() : nullptr,
+                             app_data.size(), sig,
+                             RNS::Type::isNan(rssi) ? 0 : (int16_t)rssi,
+                             RNS::Type::isNan(snr)  ? 0 : (int16_t)(snr * 10.0f));
+        }
+
         /* Build the frame once. RNS announce app_data is bounded by mR's
          * configuration; our outbound ITS buffer is 4096, well above any
          * normal announce.
@@ -7226,6 +7360,11 @@ static void rnsdTaskMain(void*)
 #if 0  /* route publishing to our storage disabled */
                 publishPathTable();
 #endif
+                /* Ages peers out and republishes, but only when the table
+                 * actually changed. On the OTHER phase from Transport::jobs():
+                 * a neighbourhood moves at announce intervals, so it has no
+                 * claim to share a tick with the sweep. */
+                rnsdPeersTick();
             }
             publishStats();   /* cheap, every tick */
             tickPhase ^= 1;

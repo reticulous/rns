@@ -51,6 +51,12 @@ kconfig:
 # explicit ordering needed.
 services:
   - { class: RnsdService, header: rnsd.h }
+  # Interface-class pills in the shell status bar (`L3` — three peers on LoRa).
+  # The renderer is shared, driven by the rns.pill.* keys each interface
+  # straddle publishes, so it lives here rather than four times over. when:-gated
+  # on spangap-lcd — the whole class is under conditional/spangap-lcd/, so
+  # without a display neither the trampoline nor the class compiles.
+  - { class: RnsdPillsService, header: rnsd_pills.h, when: spangap/spangap-lcd }
 
 # Browser-side UI registration (parallel to init: above) — auto-wired into
 # the buildable SPA via straddles.gen.ts; no web-interface edit needed.

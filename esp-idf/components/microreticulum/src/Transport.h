@@ -75,7 +75,14 @@ namespace RNS {
 		// empty for a destination that advertises none. It is a field of the
 		// announce, never part of app_data — a handler that wants to encrypt
 		// to the peer with forward secrecy takes it from here.
-		virtual void received_announce(const Bytes& destination_hash, const Identity& announced_identity, const Bytes& app_data, const Bytes& name_hash, const Bytes& ratchet, uint8_t hops) = 0;
+		//
+		// `receiving_interface` is where the announce arrived. It is the other
+		// half of `hops`: hops alone says how far away the origin is, and only
+		// the pair says whose neighbour it is, which interface's community it
+		// falls in, and — through the interface's own r_stat_rssi/r_stat_snr,
+		// still holding this packet's sample on this call stack — how well it
+		// was heard. Type::NONE for an announce with no interface behind it.
+		virtual void received_announce(const Bytes& destination_hash, const Identity& announced_identity, const Bytes& app_data, const Bytes& name_hash, const Bytes& ratchet, uint8_t hops, const Interface& receiving_interface) = 0;
 		std::string& aspect_filter() { return _aspect_filter; }
 		// The aspect filter compiled to its name hash, once, at construction.
 		const Bytes& name_hash_filter() const { return _name_hash_filter; }

@@ -42,16 +42,25 @@ rns/
 │   ├── include/
 │   │   ├── rnsd.h        public C API (rnsdLinkOpen, rnsdRecallPubkey, …)
 │   │   └── ports.h       ITS port constants + frame opcodes shared with consumers
-│   ├── src/rnsd.cpp      the rnsd task: identity, Transport, iface table, links
+│   ├── src/
+│   │   ├── rnsd.cpp            the rnsd task: identity, Transport, iface table, links
+│   │   └── rnsd_peers.cpp      the neighbourhood: nodes, their peers, the shared `n` printer
+│   ├── conditional/spangap-lcd/
+│   │   └── …/rnsd_pills_lcd.cpp   the status-bar pills, where there is a display
 │   └── components/
 │       ├── microreticulum/    our modified fork of attermann/microReticulum
 │       └── bzip2/             vendored bzip2 1.0.8
-└── browser/
-    └── src/
-        ├── modules/rnsd.ts          self-registering pinia module + RPC
-        ├── panels/RnsdPanel.vue     Reticulum Settings panel
-        ├── panels/NodesWindow.vue   live announce / path-table viewer
-        └── panels/MapWindow.vue     status floating windows
+├── browser/
+│   └── src/
+│       ├── modules/rnsd.ts            self-registering pinia module + RPC
+│       ├── lib/netGraph.ts            the neighbourhood as vertices + edges
+│       ├── lib/forceLayout.ts         where the vertices go (the one seam)
+│       ├── panels/RnsdPanel.vue       Reticulum Settings panel
+│       ├── panels/NetGraphWindow.vue  the NetGraph dock app
+│       ├── panels/IfacePills.vue      per-medium status-line pills
+│       ├── panels/NodesWindow.vue     live announce / path-table viewer
+│       └── panels/MapWindow.vue       status floating windows
+└── esp-idf/assets/lcd-icons/          launcher SVGs (LCD tiles + web dock)
 ```
 
 ## What it does
@@ -261,6 +270,168 @@ their whole wide-network distance across it), so they fall outside the radius
 and are never taken into custody, while native mesh members arrive shallow and
 are.
 
+## The neighbourhood — who is one hop away
+
+    iface → rnsd    register (point_to_point, peer_label "AA:BB:…")   ─┐ a NODE
+    iface → rnsd    RNSD_IFACE_AUX_PEER up, key, label                ─┘ is declared
+    peer  → air     announce (hops 0)
+    iface → rnsd    [origin key] ‖ packet
+    rnsd            hops == 1, radius > 0 → a peer of that node
+    cli   → rnsd    `tcp n` / `auto n` / `ble_if n` / `espnow n`
+    rnsd → cli      one numbered block per node, its destinations under it
+
+Every interface has the same question to answer — who is one hop away — and the
+same evidence to answer it with, so `rnsd` answers it once for all of them. An
+announce that arrives with `hops == 1` was transmitted by the node that
+originated it, and `rnsd` sees every announce together with the interface it
+arrived on, so the neighbourhood is built in one place and a medium added
+tomorrow gets the verb for free. Every interface straddle's main command takes
+`n` / `neighbors` (`-v` for announce counts and signal), and prints the same
+format from the same code.
+
+Kept only for an interface with a **community** (`community_radius > 0`): a
+radius-0 interface is an uplink, whose far end is a route rather than a
+neighbourhood, and whose announce firehose is the whole wide network. `n` says
+so for such an interface instead of showing an empty list.
+
+### Nodes and destinations
+
+A **peer** is a destination; a **node** is the thing at the far end. They are
+only the same on a medium that cannot tell them apart. Where the interface can
+say *which* peer a packet came from, rnsd groups that peer's destinations under
+one node and the listing shows one numbered block per node:
+
+```
+Bluetooth neighbors:
+
+   1    c68e4bd797f6da5afd27f1f82f6b21ae rnstransport.probe  26m ago
+        3520cc8cf908e6ac53d940ffc8fe4feb lxmf.delivery  "w12"  26m ago
+        ( TRANSPORT )
+```
+
+Two things let an interface say that, and it declares which through
+[`rnsd_iface_t`](esp-idf/include/ports.h):
+
+- **`point_to_point`** — there is only one peer, so the interface *is* the node.
+  Bluetooth registers one interface per peer and TCP one per connection, so this
+  is the ordinary case, and the registration's `peer_label` (a MAC, a
+  `host:port`) is who is at the far end.
+- **`rx_origin`** — several peers under one registration, so each inbound frame
+  is prefixed with a 16-byte **origin key** naming which of them sent it, and
+  each peer is declared with `RNSD_IFACE_AUX_PEER`. An all-zero key is "the
+  sender is unknown", which a medium has to be able to say per packet.
+  [iface-auto](../iface-auto) is the simple case: every peer is a unicast UDP
+  address, and that address is both the key and the label.
+  [iface-lora](../iface-lora) is the interesting one — a shared radio cannot
+  name the sender of a packet it merely overheard, but it CAN name the sender of
+  an **announce**, because it verified the signature and joined the destination
+  to a row in its own peer table. Announces are the only frames this
+  neighbourhood is built from, so that is exactly the coverage needed, and the
+  key is that row: every join the radio's table makes — an announce identity, a
+  linkage frame, a SUPE association — ends in one row, so the shared listing
+  groups exactly as `lora n` does.
+
+A node exists from the moment it is **reachable**, not from its first announce —
+so a peer that has attached and said nothing is a row under its transport
+address rather than a silence, and a peer that goes away stops being a row,
+which is the only thing that can ever say so (nothing announces a departure).
+That holds on a **radius-0 uplink** too: whether this node serves a peer's mesh
+is policy, but that somebody is at the other end of the wire is a fact, and an
+uplink an operator dialled is exactly the peer they most want named back at
+them. The radius gates only the peer's *destinations*, and the row says so.
+
+**`( TRANSPORT )`** needs nothing extra. An announce arriving through a node
+with `hops > 1` travelled through it from somewhere else, and only a node that
+forwards for others produces that — so the announce proves it without anyone
+being asked.
+
+Where a medium declares no attribution at all, none of this is possible: two
+identities announced into the air are indistinguishable from two nodes, and
+merging on a guess would put the wrong lines on a graph. Those destinations are
+listed one per row, numbered after the nodes — which is what
+[iface-espnow](../iface-espnow) gets, having no node-level protocol to cluster
+with. `lora n` remains the richer view of the same neighbourhood: it adds the
+link ids, the identity prefixes, the negotiated SUPE budget and the derived
+transmit power, none of which fits a shape every medium has to fill.
+
+Names come from the announce's own `app_data` — the LXMF msgpack display name,
+or the plain UTF-8 NomadNet and older clients send. `rnsdAnnounceName` and
+`rnsdAspectLabel` (both in [`rnsd.h`](esp-idf/include/rnsd.h)) are that decoding,
+shared rather than re-implemented per interface. `RNSD_PEER_ROW_FMT` /
+`RNSD_PEER_ROW_PAD` are the row indent, shared for the same reason: every
+medium's neighbourhood lines up in the same columns, this printer's and
+iface-lora's alike.
+
+## NetGraph — the neighbourhood as a picture
+
+A dock app in this straddle's browser half: this node in the middle, one circle
+per node around it, **one line per link**. It is drawn entirely from the
+published tables above, so it needs no per-medium knowledge and a medium added
+tomorrow appears the moment rnsd files its peers.
+
+Two things it does that a plain node-link drawing does not, and the reason for
+each:
+
+- **Lines take the medium's colour** — the same `rns.pill.<class>.color` its
+  status-line pill uses, read live. One vocabulary for "which medium" on every
+  surface, and no palette in the app.
+- **Parallel links are parallel arcs.** A peer reachable over both LoRa and
+  Bluetooth is a peer that stays reachable, and that is the interesting fact on
+  a mesh; one line between the circles would hide exactly it. The bundle between
+  a pair is collected first and the curvatures spread symmetrically about where
+  the straight line would have been, so one link is straight and two bow either
+  side.
+
+**One circle is one physical node, not one interface.** rnsd files a node per
+(interface, peer) — correctly, since those are two different links — and the app
+joins them on **evidence**: a destination hash is a cryptographic identity, so
+two rnsd nodes that have announced the same destination are the same device.
+Nothing else merges them, and a node that has announced nothing joins nothing,
+because it has proved nothing about itself.
+
+A dashed line is a link whose last announce is over an hour old — "was here and
+has gone quiet" being a different thing from "not here". A second ring around a
+circle is a transport node, which is the one property that changes what the
+graph *means*: an edge through it reaches further than itself.
+
+**Captions look for a clear spot.** Straight under the circle is where a caption
+belongs, but on a graph that is the busiest space on the canvas — every line to
+the node converges there. So each label is tried in a ring of eight spots
+(below, above, the sides, the diagonals) against the sampled edge curves, the
+other circles, the canvas edge and the captions already placed, and takes the
+first that is clear. One with nowhere clear to go keeps the conventional spot
+and is drawn on a black knockout instead: a dense graph genuinely has no clear
+spot, and moving a caption far enough to find one makes it read as belonging to
+a different circle.
+
+`browser/src/lib/netGraph.ts` is the model, `panels/NetGraphWindow.vue` the
+drawing, and `lib/forceLayout.ts` is the one seam — a spring embedder small
+enough to carry inline for a graph this size, replaceable by a layout library
+without touching anything else.
+
+## Status-line pills
+
+One pill per interface **class** in the top status line, on the display and in
+the browser alike: a letter for the medium and how many peers are on it. `L3` is
+three peers on LoRa — the same three `lora n` lists; `T0` is TCP configured and
+not connected. A pill appears the moment its class is switched on, at 0 as
+readily as at 3, and goes when it is switched off.
+
+The count is each straddle's OWN notion of a peer, because what counts as one is
+a property of the medium: a LoRa radio counts the nodes it hears, TCP counts
+connections inbound and out. `rnsd` holds no table of media and no palette — it
+composes the text, and owns only the keys both renderers read:
+
+| Key | Meaning |
+|---|---|
+| `rns.pill.<id>.text` | The finished pill, e.g. `L3`. **Empty = no pill** (emptied rather than deleted, because a delete fires no change callback and the display's renderer would never learn it had gone). |
+| `rns.pill.<id>.color` | `rrggbb` for the class. |
+| `rns.pill.<id>.order` | Left-to-right placement — each straddle passes its own settings `order:`, so the pills read in the same sequence the Interfaces pane lists them. |
+
+An interface straddle calls `rnsdPillSet(id, letter, count, color, order)` /
+`rnsdPillClear(id)` and contributes nothing else; the browser component and the
+on-device status-bar indicator both live here.
+
 ## The directory
 
 Everything `rnsd` knows about *other* destinations lives in one arena of packed
@@ -376,6 +547,40 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.chan.byid.<link_id>` | Reverse index: channel's hidden link_id → tag. |
 | `rnsd.dest.<idx>.{aspect,dest}` | Hosted-destination (our-dest) observability. |
 | `rnsd.ifaces.<name>.{up,mode,mtu,bitrate,rx_bytes,rx_packets,tx_bytes,tx_packets}` | Per-interface state and counters. |
+| `rnsd.ifaces.<name>.{peers,nodes}` | Direct peers and the nodes they group into, on that interface; both `0` where its community radius is. |
+| `rnsd.peers.count` | Direct peers across every interface with a community — the length of the list below. |
+| `rnsd.peers.<i>.{iface,node,dest,aspect,name,hops,heard,announces,rssi,snr}` | One direct peer — a destination one hop away (below). |
+| `rnsd.nodes.slots` | How far a reader iterates the node table. |
+| `rnsd.nodes.<i>.{iface,key,label,transport,heard,peers}` | One node — the thing at the far end (below). |
+| `rns.pill.<id>.{text,color,order}` | One interface class's status-line pill; `text` empty = no pill. Written by the interface straddles through `rnsdPillSet`. |
+
+Together these are the graph: **nodes** are the vertices and **peers** the
+destinations hanging off them, in the same shape whatever medium they arrived
+over.
+
+A peer's `iface` is the registered interface name (`lora/0`, `tcp_in/…`), `node`
+the index of the node that announced it — or `-1` on a shared medium that cannot
+say who transmitted a packet, which is a real answer and not a missing one.
+`dest` is the 32-hex destination hash, `aspect` the aspect in words where rnsd
+knows the name behind the hash and the 20-hex name hash where it does not, `name`
+the display name the announce carried (empty when it carried none), `heard`
+device unix-seconds of the last announce, and `rssi`/`snr` the reception where
+the medium measures one — written **empty** where it does not, because that
+absence is the answer and a zero would not be. Peer indices are table order, not
+recency: a peer keeps its index until the membership changes, and a reader
+wanting newest-first sorts on `heard`.
+
+A node's `label` is its transport address (a Bluetooth MAC, `host:port`, a
+link-local address) — what identifies it before any announce does, and on a
+graph regardless; `key` is the origin key its packets carry, all-zero where the
+interface itself is the node; `transport` says it forwards for others. Nodes are
+published under their **table** index and a withdrawn one's subtree is deleted
+rather than the rest renumbered, because a peer names its node by that index and
+compaction would move the graph's edges every time a Bluetooth peer came or
+went.
+
+A medium that knows more publishes it under its own prefix
+([iface-lora](../iface-lora) does); this is the floor, not the ceiling.
 
 ### Command sentinels (read, self-clearing)
 
@@ -425,7 +630,8 @@ Run any of these on-device through `spangap cli "<command>"`.
 ## Browser
 
 The shared RNS UI lives in this straddle: the Reticulum Settings panel, the
-Nodes window, the Announces window, and the RNS Pinia state. Interface-specific
+NetGraph dock app, the interface-class pills, the Nodes window, the Announces
+window, and the RNS Pinia state. Interface-specific
 UI lives in each interface straddle's own `browser/`.
 
 ## Dependencies

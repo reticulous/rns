@@ -1,10 +1,13 @@
 import { ref } from 'vue'
 import { useMenuStore } from 'spangap-browser/stores/menu'
+import { registerApp } from 'spangap-browser/lib/apps'
 import { registerWindowMount } from 'spangap-browser/lib/windowMounts'
 import { registerTopbarIcon } from 'spangap-browser/lib/topbarIcons'
+import NetGraphWindow from '../panels/NetGraphWindow.vue'
 import MapWindow from '../panels/MapWindow.vue'
 import NodesWindow from '../panels/NodesWindow.vue'
 import GwSignal from '../panels/GwSignal.vue'
+import IfacePills from '../panels/IfacePills.vue'
 
 /* Visibility ref for the Status → Map floating window. Toggled by the menu
  * action below; <StraddleWindows/> binds the MapWindow component to it via the
@@ -13,12 +16,34 @@ import GwSignal from '../panels/GwSignal.vue'
 export const mapVisible = ref(false)
 export const nodesVisible = ref(false)
 
+/* FloatingWindow restores its own saved visibility on mount and emits it back;
+ * the focus nonce is what raises an already-open window from the dock. */
+export const netGraphVisible = ref(false)
+export const netGraphFocus = ref(0)
+export function showNetGraph() {
+  netGraphVisible.value = true
+  netGraphFocus.value++
+}
+
 export function registerRnsd() {
   const menu = useMenuStore()
+
+  /* One pill per switched-on interface class, ahead of the signal bars: the
+   * medium's letter and how many peers are on it. The straddles publish them;
+   * this component only renders what is there. */
+  registerTopbarIcon({ id: 'rns-iface-pills', component: IfacePills })
 
   /* Gateway/infrastructure signal bars in the app header, left of the power
    * button — the received quality of the transport node that last relayed to us. */
   registerTopbarIcon({ id: 'rnsd-gw-signal', component: GwSignal })
+
+  /* Dock app: NetGraph — the neighbourhood drawn from rnsd's own node/peer
+   * tables, one circle per node and one line per link, in the media's own
+   * status-line colours. Self-mounts its window, so no buildable edit. */
+  registerApp({ id: 'netgraph', label: 'NetGraph', icon: 'netgraph', placement: 7,
+                open: showNetGraph, isOpen: () => netGraphVisible.value })
+  registerWindowMount({ id: 'netgraph', title: 'NetGraph', component: NetGraphWindow,
+                        visible: netGraphVisible, focusToken: netGraphFocus })
 
   registerWindowMount({ id: 'nodes', title: 'Reticulum Nodes',
                         component: NodesWindow, visible: nodesVisible })

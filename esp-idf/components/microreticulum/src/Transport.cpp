@@ -2612,7 +2612,8 @@ static const Bytes& ifac_salt() {
 											announce_app_data,
 											announce_name_hash,
 											announce_ratchet,
-											packet.hops()
+											packet.hops(),
+											packet.receiving_interface()
 										);
 									}
 								}
@@ -3015,7 +3016,13 @@ static const Bytes& ifac_salt() {
 
 /*static*/ void Transport::register_interface(Interface& interface) {
 	TRACEF("Transport: Registering interface %s %s", interface.get_hash().toHex().c_str(), interface.toString().c_str());
-	_interfaces.insert({interface.get_hash(), interface});
+	// The map key is a hash of the interface NAME alone (Interface::get_hash),
+	// and insert keeps whatever is already there. A same-named interface would
+	// therefore be accepted by the caller and never transmit. Say so.
+	if (!_interfaces.insert({interface.get_hash(), interface}).second) {
+		WARNINGF("Transport: interface %s is already registered — the new one will not be used",
+			interface.toString().c_str());
+	}
 	// CBA TODO set or add transport as listener on interface to receive incoming packets?
 }
 

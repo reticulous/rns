@@ -302,6 +302,39 @@ typedef struct {
                                in any control loop. Re-registration is what
                                refreshes it, which is what a config change
                                already does. */
+    uint8_t  rx_origin;     /* 1 => this interface carries SEVERAL peers under one
+                               registration and names them itself: each inbound
+                               data frame is prefixed with a 16-byte ORIGIN KEY
+                               saying which of them sent it, and each peer is
+                               declared with RNSD_IFACE_AUX_PEER. It therefore
+                               also overrides `point_to_point` as far as the
+                               neighbourhood is concerned — AutoInterface sets
+                               both, the one for the no-echo rule (a switched
+                               LAN has no hidden node) and the other because it
+                               has many peers. An ALL-ZERO key means "the sender
+                               is unknown" — a shared radio can name the
+                               transmitter of an announce it parsed and not of a
+                               packet it merely overheard, and the field is
+                               present either way so the strip stays a fixed
+                               offset. For a medium that carries
+                               several peers under ONE registration —
+                               AutoInterface, where every peer is a unicast UDP
+                               address — it is the only thing that can say who a
+                               packet came from, and so the only way rnsd can
+                               group a node's announces. A point-to-point
+                               interface sets neither this nor a key: the
+                               interface IS the node. The key is opaque to rnsd
+                               and needs only to be stable and unique within the
+                               interface (auto uses the peer's in6_addr
+                               verbatim); the human-readable form is declared
+                               separately with RNSD_IFACE_AUX_PEER. */
+    char     peer_label[48];/* Who is at the far end, in an operator's terms —
+                               a Bluetooth MAC, host:port. For a POINT-TO-POINT
+                               interface only, where the interface is one node.
+                               It is what the neighbourhood listing shows until
+                               an announce gives the node a name, so a peer that
+                               has attached and said nothing is still a row
+                               rather than a silence. "" = nothing to show. */
     char     ifac_netname[32]; /* IFAC network_name; "" => no IFAC */
     char     ifac_netkey[64];  /* IFAC passphrase; "" => no IFAC */
 } rnsd_iface_t;
@@ -312,6 +345,7 @@ static_assert(sizeof(rnsd_iface_t) <= ITS_MAX_MSG_DATA,
 
 enum : uint8_t {
     RNSD_IFACE_AUX_ANNOUNCE = 0x01,  /* payload: rnsd_iface_announce_t */
+    RNSD_IFACE_AUX_PEER     = 0x02,  /* payload: rnsd_iface_peer_t */
 };
 
 /** "Say who we are on these interfaces, now" (RNSD_PORT_IFACE aux). Sent by
@@ -335,6 +369,35 @@ typedef struct {
 } rnsd_iface_announce_t;
 static_assert(sizeof(rnsd_iface_announce_t) <= ITS_MAX_MSG_DATA,
               "rnsd_iface_announce_t must fit ITS_MAX_MSG_DATA");
+
+/** "A peer appeared / went away under this interface" (RNSD_PORT_IFACE aux),
+ *  for a medium that carries SEVERAL peers under one registration. Sent on the
+ *  interface's own handle, so rnsd knows which interface it is about.
+ *
+ *  This is the other half of `rx_origin`: the key attributes an inbound packet,
+ *  and this gives the key a human-readable label and a lifetime. A peer
+ *  declared here is a row in the neighbourhood listing from the moment it is
+ *  reachable — labelled by its transport address until an announce names it —
+ *  and stops being one when it is withdrawn, which is the only thing that can
+ *  say a peer has left, since nothing announces a departure.
+ *
+ *  A point-to-point interface sends none of these: the interface is the node,
+ *  and `rnsd_iface_t.peer_label` says who is at the far end.
+ *
+ *  Fire-and-forget, safe from any task; a withdrawal of a key never declared is
+ *  a no-op. */
+typedef struct {
+    uint8_t  op;            /* RNSD_IFACE_AUX_PEER */
+    uint8_t  up;            /* 1 = present, 0 = gone */
+    /* The EXACT registered name, not a prefix: this names one interface's peer,
+     * and aux is addressed to a port rather than to a handle, so the message
+     * has to say which registration it belongs to. */
+    char     iface[24];
+    uint8_t  key[16];       /* the same origin key inbound frames are prefixed with */
+    char     label[48];     /* the peer in an operator's terms — an address */
+} rnsd_iface_peer_t;
+static_assert(sizeof(rnsd_iface_peer_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_iface_peer_t must fit ITS_MAX_MSG_DATA");
 
 /* ---- RNSD_PORT_DEST frame opcodes ---- */
 

@@ -35,6 +35,16 @@ Our deltas, by category:
   `Link::rtt_sample()` folds each delivered link proof's own round trip into a
   smoothed estimate instead (§5.3a), so a link that established while the medium
   was busy is not paced by that one reading forever.
+- **`AnnounceHandler::received_announce` carries the receiving interface.** The
+  handler is where a node learns of every destination on the network, and
+  upstream tells it *how far away* the origin is (`hops`) without telling it
+  *which way*. The pair is what a handler actually needs: whose neighbour the
+  origin is, which interface's community it falls in, and — through the
+  interface's own `r_stat_rssi`/`r_stat_snr`, which still hold this packet's
+  sample on this call stack — how well it was heard. It is `Type::NONE` for an
+  announce with no interface behind it. This is what lets one handler in rnsd
+  build the direct-peer table for every medium at once (§1.3) instead of each
+  interface straddle reconstructing it from its own wire.
 - **IFAC enforcement in `Transport.cpp`.** The fork had no Interface Access
   Code support; `ifac_salt`/`derive_ifac` (HKDF from netname+netkey, size
   clamped 1–64), outbound masking/signing, and inbound verify-by-recompute
@@ -549,6 +559,92 @@ chance that someone asks. Occupancy and the counters that explain it are in
 - **Outbound delivery-proof tracking** (§5.4).
 - **CLI + debug surfaces** (`rnsd`, `clink`, `rnprobe`).
 
+### 1.3 The neighbourhood (`rnsd_peers.cpp`)
+
+Nodes and their direct peers, for every medium at once. It hangs off the same
+announce handler as the fan-out: an announce with `hops == 1` was transmitted by
+the node that originated it, and the fork's `received_announce` now says which
+interface it arrived on (§1.1), so the whole neighbourhood is computable in one
+place.
+
+**Only for an interface with a community** (`community_radius > 0`). A radius-0
+interface is an uplink: its far end is a route rather than a neighbourhood, and
+its announce firehose is every node in the wide network that is one hop from
+*it*. That is also what bounds the tables — 16 nodes and 32 peers, PSRAM,
+least-recently-heard evicted — since the media that have communities have
+neighbourhoods the size of a room, a LAN or a radio's range.
+
+**A peer is a DESTINATION; a node is the thing at the far end.** Grouping them
+takes attribution, which an interface declares one of two ways:
+
+- `rnsd_iface_t.point_to_point` — one peer, so the interface *is* the node, filed
+  under an all-zero origin key with `peer_label` as its address. rnsd declares it
+  at registration.
+- `rnsd_iface_t.rx_origin` — several peers under one registration, so every
+  inbound frame is prefixed with a 16-byte origin key and each peer is declared
+  with `RNSD_IFACE_AUX_PEER` (which carries the *exact* interface name, because
+  aux is addressed to a port rather than to a handle). An all-zero key is "the
+  sender is unknown": the field is present on every frame so the strip stays a
+  fixed offset, and a medium that can name some senders and not others says so
+  per packet. It overrides `point_to_point` for this purpose: iface-auto sets
+  both, the one for the no-echo rule and the other because it has many peers.
+  iface-lora sets it too — a shared radio cannot name the sender of a packet it
+  overheard, but it names the sender of an **announce** from its own peer table,
+  and announces are the only frames this table is built from.
+
+The key is stripped in `onTransportRecv` and stashed in `s_rxOrigin` for the
+length of one `handle_incoming` — not threaded through mR, because
+`Transport::inbound` and every handler it calls run synchronously in that call
+stack, so "the packet being processed" is a well-defined thing there and nowhere
+else. It is cleared immediately after, since `Transport::inbound` is also reached
+by a cache replay that has no arriving frame behind it.
+
+**Without attribution there is no grouping, deliberately.** Two destinations
+announced into the air by one node are indistinguishable from two nodes, so a
+medium that declares no origin gets one row per destination (`node == -1`) and
+nothing is merged on a guess. That is [iface-espnow](../iface-espnow), which has
+no node-level protocol to cluster with. It is NOT iface-lora: that straddle's
+own table already does the harder version of this join (announce identities,
+0x03 linkages, SUPE associations all ending in one row), so it hands the row
+over as the origin key rather than leaving rnsd to guess. `lora n` stays the
+richer view of the same nodes — link ids, identity prefixes, SUPE budget,
+derived power — none of which belongs in a shape every medium must fill.
+
+**`( TRANSPORT )` is free.** An announce arriving through a node with `hops > 1`
+travelled through it from elsewhere, which nothing but a transport node produces.
+That test runs *before* the direct-peer test, since it is the one useful thing a
+beyond-the-radius announce says.
+
+**A node's lifetime is the transport's statement, not the announces'.** It exists
+from the moment the interface says it is reachable and goes when the interface
+withdraws it or deregisters — the only thing that can ever say a peer has left,
+since nothing announces a departure. Peers age out under it on `s.rnsd.path.ttl`
+(a neighbour that has not announced in a whole path lifetime is not a neighbour,
+and its interface would re-learn it exactly as the directory does); the node
+does not, because a silent peer is still a peer.
+
+**No µR types.** `rnsd_peers.cpp` takes byte arrays and C strings, exactly as a
+consumer would, so the tables have no opinion about the protocol engine
+underneath. The seam is `rnsd_peers.h`: `rnsdNodeDeclare` and `rnsdPeersObserve`
+in, `rnsdIfaceWalk` back out for the registered-interface list.
+
+**Locking.** One mutex. Writes are on the rnsd task (inside `Transport::inbound`);
+reads come from the CLI task as well. `rnsdPeersForEach` takes an ORDER under
+the lock and then copies one record at a time, releasing it around every
+callback: a callback is a printer or a publisher and either can block on its own
+transport, and a whole-table snapshot would be near four kilobytes of stack on a
+task that has a few. A slot reused between the two passes is skipped rather than
+shown under the wrong heading.
+
+**Publication** is `rnsd.nodes.*` / `rnsd.peers.*` on the housekeeping tick's
+OTHER phase from `Transport::jobs()` — a neighbourhood moves at announce
+intervals and has no claim to share a tick with the sweep — and only when a
+generation counter says something changed. Peer indices are table order rather
+than recency, so an ordinary announce dirties two keys instead of rewriting every
+row; NODE indices are the table slot itself and a withdrawn node's subtree is
+deleted rather than the rest compacted, because a peer names its node by that
+index and compaction would move the graph's edges under a reader.
+
 ## 2. The `rnsd` task
 
 One FreeRTOS task, **core 0, prio 1, 12 KB PSRAM stack**. It owns µR's
@@ -596,7 +692,11 @@ the framing details:
   registration; the handle is then a packet-mode pipe (one RNS packet per
   send/recv). Disconnect deregisters. `rns_iface_mode` is a rnsd-facing enum and
   does **not** share µR's `Type::Interface::modes` bit layout — `mapIfaceMode`
-  translates; never raw-cast between them.
+  translates; never raw-cast between them. An inbound frame may carry prefixes,
+  stripped in the order they are written: the 16-byte origin key first
+  (`rx_origin`, §1.3), then the 4-byte signal header (`rx_signal`). Aux ops are
+  `RNSD_IFACE_AUX_ANNOUNCE` (replay onto a name prefix) and
+  `RNSD_IFACE_AUX_PEER` (declare/withdraw a peer under a multi-peer interface).
 - **`RNSD_PORT_DEST` (4)** — opened by `rnsdDestOpen`. Type-tagged frames both
   ways (`RNSD_DEST_*` opcodes in `ports.h`): `OUT_PACKET`/`IN_PACKET` for data,
   `OUT_RESULT` for send outcome, `OUT_STATUS` for aux progress narration,
@@ -1221,6 +1321,13 @@ per destination.
 - **Run Transport-touching code on the rnsd task.** `request_path`, link
   construction, destination registration off-task silently no-op (the outbound
   packet is dropped). Defer via ITS or a `rnsd.cmd.*` sentinel.
+- **One name, one interface.** `Transport::_interfaces` is keyed on
+  `Interface::get_hash()`, a hash of the interface's *name* alone, and its
+  insert keeps the entry already present. A second interface registering under
+  a name already in the table would therefore be accepted by its straddle,
+  appear in `rnstatus`, receive inbound packets — and never transmit, because
+  Transport still holds the first one. `onTransportConnect` refuses a duplicate
+  name outright, and Transport warns if one reaches it anyway.
 - **Large tables go in PSRAM, FreeRTOS sync objects do not.** Internal
   DRAM/DMA is scarce on the T-Deck, so ITS metadata, the directory arena, and recv
   buffers live in PSRAM. But queues/stream-buffers/mutexes placed in PSRAM trip

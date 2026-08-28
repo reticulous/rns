@@ -370,6 +370,169 @@ void rnsdIfaceAnnounceNow(const char* prefix);
  *  somebody presses the button. */
 void rnsdAnnounceBeat(uint32_t* next_ms, int interval_min, const char* prefix);
 
+/* ──────────────── direct peers — the neighbourhood ────────────────
+ *
+ * Who is one hop away, per interface. Every interface has the same question to
+ * answer and the same evidence to answer it with — an announce that arrived
+ * with hops == 1 came from the node that transmitted it — so the table lives
+ * here rather than once per interface straddle. It is populated from rnsd's own
+ * announce handler and therefore covers every medium, present and future,
+ * without an interface writing a line of code for it.
+ *
+ * Kept only for an interface with a COMMUNITY (`community_radius > 0`): a
+ * radius-0 interface is an uplink, whose far end is a route rather than a
+ * neighbourhood, and whose announce firehose would fill the table with the
+ * whole wide network's direct-to-it peers.
+ *
+ * A peer here is a DESTINATION. A NODE is the thing at the far end, and the two
+ * are only the same on a medium that cannot tell them apart. Where an interface
+ * can say WHICH peer a packet came from — a point-to-point one, because there
+ * is only one; a multi-peer one that sets `rx_origin` and prefixes each frame
+ * with an origin key — rnsd groups that peer's destinations under one node, and
+ * the listing shows one numbered block per node with its destinations under it.
+ * On a shared broadcast medium with no such attribution (a radio) it cannot:
+ * two identities announced into the air are indistinguishable from two nodes,
+ * and merging on a guess would put the wrong lines on a graph. Only a medium
+ * with a node-level protocol of its own can do better there, which is why
+ * [iface-lora] keeps its own SUPE-clustered table.
+ *
+ * A node exists from the moment it is REACHABLE, not from its first announce:
+ * an interface declares it (`rnsd_iface_t.peer_label`, or RNSD_IFACE_AUX_PEER
+ * for a multi-peer medium) with the transport address to show until an announce
+ * gives it a name. A peer that has attached and said nothing is a row rather
+ * than a silence.
+ */
+
+constexpr size_t RNSD_NAME_HASH_LEN  = 10;  /* aspect name hash carried by an announce */
+constexpr size_t RNSD_PEER_IFACE_MAX = 24;  /* == rnsd_iface_t::name */
+constexpr size_t RNSD_PEER_ASPECT_MAX = 24; /* "nomadnetwork.node" + NUL */
+constexpr size_t RNSD_PEER_NAME_MAX  = 32;  /* announced display name */
+constexpr size_t RNSD_NODE_KEY_LEN   = 16;  /* == rnsd_iface_peer_t::key */
+constexpr size_t RNSD_NODE_LABEL_MAX = 48;  /* == rnsd_iface_peer_t::label */
+
+/** One direct peer — a destination one hop away — as handed to a walk callback. */
+typedef struct {
+    uint8_t  dest[RNSD_DEST_HASH_LEN];
+    uint8_t  name_hash[RNSD_NAME_HASH_LEN];
+    char     iface[RNSD_PEER_IFACE_MAX];    /* registered name: "lora/0", "tcp_in/…" */
+    /** The aspect in words where rnsd knows the name behind the hash
+     *  ("lxmf.delivery"), empty where it does not — a name hash is one-way, so
+     *  an unknown aspect can only ever be shown as its hash. */
+    char     aspect[RNSD_PEER_ASPECT_MAX];
+    /** Display name out of the announce's app_data (LXMF msgpack, NomadNet
+     *  plain UTF-8), empty when the announce carried none. */
+    char     name[RNSD_PEER_NAME_MAX];
+    uint32_t heard;         /* device unix-seconds of the last announce */
+    uint32_t announces;     /* announces heard from this peer since boot */
+    uint8_t  hops;          /* 1 — a direct peer, by construction */
+    /** Which node announced it, as an index into the node table, or -1 on a
+     *  medium that cannot attribute a packet to a peer. */
+    int16_t  node;
+    bool     have_signal;   /* the medium measured the reception below */
+    int16_t  rssi;          /* dBm */
+    int16_t  snr10;         /* dB × 10 */
+} rnsd_peer_t;
+
+/** One node — the thing at the far end of an interface, or one of the peers
+ *  under a multi-peer one. */
+typedef struct {
+    char     iface[RNSD_PEER_IFACE_MAX];
+    /** Origin key, all-zero when the interface IS the node (point-to-point). */
+    uint8_t  key[RNSD_NODE_KEY_LEN];
+    /** Transport address in an operator's terms — a Bluetooth MAC, host:port,
+     *  a link-local address. What the listing shows until an announce names it,
+     *  and what identifies the node on a graph regardless. */
+    char     label[RNSD_NODE_LABEL_MAX];
+    /** It forwards for others: an announce more than one hop old arrived
+     *  through it, which nothing but a transport node can produce. */
+    bool     transport;
+    uint32_t heard;         /* device unix-seconds of the last announce through it */
+    uint16_t peers;         /* destinations it has announced */
+} rnsd_node_t;
+
+/** Walk the direct peers whose interface name starts with `iface_prefix`
+ *  (`"lora"` every radio, `"tcp"` every connection in and out, `""` the lot),
+ *  most recently heard first. Returns how many were visited. The callback runs
+ *  on the caller's task against a private copy; it must not call back in. */
+int rnsdPeersForEach(const char* iface_prefix,
+                     void (*cb)(const rnsd_peer_t*, void*), void* ctx);
+
+/** How many direct peers match `iface_prefix`. */
+int rnsdPeersCount(const char* iface_prefix);
+
+/** The same walk over NODES, in declaration order (which is the order they
+ *  became reachable). Returns how many were visited. */
+int rnsdNodesForEach(const char* iface_prefix,
+                     void (*cb)(int idx, const rnsd_node_t*, void*), void* ctx);
+
+/** How many nodes match `iface_prefix` — the count a status-line pill wants on
+ *  a medium whose peers are nodes. */
+int rnsdNodesCount(const char* iface_prefix);
+
+/** Print the neighbourhood — the body of every interface's `n[eighbors]` verb,
+ *  written once here so every medium answers in one format. `title` is what the
+ *  medium is called in an operator's terms ("Bluetooth", "TCP"): the interface
+ *  registrations under it are an implementation detail of the straddle, and a
+ *  listing that named them would be reporting its own plumbing. */
+void rnsdPeersPrint(const char* iface_prefix, const char* title, bool verbose);
+
+/** The listing's row indent, shared so every medium's neighbourhood — this
+ *  printer's and iface-lora's own richer one — lines up in the same columns.
+ *  `RNSD_PEER_ROW_FMT` takes the node's number on its first line and "" on
+ *  every continuation; `RNSD_PEER_ROW_PAD` is that column's width in spaces. */
+#define RNSD_PEER_ROW_FMT "   %-5s"
+#define RNSD_PEER_ROW_PAD "        "
+
+/** True for `n`, `neighbors` or `neighbours` — so every interface's CLI spells
+ *  the verb, and abbreviates it, identically. */
+bool rnsdIsNeighborsVerb(const char* tok);
+
+/** The whole `n[eighbors] [-v]` verb for one interface straddle's command:
+ *  returns false if `args` is something else (the caller carries on), true once
+ *  the listing has been printed. One line per interface CLI, so the media
+ *  cannot drift apart in spelling, in flags, or in output. */
+bool rnsdPeersCli(const char* args, const char* iface_prefix, const char* title);
+
+/** The aspect behind an announce's name hash, or nullptr when rnsd does not
+ *  know the name. A name hash is SHA-256(aspect)[:10] and therefore one-way;
+ *  this is a lookup against the aspects this firmware speaks, nothing more. */
+const char* rnsdAspectLabel(const uint8_t name_hash[RNSD_NAME_HASH_LEN]);
+
+/** The display name an announce's app_data carries, or "" when it carries
+ *  none. LXMF wraps the name in msgpack (behind the ratchet when present);
+ *  NomadNet and older clients send raw UTF-8. Always NUL-terminates. */
+void rnsdAnnounceName(const uint8_t* app_data, size_t n, char* out, size_t outsz);
+
+/* ──────────────── status-line pills ────────────────
+ *
+ * One pill per interface CLASS in the top status line, on the display and in
+ * the browser alike: a letter for the medium and how many peers are on it —
+ * `L3` is three peers on LoRa. It appears the moment the class is enabled (at
+ * `0`, which is a fact worth showing) and vanishes when it is switched off.
+ *
+ * The count is the straddle's OWN notion of a peer, not this node's neighbour
+ * table: what a medium counts as a peer is a property of the medium — a LoRa
+ * radio counts the nodes it hears, TCP counts connections in and out — and only
+ * the straddle knows it.
+ *
+ * rnsd holds no table of media and no palette. It composes the text, and the
+ * keys the two renderers read are all it owns:
+ *
+ *     rns.pill.<id>.text   "L3"      the finished pill; empty = no pill
+ *     rns.pill.<id>.color  "ffd400"  rrggbb, the class's colour
+ *     rns.pill.<id>.order  4         left-to-right placement
+ */
+
+/** Publish (or update) this class's pill. `id` is a short stable slug owned by
+ *  the calling straddle (`"lora"`, `"tcp"`); `letter` and `count` compose the
+ *  text; `color` is `"rrggbb"`; `order` places it among the others — use the
+ *  straddle's own settings `order:` so the pills read left to right in the same
+ *  sequence the Interfaces pane lists them. Safe from any task. */
+void rnsdPillSet(const char* id, char letter, int count, const char* color, int order);
+
+/** Take this class's pill down — the interface is disabled. */
+void rnsdPillClear(const char* id);
+
 /* ──────────────── destination / link client API ────────────────
  *
  * Higher-level protocols (lxmf, rnprobe, custom apps) talk to rnsd
