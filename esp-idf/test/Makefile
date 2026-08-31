@@ -13,9 +13,19 @@
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -O1 -g -Istubs -I../include -I../src -Wno-unused-parameter
 
+MSGPACK_SRC := ../components/microreticulum/src/MsgPack.h
+
 all: run
 
-netgraph_record_test: netgraph_record_test.cpp ../src/netgraph.cpp \
+# The REAL MsgPack.h, copied in beside the stub Bytes.h it needs. Copied rather
+# than reached over an -I, because its own `#include "Bytes.h"` resolves against
+# its directory first and would find the microreticulum one — which drags in
+# ESP-IDF's allocator and the microStore codec. Refreshed every build, so this
+# is the shipping file and not a fork of it.
+stubs/MsgPack.h: $(MSGPACK_SRC)
+	cp $< $@
+
+netgraph_record_test: netgraph_record_test.cpp ../src/netgraph.cpp stubs/MsgPack.h \
                       ../include/netgraph.h ../include/rnsd.h ../src/rnsd_peers.h
 	$(CXX) $(CXXFLAGS) -o $@ netgraph_record_test.cpp
 

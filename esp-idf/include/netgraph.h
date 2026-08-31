@@ -1,10 +1,9 @@
 #pragma once
 /**
- * netgraph — every node holds the community's whole graph.
+ * netgraph — routing truth locally, remote management for the rest.
  *
- *   push (continuous, unsolicited, mesh-wide):
- *     every node:  ANNOUNCE netgraph.discovery  app_data = own record, abridged
- *                  — flooded and rate-limited by ordinary RNS announce mechanics
+ *   crawl (on demand, one Link per node, never automatic):
+ *     us → node   LINK → IDENTIFY → /path ["table", nil, 1] → /status [true]
  *
  *   sync (on demand, over one Reticulum Channel between two nodes):
  *     I → R   DIGEST        every (origin, seq) I hold
@@ -13,16 +12,17 @@
  *     I → R   RECORD_PART*  those records
  *     both    DONE          then the initiator closes the channel
  *
- * Each node publishes ONE record describing only itself — its name, its
- * interfaces, its links, the destinations it announces — and never writes into
- * another node's. The graph everyone sees is the union of everyone's records,
- * resolved on device into the `netgraph.*` rows the browser NetGraph app, the
- * display and any on-device logic read. Newer seq wins; that is the whole
- * conflict story.
+ * The drawing has four classes of evidence and line style says which: a route
+ * one hop out, a route two hops out, a peer an interface hears but routing does
+ * not use, and a node's own record. The first three cost nothing — they are
+ * this device's own path table and interface state, so the picture changes the
+ * moment its state does. The fourth arrives over a sync Channel, and records
+ * are never announced.
  *
- * The record format, the resolver and the sync engine live in netgraph.cpp;
- * this header is the two things outside it: the boot registration, and the way
- * an interface straddle contributes its own configuration to its `if` line.
+ * The record format, the resolver, the crawl and the sync engine live in
+ * netgraph.cpp; this header is the two things outside it: the boot
+ * registration, and the way an interface straddle contributes its own
+ * configuration to its `if` line.
  */
 #include "service.h"
 

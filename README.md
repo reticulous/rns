@@ -41,12 +41,12 @@ rns/
 ├── esp-idf/
 │   ├── include/
 │   │   ├── rnsd.h        public C API (rnsdLinkOpen, rnsdRecallPubkey, …)
-│   │   ├── netgraph.h    the distributed graph: boot hook + iface detail contribution
+│   │   ├── netgraph.h    the network graph: boot hook + iface detail contribution
 │   │   └── ports.h       ITS port constants + frame opcodes shared with consumers
 │   ├── src/
 │   │   ├── rnsd.cpp            the rnsd task: identity, Transport, iface table, links
 │   │   ├── rnsd_peers.cpp      the neighbourhood: nodes, their peers, the shared `n` printer
-│   │   └── netgraph.cpp        the community's graph: record, store, resolver, sync
+│   │   └── netgraph.cpp        the graph: routing + interfaces, the crawl, remote mgmt
 │   ├── conditional/spangap-lcd/
 │   │   └── …/rnsd_pills_lcd.cpp   the status-bar pills, where there is a display
 │   └── components/
@@ -190,8 +190,11 @@ themselves at runtime, so it has zero compile-time knowledge of which exist.
 | 11 | `RNSD_PORT_CHANNEL` | Outbound reliable channels (`rnsdChannelOpen`); inbound via `rnsdDestListenChannels`. |
 | 12 | `RNSD_PORT_DIR` | Directory claims + out-of-band key seeding (aux only; `rnsdClaim` / `rnsdSeedPubkey`). |
 
-(`lxmf` reserves internal ports 100/101 for rnsd→lxmf inbound-link and Resource
-hand-offs; these are not client-facing.) Opcode tables for the framed ports
+(Port 100 is lxmf's inbound-link hand-off, not client-facing. Port 101,
+`RNSD_LINK_RESOURCE_AUX_PORT`, is where rnsd reports the Resource lifecycle for
+**every** link consumer, by task handle — a consumer that opens a link and does
+not open that port gets "aux send to unregistered port 101" and rnsd frees the
+frame's buffer.) Opcode tables for the framed ports
 (`RNSD_DEST_*`, link aux, resource aux) are in
 [`include/ports.h`](esp-idf/include/ports.h).
 
@@ -364,11 +367,49 @@ shared rather than re-implemented per interface. `RNSD_PEER_ROW_FMT` /
 medium's neighbourhood lines up in the same columns, this printer's and
 iface-lora's alike.
 
-## netgraph — every node holds the community's whole graph
+## Remote management — the stock service, both ways
 
 ```
-push (continuous, unsolicited, mesh-wide):
-  every node:  ANNOUNCE netgraph.discovery   app_data = own record, abridged
+serving (any RNS installation → us):
+  us → all    ANNOUNCE rnstransport.remote.management   on the stock beat
+  them → us   LINK → IDENTIFY → REQUEST /path | /status
+  us → them   RESPONSE  upstream's own shapes, from Transport's tables
+
+asking (`rnstatus -R <hash>` / `rnpath -R <hash>`, and the netgraph crawl):
+  us → node   LINK → IDENTIFY → /path ["table", nil, hops] → /status [true]
+```
+
+The address is the stock one — `rnstransport.remote.management` on this node's
+transport identity — so `rnstatus -R <our identity hash>` from an unmodified
+`pip install rns` works with nothing on the other side but that hash in a config
+file. `/path` answers upstream's list of `{hash, timestamp, via, hops, expires,
+interface}` and `/status` its `[stats-dict, link-count]`.
+
+**The handlers live in rnsd** (`rnsdRemoteManagementStart` / `…Allow` /
+`…AnnounceData` in [`rnsd.h`](esp-idf/include/rnsd.h)). µR's response generator
+returns its answer synchronously, inside `Link::handle_request` on the rnsd
+task, and the answers *are* Transport's own path table and interface statistics
+— so there is nothing to marshal anywhere else. A consumer supplies the policy
+(whether to serve, and who may ask); rnsd supplies the answers. netgraph is that
+consumer.
+
+**An unidentified link is refused, and so is an identity that is not on the
+allow list** — upstream's `ALLOW_LIST`, with the same meaning. An empty list
+leaves the service reachable and refusing everyone, which is the correct state
+for a node serving with no community configured and nothing granted.
+
+Asking is the `-R` half: `rnsdSetRemoteAsker` registers whoever does the asking,
+so the CLI verbs parse the hash, hand it over and print an acknowledgement — the
+answer goes to the log, because a LoRa node may take a minute to reply and the
+session that asked is long gone by then. `rnsdDestinationHashFromIdentityHash`
+is what turns an operator-supplied identity hash into that address, needing
+neither the public key nor an announce.
+
+## netgraph — routing truth locally, remote management for the rest
+
+```
+crawl (on demand, one Link per node, never automatic):
+  us → node   LINK → IDENTIFY → /path ["table", nil, 1] → /status [true] → CLOSE
 
 sync (on demand, over one Reticulum Channel between two nodes):
   I → R   DIGEST        every (origin, seq) I hold
@@ -378,31 +419,68 @@ sync (on demand, over one Reticulum Channel between two nodes):
   both    DONE          then the initiator closes the channel
 ```
 
-The neighbourhood tables above say who *this* node can hear. **netgraph** makes
-the whole community's picture a dataset every node holds: each one publishes a
-small self-report of its own links and interfaces, gossips it mesh-wide, and
-resolves the union of everyone's reports into node and link tables under
-`netgraph.*`. The browser app, the display and any on-device logic then read a
-complete network view without a browser ever being involved.
+The neighbourhood tables above say who *this* node can hear. **netgraph** turns
+that plus the path table into a drawing, and fills in the rest by asking other
+nodes directly — over Reticulum's own remote-management service, so it reaches
+stock installations whose software we do not write, and serves them the same
+facility in return. The result is resolved into node and link tables under
+`netgraph.*` that the browser app, the display and any on-device logic read.
 
-It is a client of rnsd like any other ([`esp-idf/src/netgraph.cpp`](esp-idf/src/netgraph.cpp)),
-and it adds no protocol machinery to rnsd: the push path is `rnsdDestOpen` +
-`RNSD_DEST_ANNOUNCE` on one side and the announce fan-out on the other; the sync
-path is `rnsdChannelOpen` and `rnsdDestListenChannels`.
+**The graph has two sources and no others.** What this node knows for free — its
+path table and its interface state, which cost no protocol and no traffic and
+change the drawing the moment they change. And what other nodes know when asked,
+one Link per node, once per crawl, started by a human.
+
+It is a client of rnsd like any other ([`esp-idf/src/netgraph.cpp`](esp-idf/src/netgraph.cpp)).
+The crawl is `rnsdLinkIdentify` + `rnsdLinkRequest`; the server half is
+`rnsdDestListenRequests`; the sync path is `rnsdChannelOpen` and
+`rnsdDestListenChannels`.
+
+### The four classes of evidence
+
+Every edge is one of four, and **line style states the class and nothing else**.
+There is no style for "old": evidence expires and the line leaves.
+
+| `ev` | where it comes from | the edge runs | drawn |
+|---|---|---|---|
+| `route1` | our path table, `hops == 1` | us → that node | solid, in the interface class's colour |
+| `route2` | our path table, `hops == 2` | the `via` node → that node | thin, white, no colour |
+| `heard` | the peer and node walks | us → that peer | dashed, class colour |
+| `record` | a node's own self-report, over a sync Channel | origin → the cell's peer | solid, class colour |
+
+`route2` gets no colour because our `iface` names the interface *we* transmit
+on, not the one the via-node used — we do not know that hop's medium and must
+not draw as though we did. Beyond two hops nothing is drawn at all: the
+intermediate chain is not in our table, and hanging a node off the next hop
+would assert an adjacency the data does not contain.
+
+`heard` is defined as the peers routing does *not* cover — the nodes we could be
+one hop from and are not, because a faster parallel link carries the route or
+nothing has routed through them yet. It is the one class no third party will
+ever report.
+
+Precedence for the same adjacency, strongest first: `route1`, `route2`,
+`record`, `heard`. One published row per `(a, b, cls)`, carrying the strongest
+class held for it — a pair we both route to and hear is one line, not two.
+
+**Records are never announced.** The builder, the store, the resolver and the
+Channel server all work, but a record flooded per node per announce beat does
+not scale on LoRa, so the push path and the sync beat that depends on it are
+commented out at their call sites. `netgraph sync <hash>` still runs an exchange
+by hand. See `plans/netgraph.md`.
 
 ### The rules that make it simple
 
 - **One writer per record.** A record is one node's self-report *about itself*.
   No node ever writes into another's. "Newer seq wins" is the entire conflict
-  story, and the graph is the union of the records plus a local-only overlay for
-  neighbours that have never announced.
+  story. A record is one evidence class among four, not the drawing's
+  foundation.
 - **Records are atomic wholes.** Ingest replaces everything held for an origin
   in one step — no partial update, ever. That is what makes unsigned
   re-serialization by a relay safe and lets a record's internal references stay
   record-scoped.
-- **Records are unsigned.** A first-hand one arrives as announce `app_data` and
-  is covered by the announce's own signature; a relayed one travels over an
-  encrypted Link between community members. A member can fabricate, and a
+- **Records are unsigned.** They travel over encrypted Links between community
+  members and carry no signature of their own. A member can fabricate, and a
   signature never prevented that — so a record must never be handed to a party
   that does not trust the whole community.
 - **Configuration goes in a record; measurements do not.** Frequency, spreading
@@ -412,6 +490,49 @@ path is `rnsdChannelOpen` and `rnsdDestListenChannels`.
 - **A merely-heard peer is not a link.** A peer enters the link list only once
   an announce has been decoded from it — the same evidence that creates an rnsd
   peer row. The odd packet caught when the wind was right stays local.
+
+### The community, and the crawl
+
+**One keypair admits the whole community.** It is derived from a name and a
+passphrase — `PBKDF2-HMAC-SHA256(s.netgraph.passphrase, "netgraph-community:" ‖
+s.netgraph.community)`, 64 bytes read as X25519 ‖ Ed25519 — so every node that
+knows both derives the same identity, with nothing exchanged and nothing
+per-peer to configure. The derived key lands in `secrets.netgraph.identity` and
+is what `rnsdLinkIdentify` is handed when we crawl; the community hash is what
+this node's own allow list is seeded with. The passphrase is an ordinary
+setting, not a secret: every node in the community holds it, and hiding it from
+the operator who has to type it into the next node buys nothing. It is the
+community's *access credential* rather than a network name — anyone holding it
+can query every node that trusts it.
+
+The community key **identifies, never addresses**. Building the management
+destination on it would give every node the same address, and a management query
+is always about one specific node.
+
+**The management announce carries membership, encrypted or not at all.** With a
+community configured, this node's `rnstransport.remote.management` announce
+carries `issued ‖ flags ‖ name ‖ signature` encrypted to the community identity:
+every member can read it because every member holds that private key, and nobody
+else can. The signature is what proves membership — encryption alone would not,
+since anyone holding the community *public* key can mint a token. Without a
+community there is no app_data at all; the node is still perfectly askable,
+because the allow list and not the announce is what grants anything. Stock
+clients ignore app_data on this destination either way.
+
+**The device's name lives here because this is the only place it can.** A
+device's name belongs to the device, and the only address that *is* the device is
+its transport identity — which is what this destination is built on. An LXMF
+display name belongs to a person, on a different identity. A community-less
+deployment therefore draws a graph of hex, and that is the price of the rule.
+
+**A crawl happens when a person asks and at no other time.** `netgraph crawl`,
+or the button in the browser panel: no timer, no boot pass, no refresh-on-idle.
+It gathers the nodes whose management announce we hold, visits each once in
+distance order out to `s.netgraph.radius`, and extends the queue with what each
+one's own `route1` answers reveal. A refusal or a timeout is normal and quiet —
+it counts, and the pass moves on. This is pull traffic over somebody else's
+airtime, and a device that quietly re-reads a neighbour's tables on a schedule is
+what gets its hash removed from an allow list.
 
 ### The record
 
@@ -495,34 +616,50 @@ Under `netgraph.*` (ephemeral, so browser-synced automatically), written inside
 one `storageBegin`/`storageEnd` bracket so a reader sees one coalesced patch:
 
 ```
-netgraph.self                own origin hash, hex
+netgraph.self                own identity hash, hex
+netgraph.radius              community radius in force
 netgraph.nodes.slots         walk bound
-netgraph.nodes.<i>.id        origin hash hex ("" = local-only vertex)
+netgraph.nodes.<i>.id        identity hash hex ("" = known only by address)
 netgraph.nodes.<i>.name      display name (may be "")
-netgraph.nodes.<i>.label     transport-address label, for local-only vertices
-netgraph.nodes.<i>.kind      member | local | uplink
+netgraph.nodes.<i>.label     transport-address label where there is no name
 netgraph.nodes.<i>.transport 0/1
-netgraph.nodes.<i>.ts        record timestamp (= seq); 0 for local-only
-netgraph.nodes.<i>.stale     1 past half the horizon
+netgraph.nodes.<i>.dist      hops from us; 0 = us, EMPTY = nothing joined it up
+netgraph.nodes.<i>.member    1 = its management announce carried a community signature
+netgraph.nodes.<i>.visited   unix seconds of the last crawl visit, 0 = never
 netgraph.links.count
 netgraph.links.<j>.a         node slot of the reporting side
 netgraph.links.<j>.b         node slot of the peer, -1 unresolved
 netgraph.links.<j>.bref      peer prefix hex, when b = -1
-netgraph.links.<j>.cls       interface class word ("lora")
+netgraph.links.<j>.ev        route1 | route2 | heard | record
+netgraph.links.<j>.cls       interface class word ("lora"); "" for route2
 netgraph.links.<j>.iface     reporting side's interface name
-netgraph.links.<j>.fresh     bucket 0-3, EMPTY where nobody measured one
+netgraph.links.<j>.age_s     seconds since refreshed, EMPTY where undated
 netgraph.links.<j>.transport 0/1 (peer side, as reported)
+netgraph.links.<j>.src       crawled node's hash; "" for our own evidence
 netgraph.ifs.<i>.count       interface lines node <i> reports
 netgraph.ifs.<i>.<k>.cls/.name/.detail
+netgraph.crawl.state         idle | running
+netgraph.crawl.req           written by a client to start a crawl
 ```
 
-Both directions of a link are published — each endpoint reports it
-independently, and those are two separate statements, not one fact written
-twice. A *renderer* merges them into one line; the rows keep them apart, which
-is what lets it say "only one end reports this". A cell whose prefix no record
-claims is kept as a **pending edge** (`b` = -1) rather than dropped, so a node's
-degree stays honest while the record that would name the other end is still
-missing.
+`src` is there because `a` cannot answer "whose statement is this". `a` is the
+reporting side, and for `route2` the reporting side is the via-node even when we
+derived the row from our own path table — so a local `route2` and one the crawl
+pulled out of that same neighbour would otherwise publish identically. They are
+different claims: one is our table, the other is a third party's answer, asked
+once and stale from the moment it landed.
+
+`dist` and `age_s` are text so they can be EMPTY. An integer cannot say "no
+answer" for either — `0` already means "us" and "this second".
+
+Both directions of an adjacency are published — they are two separate
+statements, not one fact written twice, and until the far end has reported the
+reverse we know how one end reaches the other and not how it gets back. A
+*renderer* merges them into one line where both rows exist and **stops short of
+the far circle** where only one does; the rows keep them apart, which is what
+lets it. An edge whose far end names a destination nothing claims is kept as a
+**pending edge** (`b` = -1) rather than dropped, so a node's degree stays honest
+while whatever would name the other end is still missing.
 
 ### An interface contributes its own fields
 
@@ -536,10 +673,10 @@ and the builder composes, which is the `rnsdPillSet` relationship one layer up.
 ## NetGraph — the community as a picture
 
 A dock app in this straddle's browser half: one circle per node, **one line per
-link** — including links between two other nodes, over a mesh this browser is
-not on. It draws `netgraph.*` and nothing else; every join behind the picture
-happened on the device, which is the only place that holds every node's own
-report of itself.
+adjacency** — including adjacencies between two other nodes, over a mesh this
+browser is not on. It draws `netgraph.*` and nothing else; every join behind the
+picture happened on the device, which is the only place that holds the path
+table, the interface state and whatever the crawl brought back.
 
 **Nothing is pinned, and this device is the red circle.** A community graph has
 no natural centre. Pinning the viewing node to the middle drags the rest into
@@ -566,39 +703,33 @@ for each:
   the straight line would have been, so one link is straight and two bow either
   side.
 
-**Two reports, one line.** Each node writes only about itself, so a link between
-two of them arrives as two rows. They are merged per (node pair, medium), and a
-link only one end reports says so in its tooltip rather than by being drawn
-differently — on a settled mesh that usually means the other end's record has
-not landed yet, which is not worth its own visual language.
+**Line style is the evidence class and nothing else.** Solid in the medium's
+colour is a route one hop out; thin and white is a route two hops out, hanging
+off the neighbour it sits behind; dashed is a peer an interface hears that
+routing does not use. Nothing is styled by age — evidence that expired was
+removed by the device rather than dimmed by the app, so what is drawn is current
+by construction. The legend names each style in words, because they are not
+self-explaining, and so does the hover text: "1 hop, radio0", "2 hops — medium
+unknown", "heard on radio0, not routed".
 
-**Nothing is said that nobody measured.** An uplink was dialled rather than
-heard, and a local-only neighbour has never announced, so neither carries a
-freshness bucket — `fresh` is published EMPTY rather than 0, on the same
-principle as rnsd's `rssi`/`snr`: the field is part of the shape and its
-emptiness is the answer, which a zero would not be. Neither is reported as
-"one end reporting" either: their far ends do not file records at all, so
-one-endedness there is the definition rather than an observation, and stating
-it would read as a fault.
+**An unreciprocated edge stops short.** A link between two nodes arrives as two
+rows, one from each end. Where both are present they merge into one line that
+touches both circles. Where only one is, the line is drawn from the reporting
+end and stopped a vertex-radius short of the far one, with no arrowhead: the gap
+says "this is how `a` gets there; how `b` gets back is not known". That is the
+visible half of the invariant — we never draw a return path nobody told us
+about.
 
-A dashed line is a link the reporter last heard over an hour ago, or one whose
-reporting record is itself getting old — "was here and has gone quiet" being a
-different thing from "not here". A second ring around a circle is a transport
-node, which is the one property that changes what the graph *means*: an edge
-through it reaches further than itself. A small hollow circle with no caption is
-a **stub**: the far end of a link whose own record has not arrived yet.
+A second ring around a circle is a transport node, which is the one property
+that changes what the graph *means*: an edge through it reaches further than
+itself. A small hollow circle with no caption is a **stub**: the far end of an
+edge nothing has named yet, drawn so the degree of the node reporting it stays
+honest. A stub cannot report, so an edge to one never stops short — that would
+read as a fault rather than as the definition it is.
 
-**A box, not a circle, is outside the community.** An uplink's far end — the
-host at the end of a dialled TCP connection, say — is drawn as a rectangle with
-its address inside it, outlined in the colour of the medium that reaches it. The
-shape says "not one of us"; the colour says "over what". It never merges with a
-member and is never joined to anything: its address is the only name it will
-ever have, and two nodes naming the *same* address share one box, which asserts
-nothing beyond what both records literally say. It is written whole, in a
-smaller face than the captions, and the box grows to hold it: half a `host:port`
-names nothing, and an elision is indistinguishable from an address that really
-is that short. A long one costs room in the picture — the operator's lever for
-that is a shorter interface name.
+**The crawl button, and nothing else, starts a crawl.** It is pull traffic over
+somebody else's airtime; there is no timer behind it, no boot pass and no
+refresh-on-idle. The caption names the radius it will go to.
 
 **Captions look for a clear spot.** Straight under the circle is where a caption
 belongs, but on a graph that is the busiest space on the canvas — every line to
@@ -743,6 +874,19 @@ claim population may not carry a long duration — contacts are bounded by the
 address book, mesh neighbours by the mesh, and network-at-large announces carry
 no claim at all. See `rnsdClaim` in [`rnsd.h`](esp-idf/include/rnsd.h).
 
+**A route is only true while the way to it exists.** "To reach X, send via Y over
+Z" stops being true the moment Z goes away or Y stops answering, and neither
+event touches the path table — the entry would sit there for its full TTL while
+every packet aimed down it goes nowhere. So an interface going down drops the
+routes learned over it, and a peer detaching on a connection-oriented medium
+(`auto`, `ble`) drops the routes *to* the destinations it hosted and *through*
+it: a detach is a certain, immediate fact arriving on time, and it is strictly
+better evidence than any horizon. LoRa gets nothing from this — it is
+connectionless, there is no detach to hear, and time is the only evidence there.
+A boot is the same argument over a longer gap, which is `s.rnsd.dir.persist_routes`
+above. Keys are kept throughout: a destination's key is true wherever it is, and
+only the way there has gone.
+
 `rnsd.dir.<hex32>.{pubkey,name_hash,hops,last_heard,claims,route}` reads a
 single record on demand (a storage provider, not a mirrored subtree);
 `rnsd memory` shows pool occupancy and `rnpath` lists the records carrying a
@@ -773,6 +917,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.dir.budget_kb` | `0` | Directory arena size in KiB. `0` derives it from free PSRAM at boot, clamped to 40–96 KiB. Boot-time value: pools do not resize live. |
 | `s.rnsd.dir.blob_slot` | `320` | Bytes per retained-announce slot. An announce whose raw form exceeds it is not retained, and a path request for that destination falls through to normal discovery. Changing it discards the stored image (it is a structural property). |
 | `s.rnsd.dir.persist_s` | `900` | Seconds between directory image writes, when anything changed. The contents are a cache, so a crash costs at most one interval; the interval is minutes rather than the 60 s storage class because the directory changes on every retained announce. `0` = never persist (every destination is re-learned by path request after a reboot). |
+| `s.rnsd.dir.persist_routes` | `0` | Trust the routes in a restored directory image. Off by default: a key is a fact about a destination and is true whenever we next need it, while a route is a statement about the network at one moment, and nothing in a restored image can vouch for the next hop still being there or the interface still being up. Dropping them costs one path request per destination actually used and keeps every key, which is the expensive half. A transport node serving path requests for others is the one case with an appetite for the old behaviour. |
 | `s.rnsd.dir.img_max_kb` | `0` | Ceiling on the image file. `0` = an eighth of the `/state` partition, which is what a small-flash board needs: the image is rewritten through a temp file, so the partition must hold two copies. Above the ceiling the most valuable records are kept and the rest are re-learned by path request. |
 | `s.rnsd.jobs_interval_ms` | `250` | Transport `jobs()` cadence, milliseconds (`Transport::job_interval`). Only consulted by `Transport::loop()`, which rnsd does not drive — inert on the rnsd path; the real cadence is `s.rnsd.tick_min_ms`/`tick_max_ms` below. |
 | `s.rnsd.cull_interval_s` | `60` | Table-cull cadence, seconds (`Transport::tables_cull_interval`). |
@@ -792,8 +937,15 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rns.boot_min_s` | `10` | Mesh-safety boot window, floor: seconds from boot before the ecosystem may come up and first transmit. Always served — a boot-looping node must not be able to spam the shared medium with re-announces, and nothing cancels this part. |
 | `s.rns.boot_max_s` | `300` | Same window, ceiling: how much longer an *unattended* node holds. Cancelled by `sys.human_detected` — the first keystroke on a console, USB host on the console, screen wake, or click in the web UI drops the rest of the hold, since someone at the controls is not a bootloop. |
 | `s.netgraph.enable` | `1` | Run the distributed network graph. Live — a change starts or stops the component and takes the `netgraph.*` rows down with it. |
+| `s.netgraph.community` | *(empty)* | The community's name. With `s.netgraph.passphrase` it derives the community keypair; empty means no community — the node serves and draws, and announces no membership. |
+| `s.netgraph.passphrase` | *(empty)* | The community's passphrase. An ordinary setting rather than a secret: every node in the community holds it, and the *derived* key is what lives in the secrets tier. Changing either re-derives, re-pushes the allow list and re-airs the membership announce. |
+| `s.netgraph.serve` | `1` | Answer `/path` and `/status` on the stock management address. Only the community and the identities below may ask; an unidentified request is refused. |
+| `s.netgraph.allow.<i>.{id,hash}` | — | Identity hashes allowed to query this node besides the community, as a collection the settings pane binds rows to. Same form as stock `remote_management_allowed`, so a line copies straight across either way. Written only through the `netgraph.allow.add`/`.remove` sentinels, which is why no UI parses a hash. |
+| `s.netgraph.radius` | `2` | How many hops out a crawl goes. |
+| `s.netgraph.crawl_timeout_s` | `20` | How long one visit may take before the crawl gives up on that node and moves to the next. |
+| `s.netgraph.heard_h` | `3` | Evidence unheard for this long leaves the drawing. Lines are removed rather than dimmed: everything on the picture is current. |
 | `s.netgraph.rebuild_floor_s` | `600` | Minimum seconds between rebuilds of this node's own record. The floor is what stops a node joining a busy neighbourhood from re-flooding its record once per neighbour: a burst of changes coalesces into one rebuild. |
-| `s.netgraph.announce_cells` | `8` | Maximum link cells per `ln` line in the ANNOUNCED form. Fewer are used automatically if the record still will not fit the airtime budget; the full record always carries all of them. |
+| `s.netgraph.announce_cells` | `8` | Record path (records are never announced — the settings from here down configure a subsystem that is built and mothballed). Maximum link cells per `ln` line in the ANNOUNCED form. Fewer are used automatically if the record still will not fit the airtime budget; the full record always carries all of them. |
 | `s.netgraph.link_horizon_h` | `6` | A link not heard for this long leaves the record. A neighbour currently attached but never heard from is not stale — its lifetime is the interface's statement that it is reachable. |
 | `s.netgraph.horizon_h` | `24` | Records older than this are dropped, never stored, and never offered in a digest. Half of it is the point at which a node is published as `stale`. |
 | `s.netgraph.sync_min` | `30` | Anti-entropy ceiling in minutes: one Channel exchange against one rotating neighbour. The interval is adaptive between 30 s and this — an exchange that taught this node nothing doubles it, one that brought a record halves it — and it counts exchanges a NEIGHBOUR initiated too, since being visited answers the same question as visiting. Each wait is shortened by up to a quarter at random, so nodes that back off together do not end up dialling in lockstep. |
@@ -825,7 +977,10 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.nodes.slots` | How far a reader iterates the node table. |
 | `rnsd.nodes.<i>.{iface,key,label,transport,heard,peers}` | One node — the thing at the far end (below). |
 | `rns.pill.<id>.{text,color,order,title}` | One interface class's status-line pill, plus the colour and operator-facing name of the medium itself; `text` empty = no pill. Written by the interface straddles through `rnsdPillSet` / `rnsdPillColor`. |
-| `netgraph.{self,nodes.*,links.*,ifs.*}` | The whole community's graph, resolved from every node's own record (see the netgraph section above). Taken down wholesale when the component stops. |
+| `netgraph.{self,radius,nodes.*,links.*,ifs.*}` | The network graph, resolved from the four classes of evidence (see the netgraph section above). Taken down wholesale when the component stops. |
+| `netgraph.crawl.state` | `idle` or `running`. The browser's crawl button reads this rather than tracking a local flag, so a crawl started from the CLI or another browser disables it everywhere. |
+| `netgraph.community.id` | The derived community identity hash, published only once a key exists — the row an operator who has just typed a passphrase is watching for. It is also what a node outside the community is asked to allow. |
+| `netgraph.allow.{done,error}` | Acknowledgement counter and the rejection sentence the add form shows. |
 | `s.netgraph.seq` | State, not a setting: the last sequence number this node issued for its own record. Persisted so a reboot with a bad clock cannot re-issue an old one. |
 
 Together these are this node's own neighbourhood: **nodes** are the things one
@@ -864,10 +1019,18 @@ Single-shot debug triggers — write a value and rnsd consumes it on its own tas
 `rnsd.cmd.clink`, `rnsd.cmd.creq`, `rnsd.cmd.link.open`, `rnsd.cmd.request_path`,
 `rnsd.debug.log_msg_content`.
 
+netgraph's are the same convention: `netgraph.crawl.req` (a rising value, not a
+flag — two crawls in a row must both be seen) and `netgraph.allow.add` /
+`netgraph.allow.remove`, the only writers of the allow collection.
+
 ### Secrets
 
 `secrets.rnsd.identity` — the 128-hex private key of rnsd's default identity
 (used by `rnprobe` and any consumer that passes `""` for `identity_key`).
+
+`secrets.netgraph.identity` — the 128-hex private key derived from the community
+name and passphrase. Derived rather than generated, so it is reproducible on
+every node that knows both; deleting it costs nothing but the derivation.
 
 `secrets.rnsd.ratchets.<dest_hex>` — one per hosted destination: its retained
 ratchet private keys, newest first, as hex. Written on every rotation and read
@@ -894,13 +1057,27 @@ rnsd creq <dest_hash> <path>      request/response smoke test (page fetch)
 
 netgraph                          record store: origins, seqs, ages, bytes, sync state
 netgraph d[ump] [<prefix>]        records expanded to pipe text
-netgraph s[ync]                   run a record exchange now
-netgraph r[ebuild]                rebuild and announce our own record
+netgraph l[inks]                  the resolved graph — what is drawn
+netgraph m[embers]                who announced management, and what they said
+netgraph c[rawl] [<hash>]         visit the community, or one node
+netgraph s[ync] <hash>            run a record exchange by hand
+netgraph r[ebuild]                rebuild our own record
 
 rnstatus [filter] [-t] [-j]       interfaces & traffic — node header + per-iface block
+rnstatus -R <identity hash>       ask that node instead (answer goes to the log)
 rnpath [dest] [-n N|-a] [-s] [-j] routing path table (dest prefix-matches the hash)
+rnpath -r                         name and aspect instead of the hash, where known
+rnpath -R <identity hash>         ask that node instead (answer goes to the log)
 rnpath -d <dest>                   DROP a path (destructive; requires the hash)
 ```
+
+`-R` takes a transport identity hash exactly as upstream's `rnstatus`/`rnpath`
+do, so the muscle memory transfers; the verb queues the visit and returns, and
+the answer lands in the log rather than in the session that asked. `-r` puts a
+destination in words — the display name and aspect the neighbourhood table
+learned from its announce, and, where a resolver is registered
+(`rnsdSetNameResolver`, which netgraph fills), the *device's* own name, which no
+announce on a node's own addresses carries.
 
 `rnprobe [aspect] <dest_hash> [-s size] [-n count] [-t timeout_s] [-w wait_s]`
 is the Reticulum reachability probe (the `rnstatus`/`rnping` analogue): it dials

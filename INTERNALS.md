@@ -112,6 +112,39 @@ Our deltas, by category:
   anything, because what to keep and at which depth is the retention decision in
   `Transport::inbound`. Single writer (the rnsd task), lock-free readers via a
   per-record sequence counter (§1.1.2).
+- `Link.cpp` — **a response is a packed msgpack OBJECT, spliced verbatim.** The
+  generator's return value is already packed, so `handle_request` writes the
+  two-element array by hand and inserts those bytes as the second element — the
+  inbound mirror of `request()`'s `data_packed` path. Reference RNS packs
+  whatever the handler returned, and for the handlers that matter (`/path`
+  answers a list of dicts, `/status` a list whose head is a dict) that is a
+  structure, not a blob; bin-wrapping it hands a stock `rnstatus` a byte string
+  where it unpacks a list, and it fails with no diagnosis on either side.
+- `Link.cpp` — **a response too large for a packet goes as a Resource flagged as
+  one**, five-argument constructor. `Bytes` has a non-explicit `operator bool`,
+  so the four-argument call binds to the *other* constructor with `request_id`
+  read as `advertise` and `is_response` left false: the answer then advertises
+  as an ordinary resource, and every consumer that asked a question larger than
+  the MDU gets it handed to the resource port, where nothing is waiting for it.
+- `Link.cpp`/`Resource.cpp` — **teardown cannot be abandoned half way.**
+  `teardown_packet`'s `try` covers the decryption and nothing else (closing the
+  link runs consumer callbacks, and a throw from those was reported as a
+  decryption failure); `link_closed` cancels each resource under its own `try`,
+  so one consumer's throwing `concluded` callback cannot leave the channel
+  running, the keys in memory and the destination still holding the link; and
+  `Resource::cancel` sends its `RESOURCE_ICL` only while the link is still
+  `ACTIVE` — the commonest reason to cancel is that the link just went away, at
+  which point `Packet::send()` refuses and there is nobody listening anyway.
+- `Directory.{h,cpp}` — **`rdirClearAllRoutes`**, the route half of every record
+  dropped and everything else kept: what a boot does with a restored image
+  unless `s.rnsd.dir.persist_routes` says otherwise (README).
+- `MsgPack.h` — **whole objects in both directions**, for the remote-management
+  service: `pack_str`/`pack_int`/`pack_bool`/`nil` and an integral overload that
+  beats the `double` conversion (upstream type-checks `hops` as an integer),
+  plus `MapReader`/`ArrayReader` — walk a map, dispatch on the string keys we
+  want, `skip_value()` the rest. That last clause is the design: a status dict
+  from a newer Reticulum carries keys this firmware has never heard of, and a
+  reader that treated one as an error would break on every upstream release.
 - `Packet.cpp` — malformed-packet error path **dumps the first ≤8 bytes hex** so
   HEADER_1-vs-HEADER_2 mis-parse, HDLC desync, or a noise byte are
   distinguishable in the log.
@@ -587,6 +620,14 @@ chance that someone asks. Occupancy and the counters that explain it are in
 - **Resource transfer** (shared-memory hand-off) and **request/response** (page
   fetch) bridges.
 - **Outbound delivery-proof tracking** (§5.4).
+- **Remote management** — Reticulum's own `rnstransport.remote.management`
+  served from the stock address (`/path`, `/status`, an `ALLOW_LIST` on each
+  handler, and an app_data hook for a membership frame), plus the `-R` half of
+  `rnstatus`/`rnpath` handed to whoever registered as the asker.
+- **Route invalidation** — an interface going down drops the routes learned over
+  it, a peer detaching on a connection-oriented medium drops the routes to and
+  through it, and a boot drops the restored ones unless
+  `s.rnsd.dir.persist_routes` is set. Keys survive all three.
 - **CLI + debug surfaces** (`rnsd`, `clink`, `rnprobe`).
 
 ### 1.3 The neighbourhood (`rnsd_peers.cpp`)
@@ -804,8 +845,10 @@ own "mailbox" message-queue term, so it's gone.)
 **Six slots, and asking which they are.** `RNSD_MAX_OUR_DESTS` is 6: a
 fully-loaded node hosts `lxmf.delivery` (one per lxmf identity slot), `rnsh`,
 `rlpg.mailbox` and `netgraph.discovery` at once, so four leaves no headroom.
-`rnsdHostedDestsForEach()` walks them — plus the transport probe where it is up
-— as flat `{dest, aspect}` bytes rather than µR objects. The walk is backed by a
+`rnsdHostedDestsForEach()` walks them — plus the transport probe and the
+remote-management destination where those are up — as flat `{dest, aspect}`
+bytes rather than µR objects. Both of those ride the ordinary hosted-announce
+beat, which is what advertises the management service at no extra cost. The walk is backed by a
 snapshot rebuilt under a mutex at each of the four points the set can change (an
 our-dest opening or closing, the probe dial either way), because its callers are
 on other tasks and `our_dest_t` holds `RNS::Destination` and `RNS::Bytes` that
@@ -1431,12 +1474,25 @@ per destination.
   spangap's log *macros* corrupt them. `rnsd.cpp` `#pragma push_macro` + `#undef`s
   each name around the µR includes, then `pop_macro`s. Replicate it in any file
   that mixes the two.
-- **No remote-management endpoint.** Upstream rnsd hosts
-  `rnstransport.remote.management` so `rnstatus -R` / `rnpath -R` can query a node
-  remotely; we don't. Servicing it needs a `register_request_handler` port plus a
-  reply shaped as upstream's inline `[stats-dict, link_count]` (µR's
-  `Link::handle_request` returns one opaque `bin`). Until then we don't announce
-  the aspect at all, rather than advertising an endpoint that drops every request.
+- **Which `/status` keys are mandatory is not a matter of taste.** We host
+  `rnstransport.remote.management` (README) and a stock `rnstatus -R` must be
+  able to print the answer. Upstream's `rnstatus.py` guards most keys with an
+  `in` check but not all, and an unguarded miss *raises* instead of degrading —
+  so the required set is derived mechanically: the keys it subscripts, minus the
+  keys it guards. Per interface that is `name`, `status`, `mode`, `clients`,
+  `rxb`, `txb`, `txdrp`, `txbuffered`, `txstalled`. The guards also **cross**:
+  sending `bitrate` makes `mtu` mandatory, and `rxs`/`txs` pull in
+  `arxs`/`atxs`. Ship a family whole or not at all. Zero is a fine value for a
+  counter we do not keep; omitting a key upstream does not guard is not. Note
+  also that `rnpath -R` **misreports an empty rates table** as "The remote
+  request failed. Likely authentication failure." — an upstream node with no
+  announce-rate table trips the same line, so there is nothing better to answer.
+- **The remote-management handlers run inline on the rnsd task**, inside
+  `Link::handle_request`: µR's response generator returns synchronously and
+  there is nowhere to defer to. That is why they live in `rnsd.cpp` rather than
+  in netgraph, which supplies only the policy — whether to serve, and who may
+  ask. `rnsdRemoteManagementAllow` re-registers the handlers, because each holds
+  a *copy* of the allow list.
 
 ## 9. Browser UI
 
@@ -1500,6 +1556,18 @@ from it (LXMF's own `parseLxmfAnnounce` does the real decoding). This is the onl
 written record of the app_data dialects, hence its place here.
 
 ## 12. Testing
+
+**Host-side, no device:** `make -C esp-idf/test` builds and runs
+`netgraph_record_test`, which includes `netgraph.cpp` whole (its builder,
+encoder and resolver are in an anonymous namespace, which is right), stubs the
+platform just far enough to link, and writes rnsd's tables as data. The record
+and the resolve are exactly the part a device cannot show you: a node that draws
+circles and no lines says nothing about whether the builder emitted no cells,
+the encoder mislaid them, or the resolver failed to join them. The Makefile
+copies the *real* `MsgPack.h` in beside the stub `Bytes.h` rather than reaching
+for it over an `-I`, because its own `#include "Bytes.h"` would otherwise find
+microreticulum's and drag in the ESP-IDF allocator; the copy is refreshed every
+build, so it is the shipping file and not a fork of it.
 
 Because µR's wire is kept byte-identical to upstream RNS, the fastest way to
 exercise Links, Channels, and rnsh end-to-end is against a **host-side reference

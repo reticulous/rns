@@ -1,25 +1,30 @@
 /**
  * netGraph — the community's graph, as the device resolved it.
  *
- * The device holds every node's self-report, joins them on evidence and
- * publishes the result as `netgraph.*` rows. This module reads those rows and
- * nothing else: vertices from `netgraph.nodes.*`, edges from `netgraph.links.*`,
+ * The device joins four classes of evidence into one row schema and publishes
+ * the result as `netgraph.*` rows. This module reads those rows and nothing
+ * else: vertices from `netgraph.nodes.*`, edges from `netgraph.links.*`,
  * per-node interfaces from `netgraph.ifs.*`. There is no join here, and no
  * per-medium knowledge — a medium added tomorrow appears the moment the device
- * files it, because the record format has one shape for all of them.
+ * files it, because every class has one shape.
  *
- * WHAT IS DRAWN IS THE WHOLE COMMUNITY, not this node's neighbourhood: an edge
- * between two other nodes is here because both of them said so, over a mesh
- * this browser is not on. The one thing this device knows that nobody else can
- * — a neighbour that has attached but never announced — arrives as a local-only
- * vertex in the same rows.
+ * LINE STYLE IS A PURE FUNCTION OF `ev`, AND NOTHING ELSE STYLES A LINE. There
+ * is no style for "old": evidence that has expired is removed by the device
+ * rather than dimmed here, so anything drawn is current by construction.
  *
- * An edge whose far end names a destination no record claims is kept and
- * marked: `b` is -1 and `bref` is the four-byte prefix that went unmatched. It
- * gets a small unlabelled stub vertex, so a node's degree stays honest while
- * the record that would name the other end is still missing.
+ * WHAT IS DRAWN IS NOT ONLY THIS NODE'S NEIGHBOURHOOD. A `route2` edge runs
+ * between two other nodes, and a crawled edge is a third party's report about
+ * itself, pulled over a mesh this browser is not on.
+ *
+ * An edge whose far end names a destination nothing claims is kept and marked:
+ * `b` is -1 and `bref` is the four-byte prefix that went unmatched. It gets a
+ * small unlabelled stub vertex, so a node's degree stays honest while whatever
+ * would name the other end is still missing.
  */
 import { useDeviceStore } from 'spangap-browser/stores/device'
+
+/** The four evidence classes. The device publishes exactly these words. */
+export type Evidence = 'route1' | 'route2' | 'heard' | 'record'
 
 export interface GraphIface {
   cls: string
@@ -30,9 +35,8 @@ export interface GraphIface {
 }
 
 export interface GraphEdge {
-  /** Indices into `nodes`. One LINK, not one report: where both endpoints filed
-   *  the same link, their two rows are merged here and `from`/`to` is simply
-   *  the direction of the first one seen. */
+  /** Indices into `nodes`. `from` is the REPORTING side: the node whose
+   *  evidence this is. For `route2` that is the via-node, not us. */
   from: number
   to: number
   /** The reporting sides' own interface names — one entry when only one end
@@ -40,23 +44,23 @@ export interface GraphEdge {
   ifaces: string[]
   cls: string
   color: string
+  /** Which class of evidence this is, and therefore how it is drawn. */
+  ev: Evidence
   /** Either endpoint is a transport node, as the other described it. */
   transport: boolean
-  /** Freshest bucket either side measured: 0 ≤ 5 min, 1 ≤ 1 h, 2 ≤ 6 h, 3 older.
-   *  `null` where nobody measured one — an uplink is dialled rather than heard,
-   *  and a local-only neighbour has never announced. Not a zero: "just now" is
-   *  a claim, and we would be making it up. */
-  fresh: number | null
-  /** Only one end reports this link — which is only a FACT about a link whose
-   *  far end is something that files records at all. An uplink's far end is
-   *  outside the community and a local-only vertex has never announced; neither
-   *  will ever report, so one-endedness there is the definition rather than an
-   *  observation, and saying it would read as a fault. */
-  oneWay: boolean
-  /** Nobody reported this link — it was inferred from the routing table, which
-   *  is all a node that does not speak netgraph ever gives us. Drawn dotted: a
-   *  route is evidence of adjacency, not a statement of one. */
-  inferred: boolean
+  /** Seconds since this evidence was last refreshed, or `null` where the
+   *  evidence carries no date — a route's presence in the table is the whole of
+   *  its currency. Not a zero: "just now" is a claim, and we would be making it
+   *  up. */
+  ageS: number | null
+  /** Whose statement this is: the crawled node's identity hash, or `''` for
+   *  this device's own evidence. `from` cannot answer it — a `route2` anchors
+   *  at the via-node either way. */
+  src: string
+  /** No row reports the reverse direction yet, so the line is drawn from `from`
+   *  and stopped short of `to`. We know how `from` gets there; how `to` gets
+   *  back is a separate fact that arrives when that node is visited. */
+  stopsShort: boolean
 }
 
 export interface GraphNode {
@@ -69,33 +73,39 @@ export interface GraphNode {
   ifs: GraphIface[]
   transport: boolean
   us: boolean
-  /** The device says the record behind this vertex is getting old. */
-  stale: boolean
-  /** Record timestamp, device unix-seconds. 0 for a local-only vertex. */
-  ts: number
-  /** A placeholder for the far end of an edge no record has claimed yet. */
+  /** Hops from the viewing device; 0 is us, `null` where nothing joined it up. */
+  dist: number | null
+  /** Its remote-management announce carried a signature by the community key. */
+  member: boolean
+  /** Unix seconds of the last crawl visit, 0 for never. */
+  visited: number
+  /** A placeholder for the far end of an edge nothing has claimed yet. */
   stub: boolean
-  /** What this vertex IS, which decides how it is drawn:
-   *  - `member` — speaks for itself through a record.
-   *  - `local`  — a neighbour of the viewing node that has never announced, so
-   *               only that node can see it.
-   *  - `uplink` — not in the community at all: the far end of a standing
-   *               connection out, named only by its transport address.
-   *  - `stub`   — a peer some record named whose own record has not arrived.
-   *  - `routed` — routing knows it and nobody has heard it speak for itself:
-   *               a node that does not run netgraph at all. */
-  kind: 'member' | 'local' | 'uplink' | 'stub' | 'routed'
 }
 
 export interface Graph {
   nodes: GraphNode[]
   edges: GraphEdge[]
-  /** Index of this device, or -1 before its own record exists. */
+  /** Index of this device, or -1 before rnsd has an identity. */
   self: number
+  /** The community radius in force, for the crawl button's caption. */
+  radius: number
 }
 
 function s(v: unknown): string { return v === undefined || v === null ? '' : String(v) }
 function num(v: unknown): number { const n = Number(v); return Number.isFinite(n) ? n : 0 }
+/** Empty means "no answer", which an integer cannot say — 0 is a real value for
+ *  both `dist` (us) and `age_s` (this second). */
+function optNum(v: unknown): number | null {
+  const t = s(v)
+  return t === '' ? null : num(t)
+}
+
+const EVIDENCE: Evidence[] = ['route1', 'route2', 'heard', 'record']
+function evidence(v: unknown): Evidence {
+  const t = s(v)
+  return (EVIDENCE as string[]).includes(t) ? (t as Evidence) : 'record'
+}
 
 /** Build the graph from the mirrored store. Pure — no subscriptions, no state;
  *  the caller re-runs it when the store changes. */
@@ -131,38 +141,33 @@ export function buildGraph(): Graph {
     if (id) addresses.push(id)
     if (label && label !== id) addresses.push(label)
 
-    const kindRaw = s(t.kind)
-    const kind = (kindRaw === 'uplink' || kindRaw === 'local' || kindRaw === 'routed')
-    ? kindRaw : 'member'
-
     rowToNode.set(i, nodes.length)
     nodes.push({
-      key: id || `${kind}:${label}:${i}`,
+      key: id || `addr:${label}:${i}`,
       /* Best evidence first: what it called itself, then the address it was
-       * reached at, then the identity it announced under. An uplink only ever
-       * has the address. */
+       * reached at, then the identity it announced under. */
       label: name || label || (id ? id.slice(0, 8) : '?'),
       addresses,
       ifs,
       transport: num(t.transport) !== 0,
       us: !!id && id === me,
-      stale: num(t.stale) !== 0,
-      ts: num(t.ts),
+      dist: optNum(t.dist),
+      member: num(t.member) !== 0,
+      visited: num(t.visited),
       stub: false,
-      kind,
     })
   }
 
   /* ── links ──
-   * A link between two nodes is reported TWICE, once by each end, because each
-   * end only ever writes about itself. That is the right thing for the device
-   * to store — it is two independent statements — but it is one line on a
-   * picture, so the two are merged here. The key is the unordered vertex pair
-   * plus the medium: two nodes joined over both LoRa and Bluetooth stay two
-   * lines, which is the fact worth seeing.
+   * Both directions of an adjacency are separate rows, because they are two
+   * independent statements: one node's evidence about how it reaches another
+   * says nothing about the return path. Where both rows are present they merge
+   * into one line that touches both circles. Where only one is, the line is
+   * drawn from the reporting end and stopped a vertex-radius short of the far
+   * one — the gap is the visible half of the invariant.
    *
-   * Rows arriving in the same direction are NOT merged, so a node with two
-   * radios on the same class still contributes two lines. */
+   * The pair key includes the class, so two nodes joined over both LoRa and
+   * Bluetooth stay two lines, which is the fact worth seeing. */
   const edges: GraphEdge[] = []
   const stubs = new Map<string, number>()
   const seen = new Map<string, number[]>()   // pair+cls → edge indices
@@ -185,8 +190,8 @@ export function buildGraph(): Graph {
         stubs.set(ref, to)
         nodes.push({
           key: `stub:${ref}`, label: ref, addresses: [ref], ifs: [],
-          transport: false, us: false, stale: false, ts: 0, stub: true,
-          kind: 'stub',
+          transport: false, us: false, dist: null, member: false,
+          visited: 0, stub: true,
         })
       }
     }
@@ -194,44 +199,78 @@ export function buildGraph(): Graph {
 
     const cls = s(t.cls)
     const iface = s(t.iface)
-    /* Empty means "nobody measured one", which is not the same as bucket 0. */
-    const fresh = s(t.fresh) === '' ? null : num(t.fresh)
+    const ev = evidence(t.ev)
     const transport = num(t.transport) !== 0
-    const inferred = num(t.inferred) !== 0
+    const ageS = optNum(t.age_s)
+    const src = s(t.src)
 
-    const key = from < to ? `${from}-${to}-${cls}` : `${to}-${from}-${cls}`
+    /* Bucket by the PAIR, not by pair-and-class. A row whose class is empty
+     * still describes the same adjacency: a crawled edge carries no class,
+     * because the medium it names belongs to the reporting node's vocabulary
+     * and not to ours. Keying the bucket on the class put such a row in a
+     * bucket of its own, so a neighbour's report of a link we already draw in
+     * its medium's colour arrived as a second, uncoloured arc beside it —
+     * "routed, 1 hop" in parallel with the lora line that says the same thing. */
+    const key = from < to ? `${from}-${to}` : `${to}-${from}`
     const bucket = seen.get(key) ?? []
-    /* Merge into the first edge in this bucket that is the OTHER way round and
-     * has not been paired up yet — that one is this same link, seen from its
-     * far end. */
-    const mate = bucket.find(i => edges[i].from === to && edges[i].oneWay)
+    /* Merge into the first edge in this bucket that is the OTHER way round, is
+     * still waiting for its reverse, and does not contradict this one's medium.
+     * An empty class contradicts nothing — it is an absence of a claim, not a
+     * claim of absence. */
+    const mate = bucket.find(i => {
+      const e = edges[i]
+      return e.from === to && e.stopsShort && (!e.cls || !cls || e.cls === cls)
+    })
     if (mate !== undefined) {
       const e = edges[mate]
-      e.oneWay = false
-      e.ifaces.push(iface)
+      e.stopsShort = false
+      if (iface) e.ifaces.push(iface)
       if (transport) e.transport = true
-      /* The freshest either side measured — and a measurement beats none. */
-      if (fresh !== null && (e.fresh === null || fresh < e.fresh)) e.fresh = fresh
+      /* Whichever side actually knew the medium names it. */
+      if (!e.cls && cls) { e.cls = cls; e.color = pill(cls); e.ev = ev }
+      /* The freshest either side dated — and a dated sighting beats none. */
+      if (ageS !== null && (e.ageS === null || ageS < e.ageS)) e.ageS = ageS
+      if (!e.src && src) e.src = src
       continue
     }
     bucket.push(edges.length)
     seen.set(key, bucket)
     edges.push({
-      from, to, ifaces: [iface], cls, color: pill(cls),
-      transport, fresh, oneWay: true, inferred,
+      from, to, ifaces: [iface], cls,
+      /* `route2` has no class: our interface name says what WE transmit on,
+       * not what the via-node used, so its medium is genuinely unknown and
+       * colouring it would assert one. */
+      color: ev === 'route2' ? '#d8dee6' : pill(cls),
+      ev, transport, ageS, src, stopsShort: true,
     })
   }
 
-  /* One-endedness is only an observation about a link between two things that
-   * REPORT. An uplink's far end is outside the community and a local-only
-   * vertex has never announced — neither will ever file a record, so a link to
-   * one is one-ended by construction and saying so would read as a fault. */
-  for (const e of edges) {
-    const far = nodes[e.to]
-    if (e.inferred) { e.oneWay = false; continue }
-    if (far && (far.kind === 'uplink' || far.kind === 'local')) e.oneWay = false
+  /* ── the reach rule is about the ADJACENCY, not about one medium ──
+   *
+   * The gap says "we know how `a` gets there; how `b` gets back is not known".
+   * That question is answered by ANY row running the other way, whatever medium
+   * carries it: two nodes joined over both LoRa and Bluetooth, where `a` routes
+   * out over one and `b` routes back over the other, know perfectly well how to
+   * reach each other — and drawing two arcs both stopped short says the
+   * opposite. Merging per class is right for how many LINES there are; it is
+   * the wrong question for whether the return path exists.
+   *
+   * So closure is decided per unordered pair, over every row, before the
+   * per-class merge above has anything to say about it. */
+  const reaches = new Set<string>()
+  for (let j = 0; j < nLinks; j++) {
+    const t = device.get(`netgraph.links.${j}`)
+    if (!t) continue
+    const from = rowToNode.get(num(t.a))
+    const to = num(t.b) >= 0 ? rowToNode.get(num(t.b)) : undefined
+    if (from !== undefined && to !== undefined) reaches.add(`${from}>${to}`)
   }
+  for (const e of edges) if (reaches.has(`${e.to}>${e.from}`)) e.stopsShort = false
+
+  /* A stub cannot report, so one-endedness there is the definition rather than
+   * an observation — stopping short of it would read as a fault. */
+  for (const e of edges) if (nodes[e.to]?.stub) e.stopsShort = false
 
   const self = nodes.findIndex(n => n.us)
-  return { nodes, edges, self }
+  return { nodes, edges, self, radius: num(device.get('netgraph.radius')) }
 }

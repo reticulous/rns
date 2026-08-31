@@ -1,23 +1,32 @@
-<!-- NetGraph — the community as a picture: this node in the middle, one circle
-     per node around it, one line per LINK — including links between two other
-     nodes, over a mesh this browser is not on.
+<!-- NetGraph — the community as a picture: one circle per node, one line per
+     adjacency — including adjacencies between two other nodes, over a mesh this
+     browser is not on.
 
-     Two things a plain node-link drawing does not do, and the reasons for both:
+     Three things a plain node-link drawing does not do, and the reasons:
 
+     - LINE STYLE IS THE EVIDENCE CLASS AND NOTHING ELSE. Solid means this
+       device's path table routes there; thin white means a route two hops out,
+       whose medium is unknown; dashed means an interface hears the peer and
+       routing does not use it. Nothing is styled by age — evidence that expired
+       was removed by the device rather than dimmed here, so what is drawn is
+       current by construction.
+     - An edge whose reverse row has not arrived STOPS SHORT of the far circle.
+       We know how one end reaches the other; how it gets back is a separate
+       fact that arrives when that node is visited, and a line touching both
+       circles would claim we had it.
      - Lines take the MEDIUM's colour, the same colour its status-line pill uses
        (rns.pill.<class>.color, read live), and the legend names it with the
        title that straddle publishes beside it. One vocabulary for "which
        medium" on every surface, and no palette and no table of media here.
-     - Two nodes joined by more than one interface get one ARC PER LINK rather
-       than one line. Parallel links are the interesting case on a mesh — a peer
-       reachable over both LoRa and Bluetooth is a peer that stays reachable —
-       and a single line would hide exactly that. Both ends of a link report it
-       independently, and both arcs are drawn: asymmetric hearing is information.
+       Parallel adjacencies get one ARC EACH rather than one line: a peer
+       reachable over both LoRa and Bluetooth is a peer that stays reachable,
+       and a single line would hide exactly that.
 
      This file DRAWS. Every join behind the picture happened on the device, which
-     is the only place that holds every node's own report of itself; lib/
-     netGraph.ts just reads the rows out. Layout is lib/forceLayout.ts, the one
-     seam a different engine would replace. -->
+     is the only place that holds the path table, the interface state and
+     whatever the crawl brought back; lib/netGraph.ts just reads the rows out.
+     Layout is lib/forceLayout.ts, the one seam a different engine would
+     replace. -->
 <template>
   <FloatingWindow
     id="netgraph"
@@ -31,32 +40,26 @@
     <div ref="boxRef" class="ng-body">
       <svg class="ng-svg" :viewBox="viewBox" preserveAspectRatio="xMidYMid meet">
         <!-- Edges first, so a circle always sits on top of the lines into it. -->
+        <!-- Width and dash come from the evidence class and nothing else. An
+             edge still waiting for its reverse row is stopped short of the far
+             circle, with no arrowhead: the gap says "this is how a gets there;
+             how b gets back is not known". -->
         <g class="ng-edges">
           <path v-for="(e, i) in drawnEdges" :key="i" :d="e.d" :stroke="e.color"
-                :stroke-dasharray="e.stale ? '4 4' : undefined" fill="none">
+                :stroke-width="e.width"
+                :stroke-dasharray="e.dashed ? '5 4' : undefined" fill="none">
             <title>{{ e.tip }}</title>
           </path>
         </g>
         <g class="ng-nodes">
           <g v-for="(n, i) in drawnNodes" :key="n.key"
              :class="{ sel: i === selected }" @click="selected = i === selected ? -1 : i">
-            <!-- Outside the community: a box with the address in it, in the
-                 colour of the medium that reaches it. It is not one of us and
-                 must not read as one, and the address IS its name — there is no
-                 caption to place, because there is nothing else to call it. -->
-            <template v-if="n.kind === 'uplink'">
-              <rect :x="n.x - n.boxW / 2" :y="n.y - n.boxH / 2"
-                    :width="n.boxW" :height="n.boxH" rx="3"
-                    class="uplink" :stroke="n.color" />
-              <text :x="n.x" :y="n.y + 3.5" text-anchor="middle" class="uplink-t">{{ n.label }}</text>
-            </template>
-            <circle v-else :cx="n.x" :cy="n.y" :r="n.r"
-                    :class="n.stub ? 'stub' : n.kind === 'routed' ? 'routed'
-                                              : n.us ? 'us' : 'peer'" />
+            <circle :cx="n.x" :cy="n.y" :r="n.r"
+                    :class="n.stub ? 'stub' : n.us ? 'us' : 'peer'" />
             <!-- A transport node forwards for others, which is the one property
                  of a node that changes what the graph MEANS: an edge through it
                  reaches further than itself. A second ring says so. -->
-            <circle v-if="n.transport && n.kind !== 'uplink'"
+            <circle v-if="n.transport"
                     :cx="n.x" :cy="n.y" :r="n.r + TRANSIT_GAP" class="transit" />
           </g>
         </g>
@@ -70,16 +73,32 @@
         </g>
       </svg>
 
+      <!-- A crawl is pull traffic over somebody else's airtime, so it happens
+           when a person asks and at no other time. There is no timer behind
+           this button. -->
+      <button class="ng-crawl" :disabled="crawling" @click="startCrawl">
+        {{ crawling ? 'crawling…' : `crawl ${graph.radius} hop${graph.radius === 1 ? '' : 's'}` }}
+      </button>
+
       <div v-if="!graph.edges.length" class="ng-empty">
-        No links yet. Nodes appear here as soon as this device builds its own
-        record, or hears another node's.
+        No links yet. Nodes appear here as soon as this device routes to one or
+        hears one — or as soon as a crawl asks the neighbourhood.
       </div>
 
-      <!-- Which colour is which medium. Built from the pills that exist, so it
-           names exactly the media this node has switched on. -->
+      <!-- Which colour is which medium, and which STYLE is which evidence.
+           Both are built from what is actually on the picture, so neither names
+           something the reader cannot see. The evidence half matters more: the
+           styles are not self-explaining, and without this the difference
+           between a route and a peer we merely hear is invisible. -->
       <div class="ng-legend">
         <span v-for="c in classes" :key="c.cls" class="ng-key">
           <i :style="{ background: c.color }"></i>{{ c.title }}
+        </span>
+        <span v-for="e in evidenceKeys" :key="e.ev" class="ng-key">
+          <svg class="ng-key-line" viewBox="0 0 22 6">
+            <path d="M0,3 L22,3" :stroke="e.color" :stroke-width="e.width"
+                  :stroke-dasharray="e.dashed ? '5 4' : undefined" fill="none" />
+          </svg>{{ e.title }}
         </span>
       </div>
 
@@ -87,10 +106,11 @@
         <div class="ng-dt-head">
           <b>{{ detail.label }}</b>
           <span v-if="detail.transport" class="ng-tag">TRANSPORT</span>
+          <span v-if="detail.member" class="ng-tag">MEMBER</span>
           <button class="ng-close" @click="selected = -1">×</button>
         </div>
         <div v-for="a in detail.addresses" :key="a" class="ng-dt-row ng-hash ng-dim">{{ a }}</div>
-        <div v-if="detail.age" class="ng-dt-row ng-dim">record {{ detail.age }}</div>
+        <div class="ng-dt-row ng-dim">{{ detail.dist }} · visited {{ detail.visited }}</div>
         <!-- What the node says about its own interfaces: the class, the
              registered name, and whatever that class considers its
              configuration — verbatim, because only that class's straddle knows
@@ -122,6 +142,16 @@ const device = useDeviceStore()
 const boxRef = ref<HTMLElement | null>(null)
 const selected = ref(-1)
 const defaultGeom = { x: 22, y: 10, w: 52, h: 70 }
+
+/* The device publishes how far it has got; the button reads that back rather
+ * than tracking a local flag, so a crawl started from the CLI or from another
+ * browser disables it here too. */
+const crawling = computed(() => String(device.get('netgraph.crawl.state') ?? '') === 'running')
+function startCrawl() {
+  /* A rising value, not a flag: two crawls in a row must both be seen, and a
+   * key that is already `1` produces no change for the device to notice. */
+  device.set('netgraph.crawl.req', Math.floor(Date.now() / 1000))
+}
 
 /* The layout runs in these graph units and the browser scales the result, so a
  * resize never re-runs the simulation and the picture never jumps under the
@@ -158,21 +188,46 @@ const pillTitle = (cls: string) => String(device.get(`rns.pill.${cls}.title`) ??
 
 const classes = computed(() => {
   const seen = new Map<string, string>()
-  for (const e of graph.value.edges) if (!seen.has(e.cls)) seen.set(e.cls, e.color)
+  /* route2 has no medium and borrows no colour, so it must not appear here as
+   * though it named one. */
+  for (const e of graph.value.edges)
+    if (e.cls && e.ev !== 'route2' && !seen.has(e.cls)) seen.set(e.cls, e.color)
   return [...seen].map(([cls, color]) => ({ cls, color, title: pillTitle(cls) }))
     .sort((a, b) => a.title.localeCompare(b.title))
 })
 
-/* Text is measured by the glyph budget rather than the DOM — see CHAR_W below.
- * An uplink's address is written WHOLE, in a smaller face than the captions,
- * and the box grows to hold it: half a host:port names nothing, and the reader
- * cannot tell an elision from an address that really is that short. A long one
- * costs room in the picture, which the layout is told about through `clear` —
- * and the operator can shorten it by naming the interface something shorter. */
-const UPLINK_CHAR_W = 5.4
-function uplinkBox(label: string): { w: number; h: number } {
-  return { w: label.length * UPLINK_CHAR_W + 10, h: 15 }
+/* ── what each line style means ──
+ *
+ * ONLY THE STYLES THAT DEPART FROM THE ORDINARY LINE. A solid line in a
+ * medium's colour is the default and needs no key: the medium half of the
+ * legend above already names it, and `route1` and `record` are drawn
+ * identically anyway — a reader cannot tell them apart on the picture, so
+ * listing both taught nothing and implied a distinction that is not visible.
+ *
+ * Worse, a grey swatch beside "routed, 1 hop" read as a claim that a one-hop
+ * link can be colourless, which it cannot: a route we hold ourselves always
+ * names the interface it goes over.
+ *
+ * What is left is the two genuine departures — a dashed line, and a thin white
+ * one — and each is listed only when it is actually on the picture. */
+const EV_TITLE: Record<string, string> = {
+  route2: 'routed, 2 hops — medium unknown',
+  heard:  'heard, not routed',
 }
+const EV_ORDER = ['route2', 'heard']
+const evidenceKeys = computed(() => {
+  const present = new Set(graph.value.edges.map(e => e.ev))
+  return EV_ORDER.filter(ev => present.has(ev as never)).map(ev => ({
+    ev,
+    title: EV_TITLE[ev],
+    width: EV_STYLE[ev].width,
+    dashed: EV_STYLE[ev].dashed,
+    /* `heard` takes a medium's colour on the picture, so its key is drawn in a
+     * neutral ink and says only what the DASH means. route2 has no medium at
+     * all, and its key is the white it is actually drawn in. */
+    color: ev === 'route2' ? '#d8dee6' : '#8b97a5',
+  }))
+})
 
 const positions = computed(() => {
   const g = graph.value
@@ -182,11 +237,7 @@ const positions = computed(() => {
    * neighbours, which is a picture of the pin rather than of the network. Where
    * this device is is said by its colour instead. */
   return layout(
-    /* Per vertex, because an uplink is a captioned BOX and needs the room its
-     * text takes, not the room a circle takes. */
-    g.nodes.map(n => n.kind === 'uplink'
-      ? { clear: Math.hypot(uplinkBox(n.label).w, uplinkBox(n.label).h) / 2 + 4 }
-      : {}),
+    g.nodes.map(() => ({})),
     g.edges.map(e => ({ source: e.from, target: e.to })),
     /* nodeClear is the biggest thing drawn at an ordinary vertex — the 13 px
      * "us" circle plus its 4 px transport ring — with room for the stroke. An
@@ -201,22 +252,17 @@ const drawnNodes = computed(() => {
   const g = graph.value
   const p = positions.value
   return g.nodes.map((n, i) => {
-    const box = n.kind === 'uplink' ? uplinkBox(n.label) : { w: 0, h: 0 }
     return {
       key: n.key,
-      kind: n.kind,
-      /* A stub stands for a peer whose own record has not arrived; it is drawn
-       * so the degree of the node reporting it stays honest, and left
-       * unlabelled because there is nothing yet to call it. An uplink carries
-       * its name INSIDE its box, so it has no caption to place either. */
+      /* A stub stands for a peer nothing has named yet; it is drawn so the
+       * degree of the node reporting it stays honest, and left unlabelled
+       * because there is nothing yet to call it. */
       label: n.stub ? '' : n.label,
-      caption: n.kind === 'uplink' || n.stub ? '' : n.label,
+      caption: n.stub ? '' : n.label,
       us: n.us,
       stub: n.stub,
       transport: n.transport,
       r: n.us ? 13 : n.stub ? 4 : 9,
-      boxW: box.w,
-      boxH: box.h,
       /* The medium that reaches it, which is the only thing we know about it
        * beyond its address. */
       color: g.edges.find(e => e.to === i || e.from === i)?.color ?? '#888888',
@@ -297,10 +343,38 @@ function ago(ts: number): string {
   return `${Math.floor(s / 3600)}h ago`
 }
 
-/* The freshness the REPORTER measured, against its own record's timestamp —
- * coarse on purpose, so a bucket never moves on its own and forces a node to
- * re-flood its record. */
-const FRESH = ['under 5 min', 'under an hour', 'under 6 hours', 'over 6 hours']
+/* ── evidence, in words ──
+ *
+ * The styles are only distinguishable once somebody has been told what they
+ * mean, so the hover text says it outright. */
+function evidenceWords(ev: string, ifaces: string[]): string {
+  const on = ifaces.filter(Boolean).join(' / ')
+  switch (ev) {
+    case 'route1': return on ? `1 hop, ${on}` : '1 hop'
+    case 'route2': return '2 hops — medium unknown'
+    case 'heard':  return on ? `heard on ${on}, not routed` : 'heard, not routed'
+    default:       return on ? `reported, ${on}` : 'reported'
+  }
+}
+
+/** Width and dash, per evidence class. Colour is decided in netGraph.ts, which
+ *  is where the class palette lives. */
+const EV_STYLE: Record<string, { width: number; dashed: boolean }> = {
+  route1: { width: 2, dashed: false },
+  route2: { width: 1, dashed: false },
+  heard:  { width: 2, dashed: true },
+  record: { width: 2, dashed: false },
+}
+
+function ageWords(s: number): string {
+  if (s < 120) return `${s}s ago`
+  if (s < 7200) return `${Math.floor(s / 60)}m ago`
+  return `${Math.floor(s / 3600)}h ago`
+}
+
+/* How far short of a circle an unreciprocated edge stops. A vertex radius plus
+ * a little, so the gap reads as deliberate rather than as a rendering slip. */
+const STOP_SHORT = 16
 
 const drawnEdges = computed(() => {
   const g = graph.value
@@ -319,7 +393,8 @@ const drawnEdges = computed(() => {
     bundles.set(key, b)
   })
 
-  const out: { d: string; color: string; stale: boolean; tip: string; pts: Pt[] }[] = []
+  const out: { d: string; color: string; width: number; dashed: boolean;
+               tip: string; pts: Pt[] }[] = []
   for (const idxs of bundles.values()) {
     const first = g.edges[idxs[0]]
     const a = p[first.from] ?? { x: W / 2, y: H / 2 }
@@ -338,25 +413,41 @@ const drawnEdges = computed(() => {
       const mx = (a.x + b.x) / 2 + nx * off * 2
       const my = (a.y + b.y) / 2 + ny * off * 2
       const from = g.nodes[e.from], to = g.nodes[e.to]
+
+      /* The reach rule. An edge whose reciprocal row is absent is drawn from
+       * `a` and stopped a vertex-radius short of `b`: the gap says how `a` gets
+       * there is known and how `b` gets back is not. The arc runs a→b in the
+       * bundle's own direction, so shortening the END is what stops short of
+       * the right circle — but the bundle's direction is `first`'s, so an edge
+       * pointing the other way has to be shortened at its start instead. */
+      const forward = e.from === first.from
+      const [p0, p1] = forward ? [a, b] : [b, a]
+      let end = p1
+      if (e.stopsShort) {
+        const ex = p1.x - mx, ey = p1.y - my
+        const el = Math.hypot(ex, ey) || 1
+        const t = Math.min(0.9, STOP_SHORT / el)
+        end = { x: p1.x - ex * t, y: p1.y - ey * t }
+      }
+
+      const style = EV_STYLE[e.ev] ?? EV_STYLE.record
       out.push({
-        d: `M${a.x.toFixed(1)},${a.y.toFixed(1)} Q${mx.toFixed(1)},${my.toFixed(1)} ${b.x.toFixed(1)},${b.y.toFixed(1)}`,
+        d: `M${p0.x.toFixed(1)},${p0.y.toFixed(1)} Q${mx.toFixed(1)},${my.toFixed(1)} ${end.x.toFixed(1)},${end.y.toFixed(1)}`,
         color: e.color,
-        /* Dashed when the link has gone quiet, or when the record that reports
-         * it is itself getting old — "was here and has gone quiet" being a
-         * different thing from "not here". */
-        stale: e.inferred || (e.fresh !== null && e.fresh >= 2) || from.stale,
-        /* Only what somebody actually reported. A link nobody dated says
-         * nothing about when it was heard, and a link whose far end cannot
-         * report says nothing about being one-ended. */
-        tip: `${from.label} ${e.oneWay ? '→' : '↔'} ${to.label}  ·  ${e.ifaces.join(' / ')}`
-           + (e.fresh !== null ? `  ·  heard ${FRESH[e.fresh] ?? '?'}` : '')
-           + (e.oneWay ? '  ·  one end reporting' : '')
-           + (e.inferred ? '  ·  inferred from routing, not reported' : ''),
+        width: style.width,
+        dashed: style.dashed,
+        /* Evidence in words, because the styles carry it and the styles are not
+         * self-explaining. A crawled row says whose answer it was. */
+        tip: `${from.label} ${e.stopsShort ? '→' : '↔'} ${to.label}`
+           + `  ·  ${evidenceWords(e.ev, e.ifaces)}`
+           + (e.ageS !== null ? `  ·  ${ageWords(e.ageS)}` : '')
+           + (e.src ? `  ·  as reported by ${e.src.slice(0, 8)}` : '')
+           + (e.stopsShort ? '  ·  return path not known' : ''),
         /* The same curve as a polyline, for the label placer to keep clear of.
          * Sampled rather than solved: a quadratic against a rectangle has a
          * closed form nobody needs here, and eight chords are already finer
          * than the 2 px the line is drawn at. */
-        pts: samplePts(a, { x: mx, y: my }, b),
+        pts: samplePts(p0, { x: mx, y: my }, end),
       })
     })
   }
@@ -411,12 +502,8 @@ const labels = computed(() => {
        * two overlapping names are no more readable than a name on a line. */
       if (!hit) for (const o of nodes) {
         if (o === n) continue
-        /* An uplink is a box, not a circle, and a caption over its address is
-         * as unreadable as one over a line. */
         const or = o.r + (o.transport ? TRANSIT_GAP + 1 : 0)
-        const ow = o.kind === 'uplink' ? o.boxW : or * 2
-        const oh = o.kind === 'uplink' ? o.boxH : or * 2
-        if (rectsOverlap(r, { x: o.x - ow / 2, y: o.y - oh / 2, w: ow, h: oh })) { hit = true; break }
+        if (rectsOverlap(r, { x: o.x - or, y: o.y - or, w: or * 2, h: or * 2 })) { hit = true; break }
       }
       if (!hit) for (const p of placed) if (rectsOverlap(r, p)) { hit = true; break }
       if (!hit) { chosen = c; boxed = false; placed.push(r); break }
@@ -458,9 +545,8 @@ const viewBox = computed(() => {
     if (by > y1) y1 = by
   }
   for (const n of drawnNodes.value) {
-    const hw = n.kind === 'uplink' ? n.boxW / 2 : n.r + (n.transport ? TRANSIT_GAP + 1 : 0)
-    const hh = n.kind === 'uplink' ? n.boxH / 2 : n.r + (n.transport ? TRANSIT_GAP + 1 : 0)
-    grow(n.x - hw, n.y - hh, n.x + hw, n.y + hh)
+    const h = n.r + (n.transport ? TRANSIT_GAP + 1 : 0)
+    grow(n.x - h, n.y - h, n.x + h, n.y + h)
   }
   for (const l of labels.value) {
     if (!l.text) continue
@@ -491,9 +577,12 @@ const detail = computed(() => {
     label: n.stub ? `unresolved ${n.label}` : n.label,
     transport: n.transport,
     addresses: n.addresses,
-    /* How old the node's own report of itself is — the one number that says
-     * whether anything else in this panel can still be believed. */
-    age: n.ts ? ago(n.ts) : '',
+    /* How far out it is, and whether the crawl has actually been there. "Never
+     * visited" is the difference between a node we have only been told about
+     * and one that answered for itself. */
+    dist: n.dist === null ? 'not joined up' : n.dist === 0 ? 'this device' : `${n.dist} hop${n.dist === 1 ? '' : 's'}`,
+    member: n.member,
+    visited: n.visited ? ago(n.visited) : 'never',
     ifs: n.ifs.map(f => ({
       name: f.name,
       detail: f.detail,
@@ -510,8 +599,9 @@ const detail = computed(() => {
           iface: e.ifaces[e.from === i ? 0 : e.ifaces.length - 1],
           color: e.color,
           detail: (g.nodes[far]?.label ?? '?')
-                + (e.fresh !== null ? ` · heard ${FRESH[e.fresh] ?? '?'}` : '')
-                + (e.oneWay ? ' · one end reporting' : ''),
+                + ` · ${evidenceWords(e.ev, e.ifaces)}`
+                + (e.ageS !== null ? ` · ${ageWords(e.ageS)}` : '')
+                + (e.stopsShort ? ' · return path not known' : ''),
         }
       }),
   }
@@ -527,32 +617,17 @@ const detail = computed(() => {
   background: #0e1319;
 }
 .ng-svg { width: 100%; height: 100%; display: block; }
-.ng-edges path { stroke-width: 2; opacity: 0.85; }
+/* Width and dash are set per path from the evidence class, so nothing here may
+ * state either — a rule with stroke-width in it would override all four. */
+.ng-edges path { opacity: 0.85; }
 .ng-nodes g { cursor: pointer; }
 .ng-nodes circle.peer { fill: #1b2836; stroke: #7f8b99; stroke-width: 2; }
 /* This device. Nothing about the layout says which circle is ours — the graph
  * is the community's and has no centre — so the colour is what says it. */
 .ng-nodes circle.us   { fill: #b3202a; stroke: #ff6b6b; stroke-width: 2.5; }
-/* A far end nobody has claimed yet: present, so the degree is honest, and
+/* A far end nothing has claimed yet: present, so the degree is honest, and
  * plainly not a node anyone can tell you about. */
 .ng-nodes circle.stub { fill: none; stroke: #56636f; stroke-width: 1.5; }
-/* Seen, not heard from: a node routing knows about that has never sent a record
-   of its own. A dashed outline says the circle is real and its account of
-   itself is missing. */
-.ng-nodes circle.routed {
-  fill: #1b2836; stroke: #7f8b99; stroke-width: 1.5; stroke-dasharray: 3 3;
-}
-/* Outside the community: a box rather than a circle, outlined in the colour of
- * the medium that reaches it. The shape says "not one of us"; the colour says
- * "over what". */
-.ng-nodes rect.uplink { fill: #131a22; stroke-width: 1.5; }
-/* Smaller than a caption: it is an address rather than a name, it is written in
- * full however long it runs, and it sits inside its own box where nothing else
- * competes with it. Keep UPLINK_CHAR_W in step with this size. */
-.ng-nodes text.uplink-t {
-  fill: #cfd8e3; pointer-events: none;
-  font: 9.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
-}
 .ng-nodes circle.transit { fill: none; stroke: #7f8b99; stroke-width: 1; opacity: 0.55; }
 .ng-nodes g.sel circle.peer,
 .ng-nodes g.sel circle.stub,
@@ -572,10 +647,24 @@ const detail = computed(() => {
   position: absolute; inset: auto 12px 44px 12px;
   color: #8b97a5; font-size: 12px; text-align: center;
 }
+.ng-crawl {
+  position: absolute; top: 8px; right: 8px;
+  background: #1b2836; color: #cfd8e3; border: 1px solid #3a4756;
+  border-radius: 3px; padding: 3px 9px; cursor: pointer;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.ng-crawl:hover:enabled { border-color: #7f8b99; }
+.ng-crawl:disabled { opacity: 0.5; cursor: default; }
 .ng-legend {
   position: absolute; left: 8px; bottom: 6px;
   display: flex; flex-wrap: wrap; gap: 24px;
   font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; color: #8b97a5;
+}
+/* A sample of the line itself rather than a colour chip: the thing being named
+ * is the STYLE, and a swatch cannot show a dash or a width. */
+.ng-key-line {
+  display: inline-block; width: 22px; height: 6px;
+  vertical-align: middle; margin-right: 6px;
 }
 .ng-key i, .ng-dt-row i {
   display: inline-block; width: 8px; height: 8px; border-radius: 2px;

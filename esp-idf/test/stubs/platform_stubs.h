@@ -54,8 +54,15 @@ inline TaskHandle_t spawnTask(void (*)(void*), const char*, uint32_t, void*,
 extern std::map<std::string, std::string> g_store;
 int  storageGetInt(const char* k, int def = 0);
 void storageGetStr(const char* k, char* out, size_t n, const char* def = "");
+std::string storageGetStr(const char* k, const char* def = "");
 void storageSet(const char* k, int v);
 void storageSet(const char* k, const char* v);
+/** Deletes the whole subtree under the key, as the real one does. */
+void storageUnset(const char* k);
+/** How many contiguous elements an array prefix holds: `<prefix>0.…`,
+ *  `<prefix>1.…` and so on, stopping at the first gap — the same contiguity
+ *  the collections rely on. */
+int  storageArrayCount(const char* prefix);
 void storageBegin();
 void storageEnd();
 void storageDeleteTree(const char* prefix);
@@ -74,6 +81,13 @@ inline bool itsServerInit(size_t = 0, size_t = 0, bool = false) { return true; }
 inline void itsClientInit(int, size_t = 0, size_t = 0) {}
 inline bool itsServerPortOpen(uint16_t, its_port_kind_t, int, size_t, size_t,
                               size_t = 0, size_t = 0) { return true; }
+/* The bool overload the real header carries: false→stream, true→packet. An
+ * aux-only port is opened with it. */
+inline bool itsServerPortOpen(uint16_t, bool, int, size_t, size_t,
+                              size_t = 0, size_t = 0) { return true; }
+typedef void (*its_aux_cb_t)(TaskHandle_t, const void*, size_t);
+inline void itsOnAux(uint16_t, its_aux_cb_t) {}
+inline bool itsSendAux(const char*, uint16_t, const void*, size_t, TickType_t) { return true; }
 inline void itsServerOnConnect(uint16_t, its_connect_cb_t) {}
 inline void itsServerOnRecv(uint16_t, its_recv_cb_t) {}
 inline void itsServerOnDisconnect(uint16_t, its_disconnect_cb_t) {}
