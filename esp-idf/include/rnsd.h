@@ -785,18 +785,27 @@ bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
  *  wrapper over free() — a symmetry hook in case the allocator changes. */
 void rnsdResourceRelease(void* buf);
 
-/** Identify to the remote peer on the ACTIVE outbound Link `tag`, signing
- *  with the identity the link was opened with (rnsdLinkOpen identity_key;
- *  "" → rnsd's default). Upstream LXMF calls this "backchannel
+/** Identify to the remote peer on the outbound Link `tag`, signing with the
+ *  identity at `identity_key` (a storage path; "" → the identity the link was
+ *  opened with, itself "" → rnsd's default). WHO a link says it is need not
+ *  be whose link it is — µR signs the LINKIDENTIFY with whatever identity it
+ *  is handed — which is how nomad browses on rnsd's identity and identifies
+ *  as one of the LXMF ones. Upstream LXMF calls this "backchannel
  *  identification": after a delivery, the recipient learns which identity
  *  is on the link and can reuse it for reverse traffic instead of
  *  establishing its own Link back. Initiator-side links only (µR's
  *  Link::identify is a no-op otherwise); idempotence is the caller's job —
- *  each call sends one LINKIDENTIFY packet. On the receiving node, a
+ *  each call sends one LINKIDENTIFY packet.
+ *
+ *  Callable the moment rnsdLinkOpen() returns: a link still awaiting a path
+ *  or establishing holds the identify and runs it at establishment, ahead of
+ *  a request deferred the same way — so a caller that identifies for the
+ *  whole session (nomad's ID button) has the peer know who is asking before
+ *  it answers the first request. On the receiving node, a
  *  validated LINKIDENTIFY publishes rnsd.links.<tag>.remote_identity
  *  (identity hash) and .remote_dest (the peer's destination hash on this
  *  link's aspect). Returns true if the aux was queued to rnsd. */
-bool rnsdLinkIdentify(const char* tag);
+bool rnsdLinkIdentify(const char* tag, const char* identity_key = "");
 
 /* ──────────────── request / response (nomad page fetch) ────────────────
  *

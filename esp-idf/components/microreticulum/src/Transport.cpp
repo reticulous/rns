@@ -2575,8 +2575,19 @@ static const Bytes& ifac_salt() {
 
 						// Call externally registered callbacks from apps
 						// wanting to know when an announce arrives
-						if (fresh && packet.context() != Type::Packet::PATH_RESPONSE) {
-							TRACE("Transport::inbound: Not path response, sending to announce handler...");
+						/* A PATH_RESPONSE reaches the handlers when it answers
+						 * a request WE made. An app learns a destination's
+						 * display name from the announce and from nothing
+						 * else, and on a quiet network the answer to a path
+						 * request is the only announce for that destination
+						 * that will ever arrive here — suppressing it leaves
+						 * LXMF and nomad naming peers they resolved on demand
+						 * by their address hash forever. A path response we
+						 * did not ask for is somebody else's answer passing
+						 * through and stays silent, as it does upstream. */
+						if (fresh && (requested ||
+						              packet.context() != Type::Packet::PATH_RESPONSE)) {
+							TRACE("Transport::inbound: sending to announce handler...");
 							/* Everything a handler needs is in the announce we are
 							 * holding: recalling it back out of a store would
 							 * depend on having retained it, and would hash the

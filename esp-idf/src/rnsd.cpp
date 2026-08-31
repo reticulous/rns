@@ -4315,12 +4315,13 @@ void rnsdResourceRelease(void* buf)
     if (buf) free(buf);
 }
 
-bool rnsdLinkIdentify(const char* tag)
+bool rnsdLinkIdentify(const char* tag, const char* identity_key)
 {
     if (!tag || !*tag) { warn("rnsdLinkIdentify: bad args"); return false; }
     rnsd_link_identify_t p = {};
     p.op = RNSD_LINK_AUX_IDENTIFY;
     safeStrncpy(p.tag, tag, sizeof(p.tag));
+    if (identity_key) safeStrncpy(p.identity_key, identity_key, sizeof(p.identity_key));
     return itsSendAux("rnsd", RNSD_PORT_LINK, &p, sizeof(p),
                       pdMS_TO_TICKS(1000));
 }
@@ -4675,6 +4676,14 @@ struct link_conn_t {
     TaskHandle_t         req_task;
     double               req_deadline;   /* OS::time() response must arrive by; 0 = n/a */
 
+    /* Pre-active identify deferral. A consumer that identifies for the
+     * SESSION rather than after a delivery (nomad's ID button) issues it
+     * with the link open request, before the handshake finishes; the
+     * establish callback runs it ahead of the deferred request, so the
+     * remote knows who is asking before it answers the first one. */
+    bool                 pend_identify;
+    std::string          pend_identify_key;   /* "" = the link's own identity */
+
     /* Pre-active request deferral — held request issued on establish
      * (mirrors pend_res_*). One pending request. */
     bool                 pend_req_used;
@@ -4923,6 +4932,32 @@ static void linkStartOutboundResource(link_conn_t& c, void* buf,
     }
 }
 
+/* Identify to the peer on an ACTIVE outbound link. `identity_key` names the
+ * private key to sign with; empty falls back to the link's own identity.
+ * Used by the IDENTIFY aux (link already active) and by onLinkEstablishedCb
+ * (identify deferred from before the handshake). */
+static void linkIdentifyNow(link_conn_t& c, const std::string& identity_key)
+{
+    const char* key = !identity_key.empty()   ? identity_key.c_str()
+                    : !c.identity_key.empty() ? c.identity_key.c_str()
+                                              : "secrets.rnsd.identity";
+    RNS::Identity ident(RNS::Type::NONE);
+    if (!loadIdentityFromStorage(key, ident)) {
+        warn("link[%s]: IDENTIFY identity load failed (%s)", c.tag, key);
+        return;
+    }
+    try {
+        /* µR guards initiator + ACTIVE internally; on an inbound link
+         * this is a silent no-op, matching upstream semantics. */
+        c.link.identify(ident);
+        linkSetInt(c, "identified_s", (int)RNS::Utilities::OS::time());
+        info("link[%s]: identified to peer as %s",
+             c.tag, ident.hash().toHex().c_str());
+    } catch (const std::exception& e) {
+        warn("link[%s]: identify threw: %s", c.tag, e.what());
+    }
+}
+
 static void onLinkEstablishedCb(RNS::Link& link)
 {
     link_conn_t* c = linkFindByLink(link);
@@ -4992,6 +5027,15 @@ static void onLinkEstablishedCb(RNS::Link& link)
         c->pend_res_buf = nullptr;
         c->pend_res_len = 0;
         c->pend_res_opaque = 0;
+    }
+
+    /* Identify BEFORE any deferred request goes out: a node that gates a page
+     * on who is asking must have the identity in hand when the request
+     * arrives, and both were queued by the consumer in that order. */
+    if (c->pend_identify) {
+        c->pend_identify = false;
+        linkIdentifyNow(*c, c->pend_identify_key);
+        c->pend_identify_key.clear();
     }
 
     /* Flush a deferred request (rnsdLinkRequest before ACTIVE). */
@@ -5594,6 +5638,8 @@ static void linkFreeSlot(link_conn_t& c)
     c.pend_req_port = 0;
     c.pend_req_task = nullptr;
     c.pend_req_packed = false;
+    c.pend_identify = false;
+    c.pend_identify_key.clear();
     c.state = LST_FREE;
 }
 
@@ -5750,6 +5796,8 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     c->pend_req_port = 0;
     c->pend_req_task = nullptr;
     c->pend_req_packed = false;
+    c->pend_identify = false;
+    c->pend_identify_key.clear();
 
     int path_to_s = storageGetInt("s.rnsd.link.path_timeout_s", 30);
     if (req.path_timeout_ms != 0) path_to_s = (int)(req.path_timeout_ms / 1000);
@@ -5906,34 +5954,27 @@ static void onLinkAux(TaskHandle_t sender, const void* data, size_t len)
         rnsd_link_identify_t req;
         memcpy(&req, data, sizeof(req));
         req.tag[sizeof(req.tag) - 1] = '\0';
+        req.identity_key[sizeof(req.identity_key) - 1] = '\0';
         link_conn_t* c = linkFindByTag(req.tag);
         if (!c) { warn("link[%s]: IDENTIFY for unknown link", req.tag); return; }
         if (!c->link || c->state != LST_ACTIVE) {
-            /* No deferral: the consumer identifies after a *delivered*
-             * settle, so the link is active in every non-racy case. A
-             * teardown race just loses the identify — the peer then opens
-             * its own reply link, which is the pre-identify behaviour. */
-            warn("link[%s]: IDENTIFY on non-active link (%s)",
-                 c->tag, lstName(c->state));
+            /* A link still coming up holds the identify and runs it at
+             * establish, ahead of any deferred request — that is the whole
+             * point for a consumer identifying for the session rather than
+             * after a delivery. A link already past ACTIVE has nothing to
+             * hold it for: losing it there is the pre-identify behaviour. */
+            if (c->state == LST_AWAITING_PATH || c->state == LST_ESTABLISHING) {
+                c->pend_identify     = true;
+                c->pend_identify_key = req.identity_key;
+                info("link[%s]: IDENTIFY deferred (link %s)",
+                     c->tag, lstName(c->state));
+            } else {
+                warn("link[%s]: IDENTIFY on non-active link (%s)",
+                     c->tag, lstName(c->state));
+            }
             return;
         }
-        const char* key = !c->identity_key.empty() ? c->identity_key.c_str()
-                                                   : "secrets.rnsd.identity";
-        RNS::Identity ident(RNS::Type::NONE);
-        if (!loadIdentityFromStorage(key, ident)) {
-            warn("link[%s]: IDENTIFY identity load failed (%s)", c->tag, key);
-            return;
-        }
-        try {
-            /* µR guards initiator + ACTIVE internally; on an inbound link
-             * this is a silent no-op, matching upstream semantics. */
-            c->link.identify(ident);
-            linkSetInt(*c, "identified_s", (int)RNS::Utilities::OS::time());
-            info("link[%s]: identified to peer as %s",
-                 c->tag, ident.hash().toHex().c_str());
-        } catch (const std::exception& e) {
-            warn("link[%s]: identify threw: %s", c->tag, e.what());
-        }
+        linkIdentifyNow(*c, req.identity_key);
         return;
     }
 

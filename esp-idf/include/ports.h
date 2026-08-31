@@ -139,6 +139,13 @@ enum : uint8_t {
 typedef struct {
     uint8_t  op;            /* RNSD_LINK_AUX_IDENTIFY */
     char     tag[24];       /* outbound link tag (rnsdLinkOpen) */
+    char     identity_key[40]; /* storage path of the 128-hex private key to
+                                * sign with; "" = the identity the link was
+                                * opened with. µR signs a LINKIDENTIFY with
+                                * whatever identity it is handed, so WHO a
+                                * link says it is need not be whose link it
+                                * is: nomad browses on rnsd's identity and
+                                * identifies as an LXMF one. */
 } rnsd_link_identify_t;
 static_assert(sizeof(rnsd_link_identify_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_identify_t must fit ITS_MAX_MSG_DATA");

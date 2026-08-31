@@ -97,6 +97,14 @@ Our deltas, by category:
   `path_is_unresponsive` (not ported), so we key on an outstanding
   `_path_requests` entry instead. Without this, path discovery works exactly
   once and then goes silent.
+- `Transport.cpp` — **announce handlers fire on a `PATH_RESPONSE` we
+  requested.** Upstream suppresses handlers for every path response. An
+  application learns a destination's display name from the announce and from
+  nothing else, and on a quiet network the answer to a path request is the only
+  announce for that destination that will ever arrive — so LXMF contacts and
+  nomad nodes resolved on demand stayed nameless, listed by address hash. The
+  same outstanding `_path_requests` entry is the gate; a path response we did
+  not ask for is somebody else's answer in transit and stays silent.
 - `Directory.{h,cpp}` (new) + `Identity.cpp`/`.h` — **one arena replaces the
   identity cache and the path table.** `Identity` has no `_known_destinations`
   map: `recall()` reads the directory pool, `recall_app_data()` slices the
@@ -760,8 +768,16 @@ the framing details:
   `rnsdLinkOpen`) opens an outbound link; the handle is the packet-mode data
   path. Out-of-band aux frames carry `SEND_RESOURCE` (0x02), `REQUEST` (0x03)
   and `IDENTIFY` (0x04, `rnsdLinkIdentify` — sign a `LINKIDENTIFY` to the peer
-  with the identity the link was opened with; initiator-side, ACTIVE links
-  only, no deferral). Opcode `0x01` was a teardown frame, now removed — see §5.
+  with the identity at the frame's `identity_key`, or the one the link was
+  opened with when that is empty; initiator-side only). Who a link says it is
+  need not be whose link it is — µR signs with whatever identity it is handed —
+  which is how nomad browses on rnsd's identity and identifies as an LXMF one. An
+  `IDENTIFY` on a link still awaiting a path or establishing is **held and run
+  at establishment, ahead of a deferred `REQUEST`** — a consumer identifying
+  for the session (nomad's ID button) issues it with the link open, and the
+  node must know who is asking before it answers the first request. Past
+  ACTIVE there is nothing left to hold it for, so it is dropped with a warning.
+  Opcode `0x01` was a teardown frame, now removed — see §5.
   On the *hosting* side, a validated inbound `LINKIDENTIFY` publishes
   `rnsd.links.<tag>.remote_identity` (identity hash) and `.remote_dest` (the
   peer's destination hash derived on the link's own aspect) — consumers poll
@@ -1509,8 +1525,8 @@ path requests resolve fast. `hw-lilygo-tdeck/scripts/lxmf-stamp-test` is the wor
 example (an LXMF node dialing the testnet directly to interop against a device
 already on it — no bridge). Recipe for a bare RNS node:
 
-- `python3 -m venv <dir> && <dir>/bin/pip install rns` (RNS 1.3.5; PyPI is
-  reachable from the container).
+- `python3 -m venv <dir> && <dir>/bin/pip install rns` (PyPI is reachable from
+  the container; a current-version wheel also sits at the workspace root).
 - Write a config whose `[interfaces]` has a `TCPClientInterface` with
   `target_host = rns.radical.computer` / `target_port = 4242` — the same node
   the device dials.
