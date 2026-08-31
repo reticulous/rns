@@ -154,6 +154,23 @@ bool rnsdDestinationHashFromPubkey(const uint8_t pubkey[RNSD_PUBKEY_LEN],
                                    const char* app_name, const char* aspect,
                                    uint8_t out[RNSD_DEST_HASH_LEN]);
 
+/** Compute the conventional destination hash for (identity hash, app, aspect)
+ *  from nothing but the peer's 16-byte IDENTITY hash.
+ *
+ *  The address derivation only ever consumed the identity's hash — the public
+ *  key never enters it — so this needs neither the key nor an announce, which
+ *  is what makes it the right entry point for an operator-supplied hash.
+ *  `rnstatus -R <hash>` and `rnpath -R <hash>` take exactly this argument
+ *  upstream, and a remote-management address is derived this way and no other.
+ *
+ *  Deriving an address is not the same as being able to reach it: the returned
+ *  hash still needs a path, and a link to it still needs the peer's key. Both
+ *  arrive by the ordinary means (rnsdRequestPath, then the announce that
+ *  answers it). */
+bool rnsdDestinationHashFromIdentityHash(const uint8_t ident_hash[RNSD_IDENT_HASH_LEN],
+                                         const char* app_name, const char* aspect,
+                                         uint8_t out[RNSD_DEST_HASH_LEN]);
+
 /* ──────────────── payload encryption ────────────────
  *
  * mR Identity token encryption (ephemeral X25519 ECDH + HKDF +
@@ -228,6 +245,89 @@ bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
 bool rnsdSeedPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
                     const uint8_t pubkey[RNSD_PUBKEY_LEN]);
 
+/* ──────────────── remote management ────────────────
+ *
+ * Reticulum's own management service, served from this node:
+ *
+ *   any RNS installation → us
+ *     ← ANNOUNCE rnstransport.remote.management   (ours, on the stock beat)
+ *     ─ LINK ─────────────────────────────────►
+ *     ─ IDENTIFY ─────────────────────────────►   checked against the allow list
+ *     ─ REQUEST /path | /status ──────────────►
+ *     ◄ RESPONSE (upstream's shapes, from Transport's own tables)
+ *
+ * The address is the stock one — `rnstransport.remote.management` on this
+ * node's transport identity — so `rnstatus -R <our identity hash>` from an
+ * unmodified `pip install rns` works with nothing on the other side but that
+ * hash in a config file.
+ *
+ * THE HANDLERS LIVE HERE, not in the consumer that turns them on. µR's
+ * response generator returns its answer synchronously, inside
+ * Link::handle_request on the rnsd task; marshalling that to another task and
+ * back would mean blocking rnsd for the round trip. The answers are Transport's
+ * own path table and interface statistics, so there is nothing to marshal —
+ * this is where the data already is. A consumer supplies the POLICY (whether to
+ * serve at all, and who may ask) and rnsd supplies the answers. */
+
+/** Start serving remote management. Idempotent. Returns false if the identity
+ *  is not loaded or the destination could not be constructed. */
+bool rnsdRemoteManagementStart(void);
+
+/** Stop serving it and deregister the destination. Idempotent. */
+void rnsdRemoteManagementStop(void);
+
+/** Replace the allow list: the identity hashes permitted to invoke `/path` and
+ *  `/status`. An unidentified link is refused outright, and so is an identity
+ *  that is not on this list — upstream's ALLOW_LIST, with the same meaning.
+ *  Passing n = 0 leaves the service reachable but refusing everyone, which is
+ *  the correct state for a node that is serving with no community configured
+ *  and no hashes granted. */
+void rnsdRemoteManagementAllow(const uint8_t (*hashes)[RNSD_IDENT_HASH_LEN], int n);
+
+/** True while the destination is up. */
+bool rnsdRemoteManagementServing(void);
+
+/** Set the `app_data` this node's management announce carries — a community
+ *  membership signature, say. Upstream announces this destination with no
+ *  app_data and stock clients ignore whatever is there, so anything put here
+ *  breaks nothing. Pass nullptr/0 to carry none. Airs one announce. */
+void rnsdRemoteManagementAnnounceData(const uint8_t* data, size_t n);
+
+/** The `-R` half: ask ANOTHER node instead of ourselves.
+ *
+ *  `rnstatus -R <hash>` and `rnpath -R <hash>` take a transport identity hash
+ *  exactly as upstream does, and the destination is derived the stock way. The
+ *  asking is done by whoever registered here — rnsd owns the tables and the
+ *  Link, but not the policy about which identity to present or what to do with
+ *  the answer — so the CLI verbs call through this and print nothing but an
+ *  acknowledgement. Unregistered, `-R` says the facility is not available
+ *  rather than failing obscurely.
+ *
+ *  The callback runs on the CLI task and must not block: it queues the visit
+ *  and returns. Answers land in the log, because a LoRa node may take a minute
+ *  to reply and the CLI session that asked may be long gone. */
+typedef void (*rnsd_remote_ask_t)(const uint8_t ident[RNSD_IDENT_HASH_LEN]);
+void rnsdSetRemoteAsker(rnsd_remote_ask_t cb);
+
+/** What a DEVICE is called, given the identity behind one of its destinations.
+ *
+ *  rnsd names a destination from the display name its announce advertised,
+ *  which is what LXMF and NomadNet put there — a person's name, on a person's
+ *  address. A node's own addresses carry none: a probe announce is empty and a
+ *  management announce is not text. So `rnpath -r` on the very destinations
+ *  that ARE a device could only ever print an aspect.
+ *
+ *  A device name is a different fact, learned elsewhere and by whoever tracks
+ *  devices. Registering a resolver here lets the path table say it without rnsd
+ *  learning what a device is. Return false when the identity is not one you
+ *  know; the caller falls back to what it had.
+ *
+ *  Runs on the CLI task against whatever the resolver's own storage is, so it
+ *  must copy out and not block. */
+typedef bool (*rnsd_name_resolve_t)(const uint8_t ident[RNSD_IDENT_HASH_LEN],
+                                    char* out, size_t outsz);
+void rnsdSetNameResolver(rnsd_name_resolve_t cb);
+
 /* ──────────────── directory claims ────────────────
  *
  * A claim tells rnsd that a destination matters to you, so that when memory
@@ -252,6 +352,11 @@ enum {
     RNSD_CLAIM_RNSH  = 2,
     RNSD_CLAIM_RLPG  = 3,
     RNSD_CLAIM_RNSD  = 4,
+    /** netgraph, on the management destinations it wants to be able to reach.
+     *  The announce table evicts by memory pressure and never by time, so an
+     *  unclaimed announce sits early on the eviction ladder — and recalling a
+     *  two-hourly announce reliably means claiming it. */
+    RNSD_CLAIM_NETGRAPH = 5,
 };
 
 /** PERSIST outranks EPHEMERAL under eviction; an EPHEMERAL claim also lapses
@@ -405,7 +510,12 @@ void rnsdAnnounceBeat(uint32_t* next_ms, int interval_min, const char* prefix);
 
 constexpr size_t RNSD_NAME_HASH_LEN  = 10;  /* aspect name hash carried by an announce */
 constexpr size_t RNSD_PEER_IFACE_MAX = 24;  /* == rnsd_iface_t::name */
-constexpr size_t RNSD_PEER_ASPECT_MAX = 24; /* "nomadnetwork.node" + NUL */
+/* Long enough for the longest aspect this firmware speaks —
+ * "rnstransport.remote.management", 30 characters — plus the NUL, rounded up.
+ * An aspect that does not fit is not merely displayed short: it is copied
+ * truncated into the peer and hosted-destination rows, so the name no longer
+ * matches the one every other table and every log line uses. */
+constexpr size_t RNSD_PEER_ASPECT_MAX = 32;
 constexpr size_t RNSD_PEER_NAME_MAX  = 32;  /* announced display name */
 constexpr size_t RNSD_NODE_KEY_LEN   = 16;  /* == rnsd_iface_peer_t::key */
 constexpr size_t RNSD_NODE_LABEL_MAX = 48;  /* == rnsd_iface_peer_t::label */
@@ -539,6 +649,26 @@ typedef struct {
     uint8_t identity[RNSD_IDENT_HASH_LEN];   /* valid iff have_identity */
     uint8_t via[RNSD_DEST_HASH_LEN];         /* next hop's transport id */
     char    iface[RNSD_PEER_IFACE_MAX];      /* the interface we would send on */
+    /** The aspect in words where rnsd knows the name behind the hash
+     *  ("rnstransport.probe"), empty where it does not.
+     *
+     *  WHAT KIND OF THING this address is, which the identity alone does not
+     *  say. A device hosts several identities — its transport one, LXMF's, one
+     *  per application — so "the identity behind a destination" is the owner of
+     *  an ADDRESS and not the device. The aspect is what separates a node-level
+     *  destination from an application's. */
+    char    aspect[RNSD_PEER_ASPECT_MAX];
+    /** When the announce that established this path was heard, and when the
+     *  path stops being valid — device unix-seconds, both 0 where there is no
+     *  route.
+     *
+     *  A PATH OUTLIVES THE THING THAT MADE IT. The table holds an entry for its
+     *  full TTL whether or not the node at the far end is still there, still
+     *  announcing, or still has that interface switched on. Without a date on
+     *  it, "the path table says so" cannot tell a live neighbour from one that
+     *  was here this morning. */
+    uint32_t timestamp;
+    uint32_t expires;
     uint8_t hops;
     bool    have_identity;                   /* the announce carried a usable key */
     bool    have_route;
@@ -763,7 +893,7 @@ bool rnsdDestListenLinks(int      dest_handle,
  *  • Inbound: rnsd accepts the advertised Resource (size-gated by
  *    `s.lxmf.max_resource_size`, default 262144), reassembles it, then
  *    opens a one-shot ITS connection to the consumer's
- *    LXMF_LINK_RESOURCE_AUX_PORT with an `rnsd_link_resource_done_t`
+ *    RNSD_LINK_RESOURCE_AUX_PORT with an `rnsd_link_resource_done_t`
  *    (ports.h). On RNSD_LINK_RESOURCE_INBOUND_DONE the consumer owns
  *    `buf` and must rnsdResourceRelease() it.
  *

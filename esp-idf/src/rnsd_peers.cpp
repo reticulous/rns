@@ -77,6 +77,10 @@ uint32_t    s_pubNodes = 0;    /* node slots currently published, one bit each *
 const char* const kAspects[] = {
     "lxmf.delivery", "lxmf.propagation", "nomadnetwork.node",
     "rnstransport.probe", "rnsh", "rlpg.mailbox", "netgraph.discovery",
+    /* Read constantly by the crawl: every node offering remote management
+     * announces this on the stock two-hour beat, which is how a crawl finds
+     * who is askable without deriving a single hash. */
+    "rnstransport.remote.management",
 };
 constexpr int kAspectCount = (int)(sizeof(kAspects) / sizeof(kAspects[0]));
 uint8_t s_aspectHash[kAspectCount][RNSD_NAME_HASH_LEN];

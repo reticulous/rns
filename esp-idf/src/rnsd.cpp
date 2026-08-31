@@ -45,6 +45,8 @@
 #include "Channel.h"
 #include "Compression.h"
 #include "Resource.h"
+#include "MsgPack.h"      /* the remote-management answers, packed by hand */
+#include "Directory.h"    /* rdirForEach — the path table /path answers from */
 #include "Persistence/DestinationEntry.h"
 #include "Utilities/OS.h"
 #include "Utilities/Memory.h"
@@ -529,6 +531,17 @@ static int s_iface_event_seq = 0;
  * debounce-after-iface-up + periodic schedule as lxmf's announces. */
 static RNS::Destination s_probe_dest{RNS::Type::NONE};
 
+/* ─────────────── remote management ───────────────
+ *
+ * Declared up here beside the probe because the hosted-destination snapshot and
+ * the per-interface announce replay both reach for it, and both run well before
+ * the handlers below are defined. `s_rm_announce_data` is whatever the consumer
+ * asked us to carry in the announce — a community membership signature, or
+ * nothing at all. Upstream announces this destination with no app_data and
+ * stock clients ignore whatever is there, so carrying something breaks nobody. */
+static RNS::Destination s_rm_dest{RNS::Type::NONE};
+static RNS::Bytes       s_rm_announce_data;
+
 /* Hosted-destination announce replay, PINNED per interface via
  * attached_interface: an event on one interface must never cause announces on
  * another (a BLE peer cycling every few seconds would otherwise spend LoRa
@@ -625,6 +638,94 @@ static void publishIfaceUp(const iface_t& i)
         armDestReplay(1u << slot, RNSD_REPLAY_DEBOUNCE_MS);
 }
 
+/* ─────────────── route invalidation ───────────────
+ *
+ * A ROUTE IS ONLY TRUE WHILE THE WAY TO IT EXISTS. "To reach X, send via Y over
+ * Z" stops being true the moment Z goes away or Y stops answering, and neither
+ * event touches the path table: the entry sits there for its full TTL — hours
+ * to a week — while every packet aimed down it goes nowhere.
+ *
+ * On a connection-oriented medium we do not have to guess. `auto` and `ble`
+ * know exactly who they are connected to, and a detach is a fact arriving on
+ * time. That is the moment to drop the paths that depended on it, and it is
+ * strictly better than any horizon: certain, immediate, and it costs nothing on
+ * a link that never drops. LoRa gets nothing from this — it is connectionless,
+ * there is no detach to hear, and time is the only evidence there.
+ *
+ * Both of these run on the rnsd task, which is the directory's only writer. */
+
+/** Drop every route whose receiving interface no longer exists.
+ *
+ *  Matched by asking Transport to resolve the stored interface hash: an
+ *  interface that has gone resolves to nothing. That is the general form and
+ *  needs no name matching, so it also catches an interface removed by any route
+ *  other than the one below. */
+static size_t rnsdDropRoutesOnDeadIfaces(void)
+{
+    struct Ctx { uint8_t dead[32][RDIR_DEST_LEN]; int n; } c{ {}, 0 };
+    rdirForEach([](const rdir_entry_t* e, void* vp) {
+        Ctx* c = (Ctx*)vp;
+        if (!e->has_route || c->n >= 32) return;
+        bool live = false;
+        try {
+            RNS::Interface i = RNS::Transport::find_interface_from_hash_prefix(e->route.iface_hash);
+            live = (bool)i;
+        } catch (const std::exception&) { live = false; }
+        if (!live) std::memcpy(c->dead[c->n++], e->dest, RDIR_DEST_LEN);
+    }, &c);
+
+    size_t n = 0;
+    for (int i = 0; i < c.n; i++) if (rdirClearRoute(c.dead[i])) n++;
+    return n;
+}
+
+/** Drop the routes that depended on a node which has just detached: the routes
+ *  TO the destinations it hosted, and the routes THROUGH it.
+ *
+ *  `received_from` is the forwarding node's transport identity hash, so a route
+ *  through the departed node is found by matching that against the identity
+ *  behind any destination it hosted. Both directions matter — a neighbour
+ *  leaving takes its own addresses and everything it was relaying with it. */
+static size_t rnsdDropRoutesVia(const uint8_t (*dests)[RDIR_DEST_LEN], int ndest)
+{
+    if (ndest <= 0) return 0;
+
+    /* The identities behind those destinations — what a route through this node
+     * would name as its next hop. */
+    uint8_t ids[8][RNSD_IDENT_HASH_LEN];
+    int nid = 0;
+    for (int i = 0; i < ndest && nid < 8; i++) {
+        rdir_entry_t e;
+        if (!rdirPeekEntry(dests[i], &e) || !e.has_pubkey) continue;
+        if (rnsdIdentityHashFromPubkey(e.pubkey, ids[nid])) nid++;
+    }
+
+    struct Ctx {
+        const uint8_t (*dests)[RDIR_DEST_LEN]; int ndest;
+        uint8_t (*ids)[RNSD_IDENT_HASH_LEN];   int nid;
+        uint8_t dead[48][RDIR_DEST_LEN];       int n;
+    } c{ dests, ndest, ids, nid, {}, 0 };
+
+    rdirForEach([](const rdir_entry_t* e, void* vp) {
+        Ctx* c = (Ctx*)vp;
+        if (!e->has_route || c->n >= 48) return;
+        for (int i = 0; i < c->ndest; i++)
+            if (std::memcmp(e->dest, c->dests[i], RDIR_DEST_LEN) == 0) {
+                std::memcpy(c->dead[c->n++], e->dest, RDIR_DEST_LEN);
+                return;
+            }
+        for (int i = 0; i < c->nid; i++)
+            if (std::memcmp(e->route.received_from, c->ids[i], RNSD_IDENT_HASH_LEN) == 0) {
+                std::memcpy(c->dead[c->n++], e->dest, RDIR_DEST_LEN);
+                return;
+            }
+    }, &c);
+
+    size_t n = 0;
+    for (int i = 0; i < c.n; i++) if (rdirClearRoute(c.dead[i])) n++;
+    return n;
+}
+
 static void publishIfaceDown(const iface_t& i)
 {
     char key[80];
@@ -633,6 +734,11 @@ static void publishIfaceDown(const iface_t& i)
      * their own interface, so this is the only thing that ever says a peer has
      * left — nothing announces a departure. */
     rnsdPeersIfaceGone(i.info.name);
+    /* And the routes that were reached over it. Keys stay: a destination's key
+     * is true wherever it is, and only the way there has gone. */
+    size_t dropped = rnsdDropRoutesOnDeadIfaces();
+    if (dropped) info("iface %s down: dropped %u route%s learned over it",
+                      i.info.name, (unsigned)dropped, dropped == 1 ? "" : "s");
 }
 
 /* The registered interface table, for rnsd_peers' printer and publisher. Read
@@ -838,7 +944,30 @@ static void onIfaceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
         memcpy(&p, data, sizeof(p));
         p.iface[sizeof(p.iface) - 1] = '\0';
         p.label[sizeof(p.label) - 1] = '\0';
-        rnsdNodeDeclare(p.iface, p.key, p.label, p.up != 0);
+        if (!p.up) {
+            /* Collect what this node hosted BEFORE the declaration drops its
+             * peer rows — afterwards there is nothing left to say which
+             * destinations were its, and the routes to and through it would sit
+             * in the table until they expired. A connection-oriented medium
+             * telling us a peer detached is the only certain evidence of a
+             * departure there is; nothing announces one. */
+            uint8_t dests[8][RDIR_DEST_LEN];
+            struct Ctx { const char* iface; uint8_t (*d)[RDIR_DEST_LEN]; int n; }
+                c{ p.iface, dests, 0 };
+            rnsdPeersForEach(p.iface, [](const rnsd_peer_t* pe, void* vp) {
+                Ctx* c = (Ctx*)vp;
+                if (c->n >= 8) return;
+                std::memcpy(c->d[c->n++], pe->dest, RDIR_DEST_LEN);
+            }, &c);
+
+            rnsdNodeDeclare(p.iface, p.key, p.label, false);
+
+            size_t dropped = rnsdDropRoutesVia(dests, c.n);
+            if (dropped) info("peer left %s: dropped %u route%s to or through it",
+                              p.iface, (unsigned)dropped, dropped == 1 ? "" : "s");
+            return;
+        }
+        rnsdNodeDeclare(p.iface, p.key, p.label, true);
         return;
     }
     if (op != RNSD_IFACE_AUX_ANNOUNCE) { warn("iface aux: unknown op 0x%02x", op); return; }
@@ -870,7 +999,7 @@ static std::mutex         s_hosted_mtx;
 
 static void hostedDestsRefresh(void)
 {
-    rnsd_hosted_dest_t snap[RNSD_MAX_OUR_DESTS + 1];
+    rnsd_hosted_dest_t snap[RNSD_MAX_OUR_DESTS + 2];
     int n = 0;
     for (int j = 0; j < RNSD_MAX_OUR_DESTS && s_our_dests; j++) {
         our_dest_t& c = s_our_dests[j];
@@ -882,6 +1011,14 @@ static void hostedDestsRefresh(void)
     if (s_probe_dest) {
         std::memcpy(snap[n].dest, s_probe_dest.hash().data(), RNSD_DEST_HASH_LEN);
         safeStrncpy(snap[n].aspect, "rnstransport.probe", sizeof(snap[n].aspect));
+        n++;
+    }
+    /* The management destination rides the ordinary hosted-announce beat, which
+     * is what advertises the service — discovery costs nothing because every
+     * node offering it is already announcing on the stock two-hour cadence. */
+    if (s_rm_dest) {
+        std::memcpy(snap[n].dest, s_rm_dest.hash().data(), RNSD_DEST_HASH_LEN);
+        safeStrncpy(snap[n].aspect, "rnstransport.remote.management", sizeof(snap[n].aspect));
         n++;
     }
     std::lock_guard<std::mutex> lk(s_hosted_mtx);
@@ -966,6 +1103,17 @@ static void replayOurDestAnnounces(void)
                 n++;
             } catch (const std::exception& e) {
                 err("probe announce replay threw: %s", e.what());
+            }
+        }
+        if (s_rm_dest) {
+            try {
+                /* app_data is whatever the community layer put there — a
+                 * membership signature, or nothing. Stock clients ignore it
+                 * either way, which is what makes it safe to carry. */
+                s_rm_dest.announce(s_rm_announce_data, /*path_response=*/false, ifc.mr_iface);
+                n++;
+            } catch (const std::exception& e) {
+                err("remote-management announce replay threw: %s", e.what());
             }
         }
         if (n) info("replayed %d hosted announce%s onto %s",
@@ -2445,6 +2593,347 @@ static void rnsdProbeDestDown(void)
     info("probe dest down");
 }
 
+/* ─────────────── remote management (rnstransport.remote.management) ───────────────
+ *
+ * Reticulum's own management service, served from this node at the stock
+ * address so an unmodified `rnstatus -R <hash>` works against us. Upstream's
+ * shapes exactly: `/path` answers a list of
+ * {hash, timestamp, via, hops, expires, interface}, `/status` answers
+ * [stats-dict, link-count].
+ *
+ * The handlers run INLINE on the rnsd task, inside Link::handle_request —
+ * µR's response generator returns its answer synchronously and there is
+ * nowhere to defer to. That is why they live here rather than in the consumer
+ * that turns the service on: the answers are Transport's own tables, so there
+ * is nothing to marshal anywhere.
+ *
+ * WHICH /status KEYS ARE MANDATORY is not a matter of taste. Upstream's
+ * rnstatus guards most keys with an `in` check but not all, and an unguarded
+ * miss raises instead of degrading — so the required set is derived
+ * mechanically: the keys rnstatus.py subscripts, minus the keys it guards.
+ * Per interface that is name, status, mode, clients, rxb, txb, txdrp,
+ * txbuffered, txstalled. The guards also CROSS: sending `bitrate` makes `mtu`
+ * mandatory; `rxs`/`txs` pull in `arxs`/`atxs`. Ship a family whole or not at
+ * all. Zero is a fine value for a counter we do not keep; omitting a key
+ * upstream does not guard is not. */
+static std::vector<RNS::Bytes> s_rm_allow;
+
+/** The path table, as upstream's get_path_table() returns it. `max_hops` and
+ *  `dest` filter on OUR side, never on the caller's word. */
+static RNS::Bytes rmPathAnswer(const uint8_t* want_dest, bool have_want, int max_hops)
+{
+    struct Ctx {
+        std::vector<uint8_t> rows;
+        int                  n = 0;
+        const uint8_t*       want;
+        bool                 have_want;
+        int                  max_hops;
+    } c{ {}, 0, want_dest, have_want, max_hops };
+
+    rdirForEach([](const rdir_entry_t* e, void* vp) {
+        Ctx* c = (Ctx*)vp;
+        if (!e->has_route) return;
+        if (c->max_hops >= 0 && e->route.hops > c->max_hops) return;
+        if (c->have_want && std::memcmp(e->dest, c->want, RDIR_DEST_LEN) != 0) return;
+        /* A busy transport node's table is large and the answer rides one
+         * Link; the caller asked for a bounded view and gets one. */
+        if (c->n >= 128) return;
+
+        std::string iface;
+        try {
+            RNS::Interface i = RNS::Transport::find_interface_from_hash_prefix(e->route.iface_hash);
+            if (i) iface = ifaceShortName(i.toString());
+        } catch (const std::exception&) {}
+
+        auto& b = c->rows;
+        MsgPack::detail::pack_map_header(b, 6);
+        MsgPack::detail::pack_fixstr(b, "hash", 4);
+        MsgPack::detail::pack_bin(b, e->dest, RDIR_DEST_LEN);
+        MsgPack::detail::pack_fixstr(b, "timestamp", 9);
+        MsgPack::detail::pack_double(b, (double)e->route.timestamp);
+        MsgPack::detail::pack_fixstr(b, "via", 3);
+        MsgPack::detail::pack_bin(b, e->route.received_from, RDIR_DEST_LEN);
+        MsgPack::detail::pack_fixstr(b, "hops", 4);
+        MsgPack::detail::pack_uint(b, e->route.hops);
+        MsgPack::detail::pack_fixstr(b, "expires", 7);
+        MsgPack::detail::pack_double(b, (double)e->route.expires);
+        MsgPack::detail::pack_fixstr(b, "interface", 9);
+        MsgPack::detail::pack_str(b, iface.c_str(), iface.size());
+        c->n++;
+    }, &c);
+
+    std::vector<uint8_t> out;
+    MsgPack::detail::pack_array_header(out, (size_t)c.n);
+    out.insert(out.end(), c.rows.begin(), c.rows.end());
+    return RNS::Bytes(out.data(), out.size());
+}
+
+static RNS::Bytes rmPathHandler(const RNS::Bytes& /*path*/, const RNS::Bytes& data,
+                                const RNS::Bytes& /*request_id*/, const RNS::Bytes& /*link_id*/,
+                                const RNS::Identity& remote, double /*requested_at*/)
+{
+    if (!remote) return {RNS::Bytes::NONE};
+    try {
+        std::string command;
+        uint8_t     want[RDIR_DEST_LEN];
+        bool        have_want = false;
+        int         max_hops  = -1;
+
+        MsgPack::ArrayReader a(data.data(), data.size());
+        if (a.next()) {
+            size_t k = MsgPack::detail::unpack_str(a.value_ptr(), a.value_len(), command);
+            a.advance(k);
+        }
+        if (a.next()) {
+            if (a.value_ptr()[0] == 0xc0) a.skip_value();       /* nil → every destination */
+            else {
+                MsgPack::bin_t<uint8_t> d;
+                a.advance(MsgPack::detail::unpack_bin(a.value_ptr(), a.value_len(), d));
+                if (d.size() == RDIR_DEST_LEN) {
+                    std::memcpy(want, d.data(), RDIR_DEST_LEN);
+                    have_want = true;
+                }
+            }
+        }
+        if (a.next()) {
+            if (a.value_ptr()[0] == 0xc0) a.skip_value();       /* nil → no hop limit */
+            else {
+                double h = 0;
+                a.advance(MsgPack::detail::unpack_number(a.value_ptr(), a.value_len(), h));
+                max_hops = (int)h;
+            }
+        }
+
+        if (command == "table")
+            return rmPathAnswer(have_want ? want : nullptr, have_want, max_hops);
+
+        if (command == "rates") {
+            /* We keep no announce-rate table, and an empty list is the honest
+             * answer. Know that a stock client MISREPORTS it: rnpath treats any
+             * falsy response as "The remote request failed. Likely
+             * authentication failure." — and an upstream node with an empty
+             * rates table trips the same line, so there is nothing better to
+             * answer and nothing to fix on our side. */
+            std::vector<uint8_t> out;
+            MsgPack::detail::pack_array_header(out, 0);
+            return RNS::Bytes(out.data(), out.size());
+        }
+    } catch (const std::exception& e) {
+        warn("remote /path: %s", e.what());
+    }
+    return {RNS::Bytes::NONE};
+}
+
+/** One interface's stats dict, carrying the keys upstream's rnstatus does not
+ *  guard plus the families it does, whole. */
+static void rmPackIface(std::vector<uint8_t>& b, const iface_t& i)
+{
+    const char* name = i.info.name;
+    /* name, status, mode, clients, rxb, txb, txdrp, txbuffered, txstalled are
+     * unguarded upstream. bitrate drags in mtu; rxs/txs drag in arxs/atxs. */
+    MsgPack::detail::pack_map_header(b, 15);
+
+    MsgPack::detail::pack_fixstr(b, "name", 4);
+    MsgPack::detail::pack_str(b, name, std::strlen(name));
+    MsgPack::detail::pack_fixstr(b, "short_name", 10);
+    MsgPack::detail::pack_str(b, name, std::strlen(name));
+    MsgPack::detail::pack_fixstr(b, "type", 4);
+    MsgPack::detail::pack_str(b, "TaskInterface", 13);
+    MsgPack::detail::pack_fixstr(b, "status", 6);
+    MsgPack::detail::pack_bool(b, true);
+    MsgPack::detail::pack_fixstr(b, "mode", 4);
+    MsgPack::detail::pack_uint(b, i.info.mode);
+    /* nil, not 0: upstream writes nil for an interface with no client concept,
+     * and rnstatus prints the two differently. */
+    MsgPack::detail::pack_fixstr(b, "clients", 7);
+    MsgPack::detail::pack_nil(b);
+    MsgPack::detail::pack_fixstr(b, "bitrate", 7);
+    MsgPack::detail::pack_uint(b, i.info.bitrate);
+    MsgPack::detail::pack_fixstr(b, "mtu", 3);
+    MsgPack::detail::pack_uint(b, i.info.mtu);
+    MsgPack::detail::pack_fixstr(b, "rxb", 3);
+    MsgPack::detail::pack_uint(b, i.rx_bytes);
+    MsgPack::detail::pack_fixstr(b, "txb", 3);
+    MsgPack::detail::pack_uint(b, i.tx_bytes);
+    MsgPack::detail::pack_fixstr(b, "txdrp", 5);
+    MsgPack::detail::pack_uint(b, 0);
+    MsgPack::detail::pack_fixstr(b, "txbuffered", 10);
+    MsgPack::detail::pack_uint(b, 0);
+    MsgPack::detail::pack_fixstr(b, "txstalled", 9);
+    MsgPack::detail::pack_uint(b, 0);
+    MsgPack::detail::pack_fixstr(b, "peers", 5);
+    MsgPack::detail::pack_nil(b);
+    MsgPack::detail::pack_fixstr(b, "ifac_signature", 14);
+    MsgPack::detail::pack_nil(b);
+}
+
+static RNS::Bytes rmStatusHandler(const RNS::Bytes& /*path*/, const RNS::Bytes& data,
+                                  const RNS::Bytes& /*request_id*/, const RNS::Bytes& /*link_id*/,
+                                  const RNS::Identity& remote, double /*requested_at*/)
+{
+    if (!remote) return {RNS::Bytes::NONE};
+    try {
+        bool want_links = false;
+        MsgPack::ArrayReader a(data.data(), data.size());
+        if (a.next()) {
+            if (a.value_ptr()[0] == 0xc3) { want_links = true; a.skip_value(); }
+            else a.skip_value();
+        }
+        /* Profiling is never answered — we keep none, and upstream guards it. */
+
+        int nifs = 0;
+        for (int j = 0; j < RNSD_MAX_IFACES; j++) if (s_ifaces[j].used) nifs++;
+
+        std::vector<uint8_t> b;
+        MsgPack::detail::pack_array_header(b, want_links ? 2 : 1);
+
+        /* stats: `interfaces` always, then the -t and -q families whole. The
+         * queue counters are unguarded upstream, so they ship as zeros rather
+         * than being left out. */
+        MsgPack::detail::pack_map_header(b, 20);
+        MsgPack::detail::pack_fixstr(b, "interfaces", 10);
+        MsgPack::detail::pack_array_header(b, (size_t)nifs);
+        for (int j = 0; j < RNSD_MAX_IFACES; j++)
+            if (s_ifaces[j].used) rmPackIface(b, s_ifaces[j]);
+
+        auto num = [&](const char* k, uint64_t v) {
+            MsgPack::detail::pack_str(b, k, std::strlen(k));
+            MsgPack::detail::pack_uint(b, v);
+        };
+        num("rxb", s_stats.bytes_in);
+        num("txb", s_stats.bytes_out);
+        num("rxs", 0);        num("txs", 0);
+        num("arxs", 0);       num("atxs", 0);
+        num("rxpps", 0);      num("txpps", 0);
+        num("rxqt", 0);       num("rxqd", 0);
+        num("rxqa", 0);       num("rxqp", 0);
+        num("rxqil", 0);      num("rxqtd", 0);
+        num("rxqdd", 0);      num("rxqad", 0);
+        num("rxqpd", 0);      num("rxqild", 0);
+        MsgPack::detail::pack_fixstr(b, "txq", 3);
+        MsgPack::detail::pack_nil(b);
+
+        if (want_links)
+            MsgPack::detail::pack_uint(b, RNS::Transport::active_links_count());
+
+        return RNS::Bytes(b.data(), b.size());
+    } catch (const std::exception& e) {
+        warn("remote /status: %s", e.what());
+    }
+    return {RNS::Bytes::NONE};
+}
+
+static void rmRegisterHandlers(void)
+{
+    if (!s_rm_dest) return;
+    /* ALLOW_LIST, always. An unidentified link is refused outright by µR, and
+     * an identity that is not on the list is refused with it. The list is per
+     * handler, so /path and /status could be granted separately if they ever
+     * needed to be — one is a map of everywhere we can reach, the other is
+     * counters. */
+    s_rm_dest.register_request_handler(
+        RNS::Bytes((const uint8_t*)"/path", 5), rmPathHandler,
+        RNS::Type::Destination::ALLOW_LIST, s_rm_allow);
+    s_rm_dest.register_request_handler(
+        RNS::Bytes((const uint8_t*)"/status", 7), rmStatusHandler,
+        RNS::Type::Destination::ALLOW_LIST, s_rm_allow);
+}
+
+bool rnsdRemoteManagementStart(void)
+{
+    if (s_rm_dest) return true;
+    if (!s_identity) { warn("remote management: no identity"); return false; }
+    try {
+        s_rm_dest = RNS::Destination(*s_identity,
+            RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE,
+            "rnstransport", "remote.management");
+        s_rm_dest.accepts_links(true);
+        rmRegisterHandlers();
+        info("remote management up: %s (%zu identit%s allowed)",
+             s_rm_dest.hash().toHex().c_str(), s_rm_allow.size(),
+             s_rm_allow.size() == 1 ? "y" : "ies");
+        hostedDestsRefresh();
+        /* Announced on the stock beat with the hosted destinations, which is
+         * how a crawl finds who is askable without deriving a single hash. */
+        if (!s_dest_announce_due_tick) {
+            s_dest_announce_due_tick = xTaskGetTickCount() +
+                pdMS_TO_TICKS(RNSD_ANNOUNCE_COALESCE_MS);
+            if (!s_dest_announce_due_tick) s_dest_announce_due_tick = 1;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        err("remote management construct threw: %s", e.what());
+        s_rm_dest = RNS::Destination(RNS::Type::NONE);
+        return false;
+    }
+}
+
+void rnsdRemoteManagementStop(void)
+{
+    if (!s_rm_dest) return;
+    try { RNS::Transport::deregister_destination(s_rm_dest); }
+    catch (const std::exception& e) { warn("deregister_destination threw: %s", e.what()); }
+    s_rm_dest = RNS::Destination(RNS::Type::NONE);
+    hostedDestsRefresh();
+    info("remote management down");
+}
+
+void rnsdRemoteManagementAllow(const uint8_t (*hashes)[RNSD_IDENT_HASH_LEN], int n)
+{
+    s_rm_allow.clear();
+    for (int i = 0; i < n && hashes; i++)
+        s_rm_allow.push_back(RNS::Bytes(hashes[i], RNSD_IDENT_HASH_LEN));
+    /* The handlers hold a COPY of the list, so re-registering is what makes a
+     * change take effect. Registering the same path twice replaces. */
+    rmRegisterHandlers();
+    info("remote management: %d identit%s allowed", n, n == 1 ? "y" : "ies");
+}
+
+bool rnsdRemoteManagementServing(void)
+{
+    return (bool)s_rm_dest;
+}
+
+static rnsd_remote_ask_t s_remote_asker = nullptr;
+
+void rnsdSetRemoteAsker(rnsd_remote_ask_t cb) { s_remote_asker = cb; }
+
+/** Shared by `rnpath -R` and `rnstatus -R`. Both switches take the same
+ *  argument and mean the same thing, so they parse and fail in one place. */
+static bool cliRemoteAsk(const std::string& hex)
+{
+    if (hex.size() != RNSD_IDENT_HASH_LEN * 2) {
+        cliPrintf("-R: expected a %d-hex identity hash\n", (int)(RNSD_IDENT_HASH_LEN * 2));
+        return false;
+    }
+    if (!s_remote_asker) {
+        cliPrintf("-R: remote management is not available on this build\n");
+        return false;
+    }
+    RNS::Bytes h;
+    h.assignHex((const uint8_t*)hex.c_str(), hex.size());
+    if (h.size() != RNSD_IDENT_HASH_LEN) { cliPrintf("-R: bad hex\n"); return false; }
+    s_remote_asker(h.data());
+    /* The answer goes to the log rather than here: a node on LoRa may take a
+     * minute, and a verb that waited would be a verb that blocks. */
+    cliPrintf("asking %s — watch the log\n", hex.c_str());
+    return true;
+}
+
+void rnsdRemoteManagementAnnounceData(const uint8_t* data, size_t n)
+{
+    s_rm_announce_data = (data && n) ? RNS::Bytes(data, n) : RNS::Bytes();
+    if (!s_rm_dest) return;
+    /* Air it once now rather than waiting out the beat: the thing this carries
+     * is membership, and a node that has just been given the community key
+     * should be findable as a member without a two-hour wait. */
+    if (!s_dest_announce_due_tick) {
+        s_dest_announce_due_tick = xTaskGetTickCount() +
+            pdMS_TO_TICKS(RNSD_ANNOUNCE_COALESCE_MS);
+        if (!s_dest_announce_due_tick) s_dest_announce_due_tick = 1;
+    }
+}
+
 static void onRespondToProbesChange(const char* /*key*/, const char* val)
 {
     bool enabled = val && std::atoi(val) != 0;
@@ -2802,6 +3291,29 @@ static void rnsdDirUp(void)
     if (!rdirInit(&plat, budget)) {
         err("dir: store unavailable — no routing or identity cache this boot");
         return;
+    }
+
+    /* ROUTES DO NOT SURVIVE A BOOT; KEYS DO.
+     *
+     * A public key is a fact about a destination and is true whenever we next
+     * need it. A route is a statement about the network at one moment — "to
+     * reach X, send via Y over Z" — and it holds only while Y is still there
+     * and Z is still up. Nothing in a restored image can vouch for either, so
+     * trusting persisted routes means booting with an assertion about a
+     * topology from before the device was switched off: lines on the graph to
+     * neighbours that have gone, over interfaces that are now disabled, and
+     * traffic sent at a next hop that is not listening.
+     *
+     * Dropping them costs one path request, or the next announce, per
+     * destination actually used — while keeping every key, which is the
+     * expensive half to relearn. A transport node serving path requests for
+     * others is the one case with a real appetite for the old behaviour, so it
+     * is a setting rather than a rule; the default is fresh. */
+    if (storageGetInt("s.rnsd.dir.persist_routes", 0) == 0) {
+        size_t cleared = rdirClearAllRoutes();
+        if (cleared) info("dir: dropped %u restored route%s — keys kept, paths "
+                          "relearn on demand", (unsigned)cleared,
+                          cleared == 1 ? "" : "s");
     }
     s_dirPersistedGen = rdirGeneration();
     s_dirImgCap = rnsdDirImageCap();
@@ -3195,9 +3707,15 @@ static void rnsdDirCollect(const rdir_entry_t* e, void* vctx)
     if (e->has_route) {
         p.hops = e->route.hops;
         std::memcpy(p.via, e->route.received_from, RNSD_DEST_HASH_LEN);
+        p.timestamp = e->route.timestamp;
+        p.expires   = e->route.expires;
     }
     if (e->has_pubkey)
         p.have_identity = rnsdIdentityHashFromPubkey(e->pubkey, p.identity);
+    {
+        const char* asp = rnsdAspectLabel(e->name_hash);
+        safeStrncpy(p.aspect, asp ? asp : "", sizeof(p.aspect));
+    }
     if (e->has_route) try {
         RNS::Interface i = RNS::Transport::find_interface_from_hash_prefix(e->route.iface_hash);
         if (i) safeStrncpy(p.iface, ifaceShortName(i.toString()).c_str(), sizeof(p.iface));
@@ -3227,6 +3745,69 @@ struct PathRow {
 #define RNPATH_DEFAULT_LIMIT 32
 #define RNPATH_YIELD_EVERY   16
 
+/* ── a destination in words ──
+ *
+ * A path table is a list of hashes, and a hash is the one thing an operator
+ * cannot read. Everything needed to say it in words is already in the
+ * neighbourhood table: rnsd files a peer row per announce carrying the display
+ * name the announce advertised and the aspect behind its name hash. This is
+ * that join, and nothing else — where a destination has never announced within
+ * earshot there is no name to give, and the hash is the honest answer.
+ *
+ * Both halves are optional and printed as they come: a nameless probe
+ * destination resolves to just its aspect, an announce whose app_data carried
+ * no name to just the aspect, and something we have only routed to stays hex. */
+struct DestWords { std::string name; std::string aspect; };
+
+static rnsd_name_resolve_t s_name_resolver = nullptr;
+
+void rnsdSetNameResolver(rnsd_name_resolve_t cb) { s_name_resolver = cb; }
+
+static DestWords rnpathResolve(const uint8_t dest[RDIR_DEST_LEN],
+                               const std::string& dest_hex)
+{
+    struct Ctx { const std::string* hex; DestWords* out; } c{ &dest_hex, nullptr };
+    DestWords w;
+    c.out = &w;
+    rnsdPeersForEach("", [](const rnsd_peer_t* p, void* vp) {
+        Ctx* c = (Ctx*)vp;
+        if (!c->out->name.empty() || !c->out->aspect.empty()) return;   /* first match wins */
+        if (RNS::Bytes(p->dest, RNSD_DEST_HASH_LEN).toHex() != *c->hex) return;
+        c->out->name   = p->name;
+        c->out->aspect = p->aspect;
+    }, &c);
+
+    /* A DEVICE name outranks an announced one. The peer row's name came from
+     * app_data — a person's display name, on a person's address — and a node's
+     * own addresses carry none at all, so the destinations that ARE a device
+     * are exactly the ones this walk cannot name. Whoever tracks devices can. */
+    if (s_name_resolver) {
+        rdir_entry_t e;
+        uint8_t ident[RNSD_IDENT_HASH_LEN];
+        char dev[RNSD_PEER_NAME_MAX];
+        if (rdirPeekEntry(dest, &e) && e.has_pubkey &&
+            rnsdIdentityHashFromPubkey(e.pubkey, ident) &&
+            s_name_resolver(ident, dev, sizeof dev) && dev[0])
+            w.name = dev;
+    }
+    return w;
+}
+
+/** The destination column: "tbeam lxmf.delivery" where we can say it, the hash
+ *  where we cannot. */
+static std::string rnpathDestLabel(const std::string& dest_hex, bool resolve)
+{
+    if (!resolve) return dest_hex;
+    RNS::Bytes dh;
+    dh.assignHex((const uint8_t*)dest_hex.c_str(), dest_hex.size());
+    if (dh.size() != RDIR_DEST_LEN) return dest_hex;
+    DestWords w = rnpathResolve(dh.data(), dest_hex);
+    if (w.name.empty() && w.aspect.empty()) return dest_hex;
+    if (w.name.empty())   return w.aspect;
+    if (w.aspect.empty()) return w.name;
+    return w.name + " " + w.aspect;
+}
+
 /** Consume one whitespace-delimited token starting at *i in `a`; advance *i. */
 static std::string rnpathNextToken(const std::string& a, size_t* i)
 {
@@ -3246,6 +3827,7 @@ static void cliRnpath(const char* args)
     bool summary     = false;
     bool drop        = false;
     bool json        = false;
+    bool resolve     = false;
     bool show_help   = false;
 
     /* `help` listing → one line; `-h`/`--help` → detail. */
@@ -3265,13 +3847,17 @@ static void cliRnpath(const char* args)
             else if (t == "-s" || t == "--summary")     summary  = true;
             else if (t == "-d" || t == "--drop")        drop     = true;
             else if (t == "-j" || t == "--json")        json     = true;
+            else if (t == "-r" || t == "--resolve")     resolve  = true;
             else if (t == "-i" || t == "--iface")       filter_iface = rnpathNextToken(a, &i);
             else if (t == "-m" || t == "--max-hops")    max_hops = atoi(rnpathNextToken(a, &i).c_str());
             else if (t == "-n" || t == "--limit")       limit    = atoi(rnpathNextToken(a, &i).c_str());
+            /* Stock switch, stock argument: a transport identity hash, exactly
+             * as upstream's rnpath takes it, so the muscle memory transfers. */
+            else if (t == "-R" || t == "--remote")      { cliRemoteAsk(rnpathNextToken(a, &i)); return; }
             else if (!t.empty() && t[0] != '-')         filter_dest = t;
             else {
                 cliPrintf("unknown option: %s\n", t.c_str());
-                cliPrintf("usage: rnpath [destination] [-i iface] [-m hops] [-n N] [-a] [-s] [-d] [-j]\n");
+                cliPrintf("usage: rnpath [destination] [-i iface] [-m hops] [-n N] [-R hash] [-a] [-s] [-d] [-j] [-r]\n");
                 return;
             }
         }
@@ -3286,6 +3872,8 @@ static void cliRnpath(const char* args)
         cliPrintf("-s --summary counts only, no rows\n");
         cliPrintf("-d --drop    drop path to destination\n");
         cliPrintf("-j --json    JSON output\n");
+        cliPrintf("-r --resolve name and aspect instead of the hash, where known\n");
+        cliPrintf("-R hash      ask that node instead (answer goes to the log)\n");
         return;
     }
 
@@ -3380,18 +3968,56 @@ static void cliRnpath(const char* args)
     int to_show = show_all ? (int)rows.size() : std::min((int)rows.size(), limit);
     if (to_show < (int)rows.size())
         cliPrintf("\n(showing %d of %d, use -a or -n N for more)\n", to_show, (int)rows.size());
-    cliPrintf("\n%-32s %-32s %-16s %-5s %-8s\n",
-              "destination", "next hop", "iface", "hops", "age");
+    /* ── size every column to what is actually in it ──
+     *
+     * Rendered first, measured, then printed. A fixed width is a guess about
+     * content this function already holds: at 32 it leaves an empty third of a
+     * line between a resolved name and the next field, and it would truncate a
+     * name longer than the guess. Resolving twice — once to measure, once to
+     * print — would also mean walking the peer table twice per row, so the
+     * rendering is kept rather than repeated. */
+    struct OutRow { std::string dest, via, iface, hops, age; };
+    std::vector<OutRow> out;
+    out.reserve(to_show);
+
+    size_t w_dest  = std::strlen("destination");
+    size_t w_via   = std::strlen("next hop");
+    size_t w_iface = std::strlen("iface");
+    size_t w_hops  = std::strlen("hops");
 
     double now = RNS::Utilities::OS::time();
     for (int n = 0; n < to_show; n++) {
-        cliPrintf("%-32s %-32s %-16s %-5d %lus\n",
-                  rows[n].dest.c_str(),
-                  rows[n].next_hop.c_str(),
-                  rows[n].iface.c_str(),
-                  rows[n].hops,
-                  (unsigned long)(now - rows[n].timestamp));
+        OutRow r;
+        r.dest = rnpathDestLabel(rows[n].dest, resolve);
+        /* AT ONE HOP THERE IS NO NEXT HOP. The field holds the transport id of
+         * whoever forwarded the announce, and for a neighbour we heard directly
+         * that is nobody — the destination IS the next hop. Printing it repeats
+         * the first column, or worse prints an all-zero hash as though it named
+         * something. Blank says "straight there", which is the fact. */
+        if (rows[n].hops > 1) r.via = rnpathDestLabel(rows[n].next_hop, resolve);
+        r.iface = rows[n].iface;
+        char b[24];
+        snprintf(b, sizeof(b), "%d", rows[n].hops);                              r.hops = b;
+        snprintf(b, sizeof(b), "%lus", (unsigned long)(now - rows[n].timestamp)); r.age  = b;
+
+        w_dest  = std::max(w_dest,  r.dest.size());
+        w_via   = std::max(w_via,   r.via.size());
+        w_iface = std::max(w_iface, r.iface.size());
+        w_hops  = std::max(w_hops,  r.hops.size());
+        out.push_back(std::move(r));
+        if ((n % RNPATH_YIELD_EVERY) == RNPATH_YIELD_EVERY - 1) vTaskDelay(1);
     }
+
+    /* `age` is last and needs no width of its own — nothing follows it to line
+     * up against. */
+    cliPrintf("\n%-*s %-*s %-*s %-*s %s\n",
+              (int)w_dest,  "destination", (int)w_via,   "next hop",
+              (int)w_iface, "iface",       (int)w_hops,  "hops", "age");
+    for (auto& r : out)
+        cliPrintf("%-*s %-*s %-*s %-*s %s\n",
+                  (int)w_dest,  r.dest.c_str(),  (int)w_via,   r.via.c_str(),
+                  (int)w_iface, r.iface.c_str(), (int)w_hops,  r.hops.c_str(),
+                  r.age.c_str());
 }
 
 /* ─────────────── rnstatus ─────────────── */
@@ -3537,10 +4163,18 @@ static void cliRnstatus(const char* args)
             if      (t == "-h" || t == "--help")   show_help = true;
             else if (t == "-t" || t == "--totals") show_totals = true;
             else if (t == "-j" || t == "--json")   json = true;
+            else if (t == "-R" || t == "--remote") {
+                /* Stock switch, stock argument: a transport identity hash. */
+                while (i < a.size() && (a[i] == ' ' || a[i] == '\t')) i++;
+                size_t s2 = i;
+                while (i < a.size() && a[i] != ' ' && a[i] != '\t') i++;
+                cliRemoteAsk(a.substr(s2, i - s2));
+                return;
+            }
             else if (!t.empty() && t[0] != '-')    filter = t;
             else {
                 cliPrintf("unknown option: %s\n", t.c_str());
-                cliPrintf("usage: rnstatus [filter] [-t] [-j]\n");
+                cliPrintf("usage: rnstatus [filter] [-t] [-j] [-R hash]\n");
                 return;
             }
         }
@@ -3550,6 +4184,8 @@ static void cliRnstatus(const char* args)
         cliPrintf("%-*s interfaces & traffic\n", CLI_HELP_COL, "rnstatus [filter]");
         cliPrintf("%-*s global traffic totals\n", CLI_HELP_COL, "  -t  --totals");
         cliPrintf("%-*s JSON output\n", CLI_HELP_COL, "  -j  --json");
+        cliPrintf("%-*s ask that node instead (answer goes to the log)\n",
+                  CLI_HELP_COL, "  -R  <identity hash>");
         return;
     }
 
@@ -3962,6 +4598,30 @@ bool rnsdDestinationHashFromPubkey(const uint8_t pubkey[RNSD_PUBKEY_LEN],
         return true;
     } catch (const std::exception& e) {
         warn("rnsdDestinationHashFromPubkey: %s", e.what());
+        return false;
+    }
+}
+
+bool rnsdDestinationHashFromIdentityHash(const uint8_t ident_hash[RNSD_IDENT_HASH_LEN],
+                                         const char* app_name, const char* aspect,
+                                         uint8_t out[RNSD_DEST_HASH_LEN])
+{
+    if (!ident_hash || !app_name) return false;
+    try {
+        /* Destination::hash's own material, with the identity supplied as the
+         * hash it would have taken anyway: name_hash(app, aspect) ‖ identity
+         * hash, truncated. Built here rather than through Destination::hash
+         * because that wants an Identity object and the whole point of this
+         * entry point is not having one. */
+        RNS::Bytes material = RNS::Destination::name_hash(app_name, aspect ? aspect : "");
+        if (material.size() != RNSD_NAME_HASH_LEN) return false;
+        material << RNS::Bytes(ident_hash, RNSD_IDENT_HASH_LEN);
+        RNS::Bytes dh = RNS::Identity::truncated_hash(material);
+        if (dh.size() != RNSD_DEST_HASH_LEN) return false;
+        std::memcpy(out, dh.data(), RNSD_DEST_HASH_LEN);
+        return true;
+    } catch (const std::exception& e) {
+        warn("rnsdDestinationHashFromIdentityHash: %s", e.what());
         return false;
     }
 }
@@ -5225,7 +5885,7 @@ static void resSendAux(link_conn_t& c, uint8_t opcode,
             std::snprintf(d.iface, sizeof(d.iface), "%s", ifn.c_str());
         }
     }
-    if (!itsSendAuxByTaskHandle(c.consumer_task, LXMF_LINK_RESOURCE_AUX_PORT,
+    if (!itsSendAuxByTaskHandle(c.consumer_task, RNSD_LINK_RESOURCE_AUX_PORT,
                                 &d, sizeof(d), pdMS_TO_TICKS(2000))) {
         warn("link[%s]: resource aux send failed (op=%s)",
              c.tag, lnkAuxOpName(opcode));

@@ -206,7 +206,7 @@ enum : uint8_t {
 };
 
 /** Resource handoff frame. rnsd opens a one-shot ITS connection to the
- *  consumer's LXMF_LINK_RESOURCE_AUX_PORT carrying this as the connect
+ *  consumer's RNSD_LINK_RESOURCE_AUX_PORT carrying this as the connect
  *  payload (mirrors the rnsd_link_incoming_t pattern). On INBOUND_DONE
  *  the consumer takes ownership of `buf` and must rnsdResourceRelease()
  *  it. ≤ ITS_MAX_MSG_DATA. */
@@ -511,7 +511,16 @@ static_assert(sizeof(rnsd_announces_connect_t) <= ITS_MAX_MSG_DATA,
  * LINK_INBOX carries inbound Link forwards; LINK_RESOURCE_AUX carries
  * Resource handoffs. */
 constexpr uint16_t LXMF_LINK_INBOX_PORT        = 100;  /* inbound Link forwards */
-constexpr uint16_t LXMF_LINK_RESOURCE_AUX_PORT = 101;  /* Resource handoff */
+/** Where rnsd delivers the RESOURCE lifecycle for EVERY link consumer, not
+ *  just LXMF's — rnsd sends here by task handle whenever a Resource on any
+ *  consumer's link is advertised, concludes or fails. A consumer that opens a
+ *  link and does not open this port gets "aux send to unregistered port 101",
+ *  and rnsd frees the buffer the frame was carrying.
+ *
+ *  It is NOT the request/response port: that one is per-request, named by the
+ *  caller in rnsdLinkRequest(resp_port). This is the one every link consumer
+ *  shares, which is why it may not carry one consumer's name. */
+constexpr uint16_t RNSD_LINK_RESOURCE_AUX_PORT = 101;
 
 /* ---- netgraph task ports ---- */
 
@@ -521,3 +530,6 @@ constexpr uint16_t LXMF_LINK_RESOURCE_AUX_PORT = 101;  /* Resource handoff */
  *  `rnsd_link_incoming_t`. The handle then carries the DIGEST / WANT /
  *  RECORD_PART / DONE messages of the record exchange (netgraph.h). */
 constexpr uint16_t NETGRAPH_SYNC_PORT = 140;
+/** Where rnsd hands netgraph the answer to a remote-management request — the
+ *  crawl's `/path` and `/status` responses. Aux-only, like nomad's. */
+constexpr uint16_t NETGRAPH_REQ_PORT  = 141;
