@@ -262,6 +262,17 @@ void   rdirTouchUsed (const uint8_t dest[RDIR_DEST_LEN], uint32_t expires);
 /* Drop the routing layer, keeping identity. This is what "forget the path"
  * means once the two tables are one record. */
 bool   rdirClearRoute(const uint8_t dest[RDIR_DEST_LEN]);
+
+/* Clear the ROUTE on every record, keeping everything else.
+ *
+ * A key is a fact about a destination and survives anything; a route is a
+ * statement about the network at one moment — "to reach X, send via Y over
+ * Z" — and it is only true while Y is still there and Z is still up. Nothing
+ * in a restored image can vouch for either, so a boot that trusts persisted
+ * routes starts by asserting a topology from before it was switched off.
+ *
+ * Returns how many routes were cleared. */
+size_t rdirClearAllRoutes(void);
 /* Drop the whole record (and its blob). */
 bool   rdirForget    (const uint8_t dest[RDIR_DEST_LEN]);
 

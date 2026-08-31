@@ -766,22 +766,28 @@ void Link::teardown() {
 
 void Link::teardown_packet(const Packet& packet) {
 	assert(_object);
+	// The try covers the DECRYPTION and nothing else. Closing the link runs
+	// consumer callbacks and cancels resources; a throw from any of that is not
+	// a decryption failure, and reporting it as one sent every reader looking
+	// at the wrong half of the problem.
+	Bytes plaintext;
 	try {
-		Bytes plaintext = decrypt(packet.data());
-		if (plaintext == _object->_link_id) {
-			_object->_status = Type::Link::CLOSED;
-			if (_object->_initiator) {
-				_object->_teardown_reason = Type::Link::DESTINATION_CLOSED;
-			}
-			else {
-				_object->_teardown_reason = Type::Link::INITIATOR_CLOSED;
-			}
-			link_closed();
-		}
+		plaintext = decrypt(packet.data());
 	}
 	catch (const std::exception& e) {
 		ERRORF("Error while decrypting teardown packet from %s. The contained exception was: %s", toString().c_str(), e.what());
+		return;
 	}
+	if (plaintext != _object->_link_id) return;
+
+	_object->_status = Type::Link::CLOSED;
+	if (_object->_initiator) {
+		_object->_teardown_reason = Type::Link::DESTINATION_CLOSED;
+	}
+	else {
+		_object->_teardown_reason = Type::Link::INITIATOR_CLOSED;
+	}
+	link_closed();
 }
 
 void Link::link_closed() {
@@ -793,15 +799,28 @@ void Link::link_closed() {
 	// resource also sends RESOURCE_ICL and concludes) — mutating the set we
 	// are iterating would dangle the iterator. Iterate mutable copies (each
 	// shares the underlying ResourceData), so the const_cast is also gone.
+	// EVERY STEP BELOW HAS TO RUN. A cancel fires the consumer's concluded
+	// callback, which is arbitrary code on somebody else's terms; one that
+	// throws must not abandon the teardown half way and leave the channel
+	// running, the keys in memory and the destination still holding this link.
+	// Each resource is cancelled on its own account.
 	std::vector<Resource> incoming(_object->_incoming_resources.begin(),
 	                               _object->_incoming_resources.end());
 	for (auto& resource : incoming) {
-		resource.cancel();
+		try { resource.cancel(); }
+		catch (const std::exception& e) {
+			ERRORF("Link %s: cancelling an inbound resource threw: %s",
+			       link_id().toHex().c_str(), e.what());
+		}
 	}
 	std::vector<Resource> outgoing(_object->_outgoing_resources.begin(),
 	                               _object->_outgoing_resources.end());
 	for (auto& resource : outgoing) {
-		resource.cancel();
+		try { resource.cancel(); }
+		catch (const std::exception& e) {
+			ERRORF("Link %s: cancelling an outbound resource threw: %s",
+			       link_id().toHex().c_str(), e.what());
+		}
 	}
 	if (_object->_channel) {
 		_object->_channel._shutdown();
@@ -1056,9 +1075,20 @@ void Link::handle_request(const Bytes& request_id, const ResourceRequest& resour
 
 				if (response) {
 					//p packed_response = umsgpack.packb([request_id, response])
-					MsgPack::Packer packer;
-					packer.to_array(request_id, response);
-					Bytes packed_response(packer.data(), packer.size());
+					// The generator's return value is an already-packed msgpack
+					// OBJECT, spliced verbatim as the 2nd element — the inbound
+					// mirror of request()'s data_packed path above. Reference RNS
+					// packs whatever the handler returned, and for the handlers
+					// that matter (/path answers a list of dicts, /status a list
+					// whose head is a dict) that is a structure, not a blob.
+					// bin-wrapping it here would hand a stock rnstatus a byte
+					// string where it unpacks a list, and it would fail with no
+					// diagnosis on either side.
+					std::vector<uint8_t> b;
+					MsgPack::detail::pack_array_header(b, 2);
+					MsgPack::detail::pack_bin(b, request_id.data(), request_id.size());
+					b.insert(b.end(), response.data(), response.data() + response.size());
+					Bytes packed_response(b.data(), b.size());
 
 					if (packed_response.size() <= MDU) {
 						//p RNS.Packet(self, packed_response, Type::Packet::DATA, context = Type::Packet::RESPONSE).send()
@@ -1066,8 +1096,26 @@ void Link::handle_request(const Bytes& request_id, const ResourceRequest& resour
 						response_packet.send();
 					}
 					else {
-						// CBA TODO Determine why unused Resource is created here
-						Resource response_resource = RNS::Resource(packed_response, *this, request_id, true);
+						// A response too large for a packet goes as a Resource,
+						// FLAGGED AS ONE and carrying the request id — that is
+						// what makes the receiver route it to the pending
+						// request rather than to its generic resource callback.
+						//
+						// The five-argument form is deliberate. Bytes has a
+						// non-explicit operator bool, so a four-argument call
+						// binds to the OTHER constructor with request_id
+						// silently read as `advertise` and is_response left
+						// false: the response then advertises as an ordinary
+						// resource, and every consumer that asked a question
+						// larger than the MDU gets its answer handed to the
+						// resource port instead, where nothing is waiting for
+						// it.
+						//
+						// It does not need holding: _init_outbound registers
+						// every outbound resource with the link, which is what
+						// keeps the transfer alive past this scope.
+						RNS::Resource(packed_response, *this, request_id,
+						              /*is_response=*/true, /*timeout=*/0.0);
 					}
 				}
 			}

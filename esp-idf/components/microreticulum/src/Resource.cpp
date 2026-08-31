@@ -869,7 +869,17 @@ void Resource::cancel() {
 		_object->_status = Type::Resource::FAILED;
 		// Tell the receiver we gave up so it can drop its inbound state
 		// (upstream cancel: RESOURCE_ICL from the initiator).
-		if (_object->_outbound) {
+		//
+		// ONLY WHILE THERE IS A LINK TO SAY IT OVER. The commonest reason to
+		// cancel is that the link just went away, and Link::link_closed()
+		// cancels every resource on it — at which point the status is already
+		// CLOSED, Packet::send() refuses to transmit, and the throw escapes
+		// link_closed() half way through its teardown, leaving the remaining
+		// resources uncancelled, the channel unshut and the keys in memory.
+		// There is also nobody listening: the peer tore the link down, which
+		// is how it already knows.
+		if (_object->_outbound && _object->_link &&
+		    _object->_link.status() == Type::Link::ACTIVE) {
 			Packet cancel_packet(_object->_link, Bytes(_object->_resource_hash, 32),
 			                     Type::Packet::DATA, Type::Packet::RESOURCE_ICL);
 			cancel_packet.send();

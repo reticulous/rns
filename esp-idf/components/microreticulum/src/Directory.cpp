@@ -631,6 +631,26 @@ bool rdirClearRoute(const uint8_t dest[RDIR_DEST_LEN]) {
     return true;
 }
 
+size_t rdirClearAllRoutes(void) {
+    if (!s_ready) return 0;
+    size_t n = 0;
+    for (uint16_t i = 0; i < s_dir_slots; i++) {
+        rdir_dir_rec_t* r = &s_dir[i];
+        if (!(r->flags & RDIR_F_USED)) continue;
+        if (!(r->flags & RDIR_F_ROUTE)) continue;
+        writeBegin(r);
+        memset(r->received_from, 0, RDIR_DEST_LEN);
+        memset(r->iface_hash,    0, RDIR_DEST_LEN);
+        r->flags &= (uint8_t)~RDIR_F_ROUTE;
+        r->expires   = 0;
+        r->last_used = 0;
+        r->hops      = 0;
+        writeEnd(r);
+        n++;
+    }
+    return n;
+}
+
 bool rdirForget(const uint8_t dest[RDIR_DEST_LEN]) {
     if (!s_ready) return false;
     uint8_t* blob = blobFind(dest);
