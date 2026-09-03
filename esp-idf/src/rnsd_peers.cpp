@@ -29,8 +29,6 @@
 #include <ctime>
 #include <mutex>
 
-static const char* TAG = "rnsd";
-
 /* One table for the whole node, not one per interface: a peer is looked up by
  * (interface, destination) and the media between them hold a handful each. 32
  * slots is a LoRa neighbourhood plus every connection a small node carries;

@@ -522,13 +522,19 @@ constexpr uint16_t LXMF_LINK_INBOX_PORT        = 100;  /* inbound Link forwards 
  *  shares, which is why it may not carry one consumer's name. */
 constexpr uint16_t RNSD_LINK_RESOURCE_AUX_PORT = 101;
 
-/* ---- netgraph task ports ---- */
+/* ---- netgraph task ports ----
+ *
+ * netgraph is its own straddle and an optional one, so a build may hold no
+ * listener for either of these. They are declared here regardless, with every
+ * other consumer's, because rnsd is what dispatches on a port number and the
+ * registry it dispatches from must be whole. */
 
 /** Inbound netgraph sync Channels. netgraph hosts the node's
  *  `netgraph.discovery` destination and calls rnsdDestListenChannels() on it,
  *  so rnsd back-connects each accepted Channel here with an
  *  `rnsd_link_incoming_t`. The handle then carries the DIGEST / WANT /
- *  RECORD_PART / DONE messages of the record exchange (netgraph.h). */
+ *  RECORD_PART / DONE messages of the record exchange (netgraph's own
+ *  netgraph.h). */
 constexpr uint16_t NETGRAPH_SYNC_PORT = 140;
 /** Where rnsd hands netgraph the answer to a remote-management request — the
  *  crawl's `/path` and `/status` responses. Aux-only, like nomad's. */

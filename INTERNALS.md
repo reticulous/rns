@@ -854,7 +854,7 @@ our-dest opening or closing, the probe dial either way), because its callers are
 on other tasks and `our_dest_t` holds `RNS::Destination` and `RNS::Bytes` that
 only the rnsd task may touch. It exists because a peer's report of a link names
 the *destination* it heard, so joining that report to a node means asking each
-node which destinations are its own — see the netgraph section of the README.
+node which destinations are its own — see [netgraph](../netgraph/README.md).
 
 **Concurrent path searches with backpressure.** Each in-flight `OUT_PACKET` that
 lacks a path occupies one slot in a per-connection pending table. While the path
@@ -1490,17 +1490,16 @@ per destination.
 - **The remote-management handlers run inline on the rnsd task**, inside
   `Link::handle_request`: µR's response generator returns synchronously and
   there is nowhere to defer to. That is why they live in `rnsd.cpp` rather than
-  in netgraph, which supplies only the policy — whether to serve, and who may
-  ask. `rnsdRemoteManagementAllow` re-registers the handlers, because each holds
-  a *copy* of the allow list.
+  in [netgraph](../netgraph), which supplies only the policy — whether to serve,
+  and who may ask, and which is a straddle a build may not even have.
+  `rnsdRemoteManagementAllow` re-registers the handlers, because each holds a
+  *copy* of the allow list.
 
 ## 9. Browser UI
 
 The shared RNS UI lives in this straddle: `modules/rnsd.ts` (Pinia store +
 `rnsd:1` DataChannel exposing the directory, identity, and announces),
-`panels/NodesWindow.vue` (live nodes), `panels/NetGraphWindow.vue` (the
-community's graph — a pure renderer over the `netgraph.*` rows the device
-resolves; it joins nothing) and `panels/MapWindow.vue` (map of
+`panels/NodesWindow.vue` (live nodes) and `panels/MapWindow.vue` (map of
 GPS-announcing peers). The rows on the Settings → Reticulum Mesh page itself
 are generated from the `settings:` block in [`straddle.yaml`](straddle.yaml), so
 there is no hand-written pane. Interface-specific UI is **not** here — each interface
@@ -1557,17 +1556,12 @@ written record of the app_data dialects, hence its place here.
 
 ## 12. Testing
 
-**Host-side, no device:** `make -C esp-idf/test` builds and runs
-`netgraph_record_test`, which includes `netgraph.cpp` whole (its builder,
-encoder and resolver are in an anonymous namespace, which is right), stubs the
-platform just far enough to link, and writes rnsd's tables as data. The record
-and the resolve are exactly the part a device cannot show you: a node that draws
-circles and no lines says nothing about whether the builder emitted no cells,
-the encoder mislaid them, or the resolver failed to join them. The Makefile
-copies the *real* `MsgPack.h` in beside the stub `Bytes.h` rather than reaching
-for it over an `-I`, because its own `#include "Bytes.h"` would otherwise find
-microreticulum's and drag in the ESP-IDF allocator; the copy is refreshed every
-build, so it is the shipping file and not a fork of it.
+**Host-side, no device:** this straddle carries no host test of its own. The one
+that exercises rnsd's table shapes lives in [netgraph](../netgraph) —
+`make -C ../netgraph/esp-idf/test` — because what it tests is the record built
+over those tables. It compiles against the *real* `rnsd.h` and the real
+`MsgPack.h` from this straddle, so a change to either shape breaks it: treat a
+failure there as a signal about a change here.
 
 Because µR's wire is kept byte-identical to upstream RNS, the fastest way to
 exercise Links, Channels, and rnsh end-to-end is against a **host-side reference

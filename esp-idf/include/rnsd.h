@@ -579,6 +579,17 @@ int rnsdNodesForEach(const char* iface_prefix,
  *  a medium whose peers are nodes. */
 int rnsdNodesCount(const char* iface_prefix);
 
+/** The registered interface table, in registration order. `radius` is the
+ *  interface's community radius, which is what decides whether it has a
+ *  neighbourhood at all.
+ *
+ *  Lock-free, single-writer: the table is only ever written on the rnsd task,
+ *  and this reads it in place. Off that task it is therefore ADVISORY — a name
+ *  read while a slot is being recycled can be torn, and the answer is right
+ *  again the next time it is asked. Fine for a listing or for composing a
+ *  network-graph record; never state to act on. */
+void rnsdIfaceWalk(void (*cb)(const char* name, uint8_t radius, void* ctx), void* ctx);
+
 /** Print the neighbourhood — the body of every interface's `n[eighbors]` verb,
  *  written once here so every medium answers in one format. `title` is what the
  *  medium is called in an operator's terms ("Bluetooth", "TCP"): the interface
