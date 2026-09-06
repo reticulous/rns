@@ -514,8 +514,8 @@ TRACE("***** Accepting link request");
 	}
 }
 
-void Destination::enable_ratchets(const std::vector<Bytes>& privs,
-                                  std::function<void(const std::vector<Bytes>&)> persist /*= nullptr*/) {
+void Destination::enable_ratchets(const std::vector<Bytes>& privs, double latest_time,
+                                  std::function<void(const std::vector<Bytes>&, double)> persist /*= nullptr*/) {
 	assert(_object);
 	if (_object->_type != SINGLE) {
 		WARNINGF("Destination::enable_ratchets: %s is not a SINGLE destination, ignored", toString().c_str());
@@ -529,18 +529,18 @@ void Destination::enable_ratchets(const std::vector<Bytes>& privs,
 	}
 	_object->_ratchet_persist    = persist;
 	_object->_ratchets_enabled   = true;
-	/* Loaded ratchets carry no rotation time — treating them as freshly
-	 * rotated would hold the current one for a whole interval past every
-	 * reboot, so instead the next announce rotates and the loaded set stays
-	 * available for decrypting what is already in flight. */
-	_object->_latest_ratchet_time = 0;
+	/* The loaded rotation time paces the next rotation exactly as if the
+	 * process had never stopped; a fresh set (no privs) rotates on the first
+	 * announce regardless, and rotate_ratchets() holds against a time ahead
+	 * of the clock rather than treating it as expired. */
+	_object->_latest_ratchet_time = _object->_ratchets.empty() ? 0 : latest_time;
 	/* Cached path responses predate the setting change and would go out with
 	 * the wrong context flag. */
 	_object->_path_responses.clear();
 	/* Info, not debug: which destinations advertise a rotating key is a
 	 * security property of the node, and it is a handful of lines at boot. */
-	INFOF("Destination::enable_ratchets: %s enabled with %u retained ratchet(s)",
-	      toString().c_str(), (unsigned)_object->_ratchets.size());
+	INFOF("Destination::enable_ratchets: %s enabled with %u retained ratchet(s), last rotated %.0f",
+	      toString().c_str(), (unsigned)_object->_ratchets.size(), _object->_latest_ratchet_time);
 }
 
 void Destination::disable_ratchets() {
@@ -555,6 +555,10 @@ void Destination::disable_ratchets() {
 bool Destination::rotate_ratchets() {
 	assert(_object);
 	if (!_object->_ratchets_enabled) return false;
+	/* A held rotation time ahead of `now` is a clock still on the pre-sync
+	 * epoch after a reboot, and this comparison holds the loaded ratchet until
+	 * the clock catches up — a late rotation costs nothing, an early one drops
+	 * every message encrypted to the key it retired. */
 	double now = Utilities::OS::time();
 	if (!_object->_ratchets.empty() &&
 	    now < _object->_latest_ratchet_time + (double)Type::Destination::RATCHET_INTERVAL) {
@@ -579,7 +583,7 @@ bool Destination::rotate_ratchets() {
 	      toString().c_str(),
 	      Identity::ratchet_id(Identity::ratchet_public_bytes(ratchet)).toHex().c_str(),
 	      (unsigned)_object->_ratchets.size());
-	if (_object->_ratchet_persist) _object->_ratchet_persist(_object->_ratchets);
+	if (_object->_ratchet_persist) _object->_ratchet_persist(_object->_ratchets, now);
 	return true;
 }
 

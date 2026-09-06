@@ -557,25 +557,6 @@ void Packet::prove(const Destination& destination /*= {Type::NONE}*/) {
 	}
 }
 
-void Packet::prove_report(const Destination& destination /*= {Type::NONE}*/) {
-	assert(_object);
-	TRACE("Packet::prove_report: proving packet with rx-report...");
-	if (_object->_fromPacked && _object->_destination) {
-		if (_object->_destination.identity() && _object->_destination.identity().prv()) {
-			_object->_destination.identity().prove(*this, destination, /*report_signal=*/true);
-		}
-	}
-	else if (_object->_fromPacked && _object->_link) {
-		// Link proofs use LRPROOF framing; the rx-report append isn't wired for
-		// them, so fall back to a plain link proof.
-		_object->_link.prove_packet(*this);
-	}
-	else {
-		ERROR("Could not prove packet associated with neither a destination nor a link");
-	}
-}
-
-
 // Generates a special destination that allows Reticulum
 // to direct the proof back to the proved packet's sender
 ProofDestination Packet::generate_proof_destination() const {
@@ -883,30 +864,6 @@ bool PacketReceipt::validate_proof_packet(const Packet& proof_packet) {
 		_object->_hops = proof_packet.hops();
 		_object->_rssi = proof_packet.rssi();
 		_object->_snr  = proof_packet.snr();
-		// Our own antenna tx power on the interface the proof came back on — the
-		// radio that sent the packet this proof concludes. Paired with the
-		// prover's reported rssi below it gives the us→them path loss, as the
-		// prover's reported tx power paired with _rssi gives them→us.
-		_object->_local_txp = proof_packet.receiving_interface()
-		                    ? proof_packet.receiving_interface().tx_power_dbm() : INT8_MIN;
-		// Reticulous rx-report trailer: a proof followed by 5 bytes (int16 rssi
-		// dBm | int16 snr×10 | int8 tx power dBm, big-endian) — the prover's own
-		// rx of the packet we sent, and the power it transmits at. Decode as the
-		// REMOTE reading, independent of whether the receipt is still pending (so
-		// it survives the vanilla/extended proof race). The proof body is
-		// IMPL_LENGTH (sig only — the default, should_use_implicit_proof) or
-		// EXPL_LENGTH (hash+sig).
-		const Bytes& d = proof_packet.data();
-		size_t base = (d.size() == IMPL_LENGTH + 5) ? IMPL_LENGTH
-		            : (d.size() == EXPL_LENGTH + 5) ? EXPL_LENGTH : 0;
-		if (base > 0) {
-			const uint8_t* p = d.data() + base;
-			int16_t r = (int16_t)(((uint16_t)p[0] << 8) | p[1]);
-			int16_t s = (int16_t)(((uint16_t)p[2] << 8) | p[3]);
-			_object->_remote_rssi = (float)r;
-			_object->_remote_snr  = s / 10.0f;
-			_object->_remote_txp  = (int)(int8_t)p[4];
-		}
 	}
 	if (proof_packet.link()) {
 		return validate_link_proof(proof_packet.data(), proof_packet.link(), proof_packet);
@@ -997,12 +954,7 @@ bool PacketReceipt::validate_proof(const Bytes& proof, const Packet& proof_packe
 	TRACE("PacketReceipt::validate_proof: validating proof...");
 	// CBA LINK
 	// CBA TODO: Determine whether to use destination.identity or link.identity here!!!
-	// EXPL_LENGTH + 5 is a reticulous rx-report proof (explicit proof + trailing
-	// signal + tx power). The hash+sig are the first EXPL_LENGTH bytes and the
-	// signature covers only the hash, so the trailer is inert to validation here
-	// (it's decoded in validate_proof_packet). Accept it exactly like a plain
-	// explicit.
-	if (proof.size() == EXPL_LENGTH || proof.size() == EXPL_LENGTH + 5) {
+	if (proof.size() == EXPL_LENGTH) {
 		// This is an explicit proof
 		Bytes proof_hash = proof.left(Type::Identity::HASHLENGTH/8);
 		Bytes signature = proof.mid(Type::Identity::HASHLENGTH/8, Type::Identity::SIGLENGTH/8);
@@ -1039,11 +991,8 @@ bool PacketReceipt::validate_proof(const Bytes& proof, const Packet& proof_packe
 			return false;
 		}
 	}
-	else if (proof.size() == IMPL_LENGTH || proof.size() == IMPL_LENGTH + 5) {
-		// This is an implicit proof (the default). IMPL_LENGTH + 5 is a reticulous
-		// rx-report proof: the signature is the first IMPL_LENGTH bytes and the
-		// trailing 5 signal bytes are inert to validation (decoded separately in
-		// validate_proof_packet), so accept it exactly like a plain implicit proof.
+	else if (proof.size() == IMPL_LENGTH) {
+		// This is an implicit proof (the default).
 		if (!_object->_destination.identity()) {
 			return false;
 		}

@@ -228,15 +228,25 @@ namespace RNS {
 			RATCHET_INTERVAL, and makes decrypt() try every retained ratchet
 			before the identity key.
 
-			`privs` are our own ratchet PRIVATE keys, newest first, as loaded
-			from wherever the embedder keeps them; empty starts a fresh set.
-			mR has no storage of its own, so `persist` is called with the new
-			set on every rotation and the embedder writes it back — a ratchet
-			that does not survive a reboot black-holes every message already
-			in flight to it.
+			`privs` are our own ratchet PRIVATE keys, newest first, and
+			`latest_time` the OS::time() of the rotation that made privs[0],
+			both as loaded from wherever the embedder keeps them; empty privs
+			start a fresh set. mR has no storage of its own, so `persist` is
+			called with the new set and its rotation time on every rotation
+			and the embedder writes both back — a ratchet that does not
+			survive a reboot black-holes every message already in flight to
+			it, and a rotation time that does not survive one makes every
+			reboot rotate, which shrinks the retained window to
+			RATCHET_COUNT reboots.
+
+			A `latest_time` ahead of the clock holds the loaded ratchet
+			until the clock catches up: that is a boot on the pre-sync epoch,
+			and a late rotation loses nothing where an early one loses mail.
+			An embedder with no valid clock at rotation time should persist
+			0 rather than its uptime.
 		*/
-		void enable_ratchets(const std::vector<Bytes>& privs,
-		                     std::function<void(const std::vector<Bytes>&)> persist = nullptr);
+		void enable_ratchets(const std::vector<Bytes>& privs, double latest_time,
+		                     std::function<void(const std::vector<Bytes>&, double)> persist = nullptr);
 		void disable_ratchets();
 		/* Generates a ratchet if the interval has elapsed (or none is held),
 		   persists, and reports whether the set changed. announce() calls this
@@ -313,7 +323,7 @@ namespace RNS {
 			bool _ratchets_enabled = false;
 			std::vector<Bytes> _ratchets;
 			double _latest_ratchet_time = 0;
-			std::function<void(const std::vector<Bytes>&)> _ratchet_persist;
+			std::function<void(const std::vector<Bytes>&, double)> _ratchet_persist;
 
 			// CBA TODO when is _default_app_data a "callable"?
 			Bytes _default_app_data;

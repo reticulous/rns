@@ -219,11 +219,6 @@ typedef struct {
     uint32_t len;
     uint32_t opaque_id;                /* OUTBOUND_DONE correlation */
     uint8_t  flags;                    /* bit0 compressed, bit1 has_metadata */
-    int16_t  rssi;                     /* INBOUND_DONE: link radio RSSI dBm (last part);
-                                          INT16_MIN = no radio metric */
-    int16_t  snr;                      /* INBOUND_DONE: link radio SNR dB*10 */
-    char     iface[24];                /* INBOUND_DONE: receiving interface raw name; '' = unknown */
-    uint8_t  reserved[5];
 } rnsd_link_resource_done_t;
 static_assert(sizeof(rnsd_link_resource_done_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_resource_done_t must fit ITS_MAX_MSG_DATA");
@@ -300,21 +295,6 @@ typedef struct {
                                4-byte signal header int16 rssi_dBm | int16 snr_dB*10
                                (both BE, INT16_MIN = absent). Set by radio ifaces
                                (LoRa) that measure per-packet RSSI/SNR. */
-    uint8_t  tx_power_known; /* 1 => tx_power_dbm below is meaningful. Zero-init
-                               means "this interface has no notion of transmit
-                               power", which is the right reading for anything
-                               that isn't a radio and for a straddle predating
-                               the field. */
-    int8_t   tx_power_dbm;  /* Antenna transmit power in dBm, as configured. Read
-                               only when tx_power_known. rnsd hands it to mR so
-                               the rx-report proof can state the power that
-                               produced the signal the peer measures — the other
-                               half of a path loss. A radio that adapts its power
-                               per peer reports its configured ceiling here; the
-                               figure is a readout for the operator, not a term
-                               in any control loop. Re-registration is what
-                               refreshes it, which is what a config change
-                               already does. */
     uint8_t  rx_origin;     /* 1 => this interface carries SEVERAL peers under one
                                registration and names them itself: each inbound
                                data frame is prefixed with a 16-byte ORIGIN KEY

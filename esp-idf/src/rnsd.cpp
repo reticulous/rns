@@ -809,10 +809,6 @@ static int onTransportConnect(int handle, const void* data, size_t len)
     std::shared_ptr<RNS::InterfaceImpl> impl =
         std::make_shared<TaskInterface>(slot->info, handle);
     slot->mr_iface = RNS::Interface(impl);
-    /* Antenna transmit power, for the rx-report proof to state alongside the
-     * signal a peer measures. INT8_MIN when this interface has no such notion. */
-    slot->mr_iface.tx_power_dbm(slot->info.tx_power_known
-                                ? (int)slot->info.tx_power_dbm : INT8_MIN);
     /* Apply IFAC (Interface Access Codes) before registering, so the very
      * first packet on this iface is access-coded. No-op when both strings
      * are empty (open interface). */
@@ -1184,8 +1180,7 @@ static inline void rnsdPacketSignal(const RNS::Packet& p, int16_t& rssi, int16_t
 
 /* "Network infrastructure signal level": the received signal quality for the
  * transport node that last relayed a packet to us. Published as rnsd.gw.rssi
- * (dBm, int) and rnsd.gw.snr (dB, one decimal) — same string encoding as the
- * per-message lxmf.msgmeta signal — for a packet that (a) arrived on a
+ * (dBm, int) and rnsd.gw.snr (dB, one decimal) as text — for a packet that (a) arrived on a
  * signal-capable interface (rssi present) and (b) transited at least one
  * transport node. Fed centrally (onInboundPacketFilter, for anything addressed
  * to one of our destinations or links — data, link setup, resource, at every
@@ -1215,16 +1210,11 @@ static void rnsdPublishGwSignal(const RNS::Packet& packet)
     rnsdPublishGwSignalRaw(packet.hops(), packet.rssi(), packet.snr());
 }
 
+/* OUT_RESULT: opcode | send_id(2) | status(1) | rtt_ms(4 BE) | hops(1). */
 static void ourDestSendOutResult(our_dest_t& c, uint16_t send_id,
-                                 uint8_t status, uint32_t rtt_ms, uint8_t hops,
-                                 const uint8_t* first_hop = nullptr,
-                                 const char* iface = nullptr,
-                                 bool has_signal = false,
-                                 int16_t local_rssi = INT16_MIN, int16_t local_snr = 0,
-                                 int16_t remote_rssi = INT16_MIN, int16_t remote_snr = 0,
-                                 int8_t local_txp = INT8_MIN, int8_t remote_txp = INT8_MIN)
+                                 uint8_t status, uint32_t rtt_ms, uint8_t hops)
 {
-    uint8_t f[9 + RNSD_DEST_HASH_LEN + 1 + 24 + 10];  /* +10 = optional signal trailer */
+    uint8_t f[9];
     f[0] = RNSD_DEST_OUT_RESULT;
     f[1] = (uint8_t)(send_id >> 8);
     f[2] = (uint8_t)(send_id & 0xFF);
@@ -1234,84 +1224,8 @@ static void ourDestSendOutResult(our_dest_t& c, uint16_t send_id,
     f[6] = (uint8_t)((rtt_ms >>  8) & 0xFF);
     f[7] = (uint8_t)( rtt_ms        & 0xFF);
     f[8] = hops;
-    size_t len = 9;
-    if (first_hop || iface) {
-        if (first_hop) memcpy(f + len, first_hop, RNSD_DEST_HASH_LEN);
-        else           memset(f + len, 0,         RNSD_DEST_HASH_LEN);
-        len += RNSD_DEST_HASH_LEN;
-        size_t ilen = iface ? strnlen(iface, 24) : 0;
-        f[len++] = (uint8_t)ilen;
-        memcpy(f + len, iface, ilen);
-        len += ilen;
-    }
-    /* Optional signal trailer (the DELIVERED result): local(2+2) | remote(2+2) |
-     * local_txp(1) | remote_txp(1). The rssi/snr pairs are int16 BE — rssi in dBm
-     * (INT16_MIN = absent), snr in dB×10; the tx powers are int8 dBm at the
-     * antenna (INT8_MIN = unknown). `local` is our rx of the proof packet and our
-     * own tx power on the radio it came back by; `remote` is the peer's rx of our
-     * message and its tx power, both from the rx-report proof. Each side's tx
-     * power pairs with the OTHER side's rssi to give that direction's path loss.
-     * The consumer parses this by status, so it never collides with the
-     * first_hop/iface trailer carried on the SENT result. Fixed width: an
-     * unknown figure is INT8_MIN / INT16_MIN, never an absent field. */
-    if (has_signal) {
-        f[len++] = (uint8_t)((uint16_t)local_rssi  >> 8); f[len++] = (uint8_t)local_rssi;
-        f[len++] = (uint8_t)((uint16_t)local_snr   >> 8); f[len++] = (uint8_t)local_snr;
-        f[len++] = (uint8_t)((uint16_t)remote_rssi >> 8); f[len++] = (uint8_t)remote_rssi;
-        f[len++] = (uint8_t)((uint16_t)remote_snr  >> 8); f[len++] = (uint8_t)remote_snr;
-        f[len++] = (uint8_t)local_txp;
-        f[len++] = (uint8_t)remote_txp;
-    }
-    if (itsSend(c.handle, f, len, pdMS_TO_TICKS(100)) == 0)
+    if (itsSend(c.handle, f, sizeof(f), pdMS_TO_TICKS(100)) == 0)
         warn("our-dest: OUT_RESULT send dropped (send_id=%u)", (unsigned)send_id);
-}
-
-/* ─────────────── rx-signal-report capability ───────────────
- *
- * Per-peer flag keyed by the peer's LXMF dest hash (hex): does it accept the
- * extended (rx-report) delivery proof? Set from that peer's announce (LXMF caps
- * bit1) via rnsdSetRxReportCap — lxmf parses announces, rnsd emits proofs. We
- * emit an extended proof only to a peer known capable; a vanilla peer would
- * length-reject it, so it always gets the plain proof. RAM-only, reset on
- * reboot, refreshed by the next announce. Guarded by s_peer_caps_mtx: the
- * setter runs on lxmf's task, the reader (proveInboundWithReport) on rnsd's. */
-static std::mutex s_peer_caps_mtx;
-static std::map<std::string, bool> s_peer_caps;
-
-static bool peerAcceptsRxReport(const std::string& peer_hex)
-{
-    std::lock_guard<std::mutex> lk(s_peer_caps_mtx);
-    auto it = s_peer_caps.find(peer_hex);
-    return it != s_peer_caps.end() && it->second;
-}
-
-void rnsdSetRxReportCap(const uint8_t dest_hash[RNSD_DEST_HASH_LEN], bool capable)
-{
-    std::string key = RNS::Bytes(dest_hash, RNSD_DEST_HASH_LEN).toHex();
-    std::lock_guard<std::mutex> lk(s_peer_caps_mtx);
-    s_peer_caps[key] = capable;
-}
-
-bool rnsdGetRxReportCap(const uint8_t dest_hash[RNSD_DEST_HASH_LEN])
-{
-    return peerAcceptsRxReport(RNS::Bytes(dest_hash, RNSD_DEST_HASH_LEN).toHex());
-}
-
-/* Prove an inbound direct packet, appending our rx signal (Packet::prove_report)
- * only when the sender advertised the rx-report capability — so it learns how we
- * heard it without ever length-rejecting the proof. A plain proof otherwise: not
- * a direct radio rx (no signal to report), an unknown peer, or one that hasn't
- * advertised the capability. peer_hex is the sender's LXMF dest hash (first 16
- * bytes of the decrypted plaintext). hops<=1 is a direct rx (Transport
- * increments hops on receive). */
-static void proveInboundWithReport(RNS::Packet& packet, const std::string& peer_hex)
-{
-    bool direct = packet.hops() <= 1;
-    bool radio  = !RNS::Type::isNan(packet.rssi());
-    if (direct && radio && !peer_hex.empty() && peerAcceptsRxReport(peer_hex))
-        packet.prove_report();               /* extended */
-    else
-        packet.prove();                      /* plain */
 }
 
 static void ourDestSendOutStatusBare(our_dest_t& c, uint16_t send_id, uint8_t type)
@@ -1435,11 +1349,7 @@ static void ourDestReceiptFree(our_dest_receipt_t& r)
 /* Free the slot, then emit the second OUT_RESULT iff the conn slot still
  * belongs to the consumer that sent (guards conn-slot reuse). */
 static void ourDestReceiptSettle(our_dest_receipt_t& r, uint8_t status,
-                                 uint32_t rtt_ms,
-                                 bool has_signal = false,
-                                 int16_t local_rssi = INT16_MIN, int16_t local_snr = 0,
-                                 int16_t remote_rssi = INT16_MIN, int16_t remote_snr = 0,
-                                 int8_t local_txp = INT8_MIN, int8_t remote_txp = INT8_MIN)
+                                 uint32_t rtt_ms)
 {
     int      conn_idx    = r.conn_idx;
     int      conn_handle = r.conn_handle;
@@ -1448,9 +1358,7 @@ static void ourDestReceiptSettle(our_dest_receipt_t& r, uint8_t status,
     ourDestReceiptFree(r);
     our_dest_t& c = s_our_dests[conn_idx];
     if (c.used && c.handle == conn_handle)
-        ourDestSendOutResult(c, send_id, status, rtt_ms, hops, nullptr, nullptr,
-                             has_signal, local_rssi, local_snr, remote_rssi, remote_snr,
-                             local_txp, remote_txp);
+        ourDestSendOutResult(c, send_id, status, rtt_ms, hops);
 }
 
 /* mR delivery callback — runs on the rnsd task during Transport proof
@@ -1471,25 +1379,7 @@ static void onOurDestReceiptDelivery(const RNS::PacketReceipt& receipt)
          * rssi/snr/hops onto the receipt). This lands the gw reading on the proof,
          * a beat before the echo reply arrives. */
         rnsdPublishGwSignalRaw(receipt.hops(), receipt.rssi(), receipt.snr());
-        /* Encode the proof's own rx signal (local: our rx of the proof packet)
-         * and, from an rx-report proof, the remote signal (the peer's rx of the
-         * message we sent) for the DELIVERED result → lxmf attaches both to the
-         * outbound message. We accept and process an rx report from any peer;
-         * whether WE emit one back is gated separately on the peer's advertised
-         * capability (rnsdSetRxReportCap), not inferred here. */
-        int16_t lr, ls, rr, rs;
-        rnsdSignalToInt16(receipt.rssi(),        receipt.snr(),        lr, ls);
-        rnsdSignalToInt16(receipt.remote_rssi(), receipt.remote_snr(), rr, rs);
-        /* Antenna tx powers alongside: ours on the radio the proof came back by,
-         * the peer's from its rx report. Each is the counterpart of the
-         * OTHER end's rssi above, which is what makes the pair a path loss. */
-        auto clampTxp = [](int v) -> int8_t {
-            return (v < INT8_MIN || v > INT8_MAX) ? (int8_t)INT8_MIN : (int8_t)v; };
-        int8_t ltx = clampTxp(receipt.local_txp());
-        int8_t rtx = clampTxp(receipt.remote_txp());
-        bool has_signal = (lr != INT16_MIN) || (rr != INT16_MIN);
-        ourDestReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED, rtt_ms,
-                             has_signal, lr, ls, rr, rs, ltx, rtx);
+        ourDestReceiptSettle(r, RNSD_DEST_STATUS_DELIVERED, rtt_ms);
         return;
     }
 }
@@ -1671,18 +1561,12 @@ static int ourDestTrySend(our_dest_t& c, uint16_t send_id,
             return -1;
         }
         ourDestSendOutStatusBare(c, send_id, RNSD_DEST_AUX_EGRESS_QUEUED);
-        /* Routing telemetry for the msgmeta store: outgoing interface + RNS
-         * next-hop transport node (empty when the dest is a direct neighbour). */
         RNS::Interface oif = RNS::Transport::next_hop_interface(dh);
-        RNS::Bytes     nh  = RNS::Transport::next_hop(dh);
-        std::string    ifn = oif ? ifaceShortName(oif.toString()) : std::string();
-        const uint8_t* fh  = (nh.size() == RNSD_DEST_HASH_LEN) ? nh.data() : nullptr;
         /* Egress accepted → SENT immediately (the UI's fast grey check).
          * Upstream peers prove opportunistic packets, so keep the receipt
          * and follow up with a second OUT_RESULT — DELIVERED when the
          * proof lands, PROOF_TIMEOUT otherwise. */
-        ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_SENT, 0, hops,
-                             fh, ifn.empty() ? nullptr : ifn.c_str());
+        ourDestSendOutResult(c, send_id, RNSD_DEST_STATUS_SENT, 0, hops);
         ourDestReceiptTrack(c, send_id, receipt, hops);
         info("our-dest: send_id=%u sent to %s via %s (hops=%u, %zuB payload)",
              (unsigned)send_id, dh.toHex().c_str(),
@@ -1721,42 +1605,21 @@ static void onOurDestInbound(const RNS::Bytes& plaintext, const RNS::Packet& pac
      * destination hash; reconstruct the full LXM wire by prepending our
      * own destination hash (the IN destination that received this packet)
      * before handing off to the consumer. Symmetric with the strip done
-     * in ourDestTrySend. See LXMF LXMRouter.delivery_packet(). */
-    /* Routing telemetry prepended ahead of the reconstructed LXM wire:
-     * hops(1) | rssi(2 BE) | snr(2 BE) | first_hop(16) | iface_len(1) |
-     * iface[iface_len]. `first_hop` is the RNS transport-node this packet last
-     * transited (all-zero = received direct); `iface` is the receiving
-     * interface's raw mR name. rssi/snr are the radio signal telemetry
-     * (INT16_MIN rssi = none — non-radio iface); snr is dB*10. */
-    std::string ifn = packet.receiving_interface()
-                    ? ifaceShortName(packet.receiving_interface().toString()) : std::string();
-    size_t ilen = ifn.size() > 24 ? 24 : ifn.size();
-    /* Radio signal now rides the decoded packet (Transport::inbound copies it
-     * from the receiving interface). INT16_MIN rssi = no metric. */
-    int16_t rssi, snr;
-    rnsdPacketSignal(packet, rssi, snr);
-    size_t meta = 1 + 2 + 2 + RNSD_DEST_HASH_LEN + 1 + ilen;
-    if (meta + 16 + plaintext.size() > RNSD_OUR_DEST_INBOUND_MAX) {
+     * in ourDestTrySend. See LXMF LXMRouter.delivery_packet().
+     * IN_PACKET: opcode | dest(16) | plaintext. */
+    if (1 + 16 + plaintext.size() > RNSD_OUR_DEST_INBOUND_MAX) {
         warn("our-dest inbound: oversize plaintext %zu B (dropping)", plaintext.size());
         return;
     }
-    info("our-dest inbound: %zuB for dest %s → handle=%d (hops=%u via %s rssi=%d)",
+    std::string ifn = packet.receiving_interface()
+                    ? ifaceShortName(packet.receiving_interface().toString()) : std::string();
+    info("our-dest inbound: %zuB for dest %s → handle=%d (hops=%u via %s)",
          plaintext.size(), packet.destination().hash().toHex().c_str(), c->handle,
-         (unsigned)packet.hops(), ifn.empty() ? "?" : ifn.c_str(),
-         rssi == INT16_MIN ? 0 : (int)rssi);
+         (unsigned)packet.hops(), ifn.empty() ? "?" : ifn.c_str());
     rnsdDbgMsgContent("recv", plaintext.data(), plaintext.size());
     uint8_t f[RNSD_OUR_DEST_INBOUND_MAX];
     size_t  o = 0;
     f[o++] = RNSD_DEST_IN_PACKET;
-    f[o++] = packet.hops();
-    f[o++] = (uint8_t)((uint16_t)rssi >> 8); f[o++] = (uint8_t)rssi;
-    f[o++] = (uint8_t)((uint16_t)snr  >> 8); f[o++] = (uint8_t)snr;
-    const RNS::Bytes& tid = packet.transport_id();
-    if (tid.size() == RNSD_DEST_HASH_LEN) memcpy(f + o, tid.data(), RNSD_DEST_HASH_LEN);
-    else                                  memset(f + o, 0,          RNSD_DEST_HASH_LEN);
-    o += RNSD_DEST_HASH_LEN;
-    f[o++] = (uint8_t)ilen;
-    memcpy(f + o, ifn.data(), ilen);       o += ilen;
     memcpy(f + o, packet.destination().hash().data(), 16);   o += 16;
     memcpy(f + o, plaintext.data(), plaintext.size());       o += plaintext.size();
     if (itsSend(c->handle, f, o, pdMS_TO_TICKS(100)) == 0) {
@@ -1767,14 +1630,8 @@ static void onOurDestInbound(const RNS::Bytes& plaintext, const RNS::Packet& pac
     }
     else if (s_prove_incoming) {
         /* Delivered to the consumer task → emit the delivery proof now, exactly
-         * where upstream LXMF proves (inside delivery_packet). For a direct radio
-         * rx we may append our rx signal so the sender learns how we heard them;
-         * the peer key is the sender's LXMF dest hash — the first 16 bytes of the
-         * decrypted plaintext (dest||src||… with the leading dest stripped on the
-         * wire, so plaintext starts at src). */
-        std::string peer_hex = plaintext.size() >= RNSD_DEST_HASH_LEN
-            ? RNS::Bytes(plaintext.data(), RNSD_DEST_HASH_LEN).toHex() : std::string();
-        proveInboundWithReport(const_cast<RNS::Packet&>(packet), peer_hex);
+         * where upstream LXMF proves (inside delivery_packet). */
+        const_cast<RNS::Packet&>(packet).prove();
     }
 }
 
@@ -1782,42 +1639,59 @@ static void onOurDestInbound(const RNS::Bytes& plaintext, const RNS::Packet& pac
  *
  * mR keeps a destination's ratchet private keys in RAM and calls back here to
  * persist them, because it has no storage of its own. They live under
- * `secrets.rnsd.ratchets.<dest_hex>` as newest-first hex — the same shelf as
- * the identity keys, never leaving the device — and are loaded before the
- * destination goes up so mail already in flight to a pre-reboot ratchet still
- * opens. See Type::Destination::RATCHET_COUNT for what the retained window
- * costs in both directions. */
+ * `secrets.rnsd.ratchets.<dest_hex>` as `<rotated_at> <hex>` — the epoch
+ * seconds of the last rotation, a space, then the privates newest-first — on
+ * the same shelf as the identity keys, never leaving the device. Both halves
+ * are loaded before the destination goes up: the keys so mail already in
+ * flight to a pre-reboot ratchet still opens, the time so a reboot does not
+ * count as a rotation — without it every boot would retire a ratchet and a
+ * node that boots often would keep a window of days rather than weeks.
+ * See Type::Destination::RATCHET_COUNT for what the retained window costs in
+ * both directions. */
 
 static std::string ourDestRatchetKey(const RNS::Bytes& dest_hash)
 {
     return std::string("secrets.rnsd.ratchets.") + dest_hash.toHex();
 }
 
-static std::vector<RNS::Bytes> ourDestRatchetsLoad(const RNS::Bytes& dest_hash)
+static std::vector<RNS::Bytes> ourDestRatchetsLoad(const RNS::Bytes& dest_hash,
+                                                   double& rotated_at)
 {
     std::vector<RNS::Bytes> privs;
-    std::string hex = storageGetStr(ourDestRatchetKey(dest_hash).c_str(), "");
+    rotated_at = 0;
+    std::string rec = storageGetStr(ourDestRatchetKey(dest_hash).c_str(), "");
+    if (rec.empty()) return privs;
     const size_t chars = RNSD_RATCHET_LEN * 2;
-    if (hex.size() % chars != 0) {
+    size_t sp = rec.find(' ');
+    if (sp == std::string::npos || (rec.size() - sp - 1) % chars != 0) {
         warn("ratchets for %s are malformed (%zu chars) — starting a fresh set",
-             dest_hash.toHex().c_str(), hex.size());
+             dest_hash.toHex().c_str(), rec.size());
         return privs;
     }
-    for (size_t i = 0; i + chars <= hex.size(); i += chars) {
+    rotated_at = (double)strtoull(rec.c_str(), nullptr, 10);
+    for (size_t i = sp + 1; i + chars <= rec.size(); i += chars) {
         RNS::Bytes prv;
-        prv.assignHex((const uint8_t*)hex.data() + i, chars);
+        prv.assignHex((const uint8_t*)rec.data() + i, chars);
         if (prv.size() == RNSD_RATCHET_LEN) privs.push_back(prv);
     }
     return privs;
 }
 
 static void ourDestRatchetsPersist(const RNS::Bytes& dest_hash,
-                                   const std::vector<RNS::Bytes>& privs)
+                                   const std::vector<RNS::Bytes>& privs,
+                                   double rotated_at)
 {
-    std::string hex;
-    hex.reserve(privs.size() * RNSD_RATCHET_LEN * 2);
-    for (const RNS::Bytes& prv : privs) hex += prv.toHex();
-    storageSet(ourDestRatchetKey(dest_hash).c_str(), hex.c_str());
+    /* A rotation made on the pre-sync epoch has no time worth keeping: uptime
+     * seconds read as 1970 and would only make the next boot rotate again.
+     * 0 tells the loaded set to rotate on the first announce with a real clock
+     * and to hold for one interval of uptime without one. */
+    if (!storageGetInt("sys.time.valid", 0)) rotated_at = 0;
+    char head[24];
+    snprintf(head, sizeof(head), "%llu ", (unsigned long long)rotated_at);
+    std::string rec(head);
+    rec.reserve(rec.size() + privs.size() * RNSD_RATCHET_LEN * 2);
+    for (const RNS::Bytes& prv : privs) rec += prv.toHex();
+    storageSet(ourDestRatchetKey(dest_hash).c_str(), rec.c_str());
 }
 
 /* The retained ratchet privates of a destination we host, for trial-decrypting
@@ -1918,9 +1792,11 @@ static int onOurDestConnect(int handle, const void* data, size_t len)
          * key after, so senders that heard no ratchet still reach us. */
         if (s_ratchets_enabled && dtype == RNS::Type::Destination::SINGLE) {
             RNS::Bytes dest_hash = d.hash();
-            d.enable_ratchets(ourDestRatchetsLoad(dest_hash),
-                              [dest_hash](const std::vector<RNS::Bytes>& privs) {
-                                  ourDestRatchetsPersist(dest_hash, privs);
+            double rotated_at = 0;
+            std::vector<RNS::Bytes> privs = ourDestRatchetsLoad(dest_hash, rotated_at);
+            d.enable_ratchets(privs, rotated_at,
+                              [dest_hash](const std::vector<RNS::Bytes>& set, double at) {
+                                  ourDestRatchetsPersist(dest_hash, set, at);
                               });
         }
         slot->listener_identity = id;
@@ -5772,33 +5648,11 @@ static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packe
              c->tag, plaintext.size());
         return;
     }
-    /* Packet-mode handle: one Link plaintext = one ITS packet. Prepend the
-     * inbound telemetry header (same layout as IN_PACKET minus the opcode:
-     * hops(1) | rssi(2 BE) | snr(2 BE) | first_hop(16) | iface_len(1) | iface[])
-     * so the consumer records routing + radio signal for DIRECT / backchannel
-     * messages, not just opportunistic ones. Drop on back-pressure (timeout 0)
-     * rather than stall rnsd. */
-    std::string ifn = packet.receiving_interface()
-                    ? ifaceShortName(packet.receiving_interface().toString()) : std::string();
-    size_t ilen = ifn.size() > 24 ? 24 : ifn.size();
-    int16_t rssi, snr;
-    rnsdPacketSignal(packet, rssi, snr);
-    const RNS::Bytes& tid = packet.transport_id();
-
-    PSRAM_BSS static uint8_t f[1 + 2 + 2 + RNSD_DEST_HASH_LEN + 1 + 24 + RNSD_OUR_DEST_INBOUND_MAX];
-    size_t o = 0;
-    f[o++] = packet.hops();
-    f[o++] = (uint8_t)((uint16_t)rssi >> 8); f[o++] = (uint8_t)rssi;
-    f[o++] = (uint8_t)((uint16_t)snr  >> 8); f[o++] = (uint8_t)snr;
-    if (tid.size() == RNSD_DEST_HASH_LEN) memcpy(f + o, tid.data(), RNSD_DEST_HASH_LEN);
-    else                                  memset(f + o, 0,          RNSD_DEST_HASH_LEN);
-    o += RNSD_DEST_HASH_LEN;
-    f[o++] = (uint8_t)ilen;
-    memcpy(f + o, ifn.data(), ilen); o += ilen;
+    /* Packet-mode handle: one Link plaintext = one ITS packet, the plaintext
+     * verbatim. Drop on back-pressure (timeout 0) rather than stall rnsd. */
     size_t body = plaintext.size();
-    if (o + body > sizeof(f)) body = sizeof(f) - o;   /* defensive */
-    memcpy(f + o, plaintext.data(), body); o += body;
-    size_t w = itsSend(c->handle, f, o, 0);
+    if (body > RNSD_OUR_DEST_INBOUND_MAX) body = RNSD_OUR_DEST_INBOUND_MAX;   /* defensive */
+    size_t w = itsSend(c->handle, plaintext.data(), body, 0);
     if (w == 0) {
         linkSetError(*c, "rx_overflow");
         warn("link[%s]: inbound pkt dropped, consumer rx overflow (%zuB) — NOT proved",
@@ -5874,17 +5728,6 @@ static void resSendAux(link_conn_t& c, uint8_t opcode,
     d.len       = len;
     d.opaque_id = c.res_opaque;
     d.flags     = flags;
-    /* Radio signal + interface of the last packet on this link, for the msgmeta
-     * store (INBOUND_DONE only — outbound/failed carry the absent sentinel). */
-    d.rssi = INT16_MIN; d.snr = 0;
-    if (opcode == RNSD_LINK_RESOURCE_INBOUND_DONE && c.link) {
-        rnsdSignalToInt16(c.link.rssi(), c.link.snr(), d.rssi, d.snr);
-        const RNS::Interface& lif = c.link.attached_interface();
-        if (lif) {
-            std::string ifn = ifaceShortName(lif.toString());
-            std::snprintf(d.iface, sizeof(d.iface), "%s", ifn.c_str());
-        }
-    }
     if (!itsSendAuxByTaskHandle(c.consumer_task, RNSD_LINK_RESOURCE_AUX_PORT,
                                 &d, sizeof(d), pdMS_TO_TICKS(2000))) {
         warn("link[%s]: resource aux send failed (op=%s)",
@@ -7895,9 +7738,11 @@ static void rnsdTaskMain(void*)
             if (c.listener_dest.type() != RNS::Type::Destination::SINGLE) continue;
             if (on) {
                 RNS::Bytes dest_hash = c.listener_hash;
-                c.listener_dest.enable_ratchets(ourDestRatchetsLoad(dest_hash),
-                                                [dest_hash](const std::vector<RNS::Bytes>& privs) {
-                                                    ourDestRatchetsPersist(dest_hash, privs);
+                double rotated_at = 0;
+                std::vector<RNS::Bytes> privs = ourDestRatchetsLoad(dest_hash, rotated_at);
+                c.listener_dest.enable_ratchets(privs, rotated_at,
+                                                [dest_hash](const std::vector<RNS::Bytes>& set, double at) {
+                                                    ourDestRatchetsPersist(dest_hash, set, at);
                                                 });
             }
             else c.listener_dest.disable_ratchets();

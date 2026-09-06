@@ -615,12 +615,14 @@ Single-shot debug triggers — write a value and rnsd consumes it on its own tas
 `secrets.rnsd.identity` — the 128-hex private key of rnsd's default identity
 (used by `rnprobe` and any consumer that passes `""` for `identity_key`).
 
-`secrets.rnsd.ratchets.<dest_hex>` — one per hosted destination: its retained
-ratchet private keys, newest first, as hex. Written on every rotation and read
-back before the destination goes up, because a ratchet that does not survive a
-reboot black-holes every message already in flight to it. Deleting one costs
-whatever was encrypted to those ratchets and nothing else — the destination
-generates a fresh set on its next announce.
+`secrets.rnsd.ratchets.<dest_hex>` — one per hosted destination: the epoch
+seconds of its last ratchet rotation, a space, then its retained ratchet
+private keys newest first as hex. Written on every rotation and read back
+before the destination goes up, because a ratchet that does not survive a
+reboot black-holes every message already in flight to it, and a rotation time
+that does not survive one turns every reboot into a rotation. Deleting one
+costs whatever was encrypted to those ratchets and nothing else — the
+destination generates a fresh set on its next announce.
 
 ## CLI
 

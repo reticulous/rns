@@ -166,22 +166,10 @@ Our deltas, by category:
   exists and verifies against the peer's link signing key, so the call is wired
   up. Without it a packet sent over a Link could never conclude its receipt
   (`DELIVERED`), which the per-link proof counters depend on.
-- `Packet.{h,cpp}`/`Identity.{h,cpp}` — **rx-signal report riding the delivery
-  proof** (the "extended proof"; see [rnsd §5.7](../../INTERNALS.md)). `Packet::
-  prove_report` / `Identity::prove(report_signal=true)` append the prover's own
-  rx signal and antenna tx power (`int16 rssi dBm | int16 snr×10 | int8 txpwr
-  dBm`, BE) after the proof data, outside the signature (which covers only the
-  packet hash). `validate_proof` accepts the trailing 5 bytes on both proof forms
-  — `IMPL_LENGTH + 5` (implicit, the default per `should_use_implicit_proof`) and
-  `EXPL_LENGTH + 5` — and `validate_proof_packet` decodes them into
-  `PacketReceipt::remote_rssi/remote_snr/remote_txp`, stamps `local_txp` from the
-  interface the proof arrived on, and also captures the proof packet's own
-  rssi/snr/hops for the receipt callback. `Transport.cpp`'s proof-hash size check
-  likewise admits `EXPL_LENGTH + 5`. `Interface` carries `tx_power_dbm`
-  (`INT8_MIN` = not a radio) for the driver to fill in.
-  **Pitfall:** the trailer is inert to validation (signature covers only the
-  hash), but a *vanilla* receiver length-rejects the longer proof — so rnsd only
-  emits it under the per-peer negotiation in rnsd §5.7, never blindly.
+- `Packet.cpp` — **`validate_proof_packet` captures the proof packet's own
+  rssi/snr/hops onto the receipt** before validating, so the delivery callback
+  can read the received quality of the transport node that relayed the proof
+  back (the gateway indicator, rnsd §5.7).
 - `Link.cpp`/`Transport.h`/`Transport.cpp` — **one link per link id.** A link id
   is the hash of the link request that made it, so a retransmitted request —
   the initiator never saw our proof, or the duplicate filter below let it
@@ -951,12 +939,23 @@ context flag. The flag follows the bytes, not the setting — flagging an announ
 that carries no ratchet would fail its signature everywhere.
 
 mR has no storage of its own, so rnsd holds the keys: `ourDestRatchetsLoad` /
-`ourDestRatchetsPersist` keep newest-first hex at
-`secrets.rnsd.ratchets.<dest_hex>`, loaded before the destination goes up so
-mail already in flight to a pre-reboot ratchet still opens, and rewritten from
-the persist callback on every rotation. `s.rnsd.ratchets` (default 1) gates it,
-live: flipping it reaches destinations already up, and turning it off keeps the
-stored privates.
+`ourDestRatchetsPersist` keep the last rotation time and the newest-first hex
+at `secrets.rnsd.ratchets.<dest_hex>`, loaded before the destination goes up
+and rewritten from the persist callback on every rotation. The keys survive a
+reboot so mail already in flight to a pre-reboot ratchet still opens; the time
+survives one so a reboot is not a rotation — the retained window is
+`RATCHET_COUNT × RATCHET_INTERVAL` of wall clock, not `RATCHET_COUNT` boots.
+`s.rnsd.ratchets` (default 1) gates it, live: flipping it reaches destinations
+already up, and turning it off keeps the stored privates.
+
+The clock complicates the time in two ways, both resolved toward holding the
+current ratchet, because a late rotation loses nothing while an early one drops
+every message encrypted to the retired key. A boot still on the pre-sync epoch
+reads `now` below the stored time, and `rotate_ratchets()`'s plain
+`now < last + interval` gate holds until the clock catches up. A rotation made
+without a valid clock (`sys.time.valid` unset) persists 0 rather than uptime
+seconds, so the next boot with a real clock rotates on its first announce, and
+one without holds for an interval of uptime.
 
 **Opening what arrives.** `Identity::decrypt(token, ratchets)` trial-decrypts —
 each retained ratchet private, newest first, then the identity key. There is no
@@ -1207,10 +1206,7 @@ channel.
   Channel + hidden Link down and deletes the subtree — same 1:1 handle==channel
   lifetime as Links (§5.2).
 
-## 5.7 rx-signal reports & the gateway indicator
-
-Two related radio-signal features, both rnsd-side (the on-wire proof format
-lives in µR — see §1.1).
+## 5.7 The gateway indicator
 
 **Gateway signal (`rnsd.gw.*`).** The received quality of the transport node
 that last relayed a packet to us. Published centrally from
@@ -1221,58 +1217,16 @@ destinations or active links (`rnsdAddressedToUs`), plus the delivery-proof path
 (`onOurDestReceiptDelivery`). A sample qualifies only when it arrived on a
 signal-capable interface (rssi present) and transited ≥1 transport node. Note
 `Transport::inbound` increments hops on every receive, so a **directly**-received
-packet reports `hops()==1`; the gateway test is therefore `hops() > 1`, and a
-direct packet feeds the per-contact/per-message signal instead, never gw.
-Published as `rnsd.gw.{rssi,snr,timestamp}`; kept as the last qualifying sample.
+packet reports `hops()==1`; the gateway test is therefore `hops() > 1`; a
+direct packet feeds nothing here. Published as `rnsd.gw.{rssi,snr,timestamp}`;
+kept as the last qualifying sample.
 
-**Per-message rx reports (the "extended proof").** So a sender can learn how
-well the recipient heard it, a reticulous node appends its own rx signal and the
-power it transmits at to the delivery proofs it emits for messages that reached
-it **direct** (`hops ≤ 1`) on radio — `Packet::prove_report` /
-`Identity::prove(report_signal=true)`. The trailer is five bytes, big-endian:
-
-```
-int16 rssi dBm | int16 snr×10 | int8 txpwr dBm
-```
-
-The last byte is the prover's own antenna transmit power, `INT8_MIN` when its
-receiving interface has no such notion. It is what turns the reported rssi from
-a number into a path loss: the reader already knows what *it* transmitted at, so
-`our txpwr − their rssi` and `their txpwr − our rssi` are the two directions of
-the same link. rnsd feeds the figure to mR at interface registration
-(`rnsd_iface_t.tx_power_known/tx_power_dbm` → `Interface::tx_power_dbm`); the
-LoRa straddle states its configured `tx_power` there, not its adaptive per-peer
-power, because this is a readout for the operator and not a term in any loop.
-
-The receiver decodes the trailer off the proof into
-`PacketReceipt::remote_rssi/remote_snr/remote_txp`, and stamps
-`PacketReceipt::local_txp` from the interface the proof arrived on — the radio
-the proven packet went out by, so each side's power sits beside the other side's
-rssi. rnsd forwards all of it on the DELIVERED `OUT_RESULT` signal trailer
-(`local rssi|snr | remote rssi|snr | local_txp | remote_txp`, fixed width), keyed
-by send_id, for lxmf to attach to the outbound message or to a Ping.
-
-*Interop.* The append lengthens the proof, which a **vanilla** RNS node
-length-rejects (losing its delivered-tick). So `proveInboundWithReport` emits the
-extended proof **only to a peer known to accept it** — one that advertised the
-rx-report capability (LXMF announce caps bit1). lxmf parses that bit and pushes
-it to rnsd via `rnsdSetRxReportCap(dest_hash, capable)`; rnsd keeps it in
-`s_peer_caps` (keyed by the peer's lxmf.delivery hash; RAM-only, reboot-reset)
-and `proveInboundWithReport` reads it back through `rnsdGetRxReportCap` /
-`peerAcceptsRxReport` when it proves an inbound direct radio packet. Reception is
-unconditional — we accept a report from anyone. The table
-tracks lxmf **contacts**, not every announcer: lxmf preloads it from stored
-contacts at boot and updates it on contact creation (including the first message
-from a new peer) and on each re-announce — so the set stays bounded and matches
-who you actually correspond with. Any other peer — unknown, or advertising no such capability — gets
-a plain proof, so a vanilla node never sees a lone extended one. There is no
-probing (we never send a speculative extended-then-plain pair): capability comes
-from the announce, not from trial. Receiving an rx report is unconditional — we
-accept and process one from anyone; the capability gates only what we emit.
-
-The gateway's *own* remote half (the transport node's rx of us) has no source
-yet — the rx report is endpoint-direct-only — so the gw indicator is single-set
-until a transit-node report mechanism is added.
+Delivery proofs are vanilla Reticulum proofs in both directions; rnsd emits
+`packet.prove()` on a successful hand-off to the consumer and reads nothing but
+the proof itself back. Per-peer radio measurements — signal and path loss in
+both directions — are the radio interface's business: iface-lora's SUPE
+publishes them as `lora.<n>.meas.<slot>.*` (iface-lora README), and lxmf's Ping
+reads them from there.
 
 ## 6. Boot barrier
 

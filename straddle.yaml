@@ -91,8 +91,6 @@ settings:
       # No announce interval here. How often this node says who it is belongs
       # to each interface — see any interface's own pane — because only the
       # interface knows what airtime costs on its medium.
-      - integer: { label: "Signal-report probes", key: "s.rnsd.rx_report_probes", min: 0, max: 10, default: 3 }
-      - caption: "Extra proofs offering our rx signal to a new direct peer (0 = off)."
       - section: "Path table"
       - integer: { label: "Capacity", key: "s.rnsd.path.max", min: 64, max: 512 }
       - integer: { label: "TTL", unit: "s", key: "s.rnsd.path.ttl", min: 3600, max: 604800 }

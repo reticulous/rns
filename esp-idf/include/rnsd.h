@@ -405,35 +405,10 @@ void rnsdRequestPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
 /** Evict `dest_hash` from the path table (mR's Transport::remove_path).
  *  Same async storage-sentinel discipline as rnsdRequestPath — the removal
  *  runs on rnsd's task, which owns the path table. Fire-and-forget; no return.
- *  Intended for a deliberate "forget the route and rediscover it" step, e.g.
- *  lxmf's delivery retry after a proof/response timeout, so the next send
- *  triggers a fresh path lookup instead of reusing a stale/dead route. */
+ *  Intended for a deliberate "forget the route and rediscover it" step, so the
+ *  next send triggers a fresh path lookup instead of reusing a stale/dead
+ *  route. */
 void rnsdDropPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
-
-/* ──────────────── rx-signal-report capability ────────────────
- *
- * A reticulous node can append its own rx signal (rssi/snr) and antenna tx
- * power to the delivery proof it emits for a direct radio message, so the
- * sender learns how well it was heard and at what power the answer left (the
- * "extended proof", Packet::prove_report). A vanilla RNS node would
- * length-reject that longer
- * proof, so rnsd only emits it to peers KNOWN to accept it — those that
- * advertised the rx-report capability (LXMF announce caps bit1). lxmf owns that
- * knowledge (it parses announces); rnsd owns the proof path. These two calls
- * bridge the two: lxmf records the capability per peer here, rnsd consults it
- * when proving. Receiving an rx report is unconditional — we accept and process
- * reports from anyone; the capability gates only what WE emit. */
-
-/** Record whether the peer at `dest_hash` (its lxmf.delivery destination hash)
- *  accepts rx-signal-report delivery proofs. Set from each parsed announce
- *  (true when LXMF caps bit1 is present, false otherwise). RAM-only, reset on
- *  reboot and refreshed by the next announce. Safe from any task. */
-void rnsdSetRxReportCap(const uint8_t dest_hash[RNSD_DEST_HASH_LEN], bool capable);
-
-/** Query the flag set by rnsdSetRxReportCap. Returns false when the peer is
- *  unknown (no announce with a caps element heard since boot) or not capable.
- *  Safe from any task. */
-bool rnsdGetRxReportCap(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
 
 /* ──────────────── the announce beat ────────────────
  *
