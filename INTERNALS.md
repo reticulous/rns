@@ -597,14 +597,16 @@ chance that someone asks. Occupancy and the counters that explain it are in
 - **IFAC** (Interface Access Codes) — per-interface PSK + per-packet HMAC
   access control, derived in rnsd from an interface's `ifac_netname`/`ifac_netkey`.
 - **Boot barrier** (§6).
-- **Hosted destinations (our-dests)** with concurrent path searches and
-  `QUEUE_FULL` backpressure (§4).
+- **Hosted destinations (our-dests)** with concurrent path searches,
+  `QUEUE_FULL` backpressure, and a per-destination accept gate that drops
+  inbound *without proving it* (§4).
 - **Announce fan-out** with optional per-subscriber aspect filtering.
 - **Outbound + inbound Link lifecycle** (§5), including the pre-active outboxes
   and the establishment-timeout budget.
 - **Channel bridge** (§5.6) — outbound (`rnsdChannelOpen`) and inbound
   (`rnsdDestListenChannels`) reliable-messaging over a hidden Link, exposed as a
-  packet-mode ITS handle where each message is delivered once, in order.
+  packet-mode ITS handle where each message is delivered once, in order, plus
+  `rnsdChannelSendResource` for a payload past the channel MDU.
 - **Resource transfer** (shared-memory hand-off) and **request/response** (page
   fetch) bridges.
 - **Outbound delivery-proof tracking** (§5.4).
@@ -790,7 +792,7 @@ the framing details:
   message: assert / touch / drop a claim, or seed a public key learned off the
   network. Every directory write must happen on the rnsd task (single writer is
   what lets every other task read lock-free), and claims originate on app tasks —
-  lxmf/nomad/rlpg react to a storage write on their own task — so `rnsdClaim` /
+  lxmf/nomad/lxmproxy react to a storage write on their own task — so `rnsdClaim` /
   `rnsdSeedPubkey` marshal here. Fire-and-forget: a claim is advisory, so there
   is no reply to wait for.
 - **`RNSD_PORT_LINK` (10)** — connect (`rnsd_link_connect_t`, built by
@@ -830,9 +832,20 @@ is Reticulum **opportunistic packets** (single packet, no Link). ("Mailbox" was
 an earlier in-house name; it isn't Reticulum vocabulary and collided with ITS's
 own "mailbox" message-queue term, so it's gone.)
 
-**Six slots, and asking which they are.** `RNSD_MAX_OUR_DESTS` is 6: a
+**Twelve slots, and asking which they are.** `RNSD_MAX_OUR_DESTS` is 12: a
 fully-loaded node hosts `lxmf.delivery` (one per lxmf identity slot), `rnsh`,
-`rlpg.mailbox` and `netgraph.discovery` at once, so four leaves no headroom.
+`lxmproxy.server` and `netgraph.discovery` at once, and an lxmproxy server hosts
+one further `lxmf.delivery` per account it serves — a hosted account is an
+ordinary lxmf identity — so the table is sized to lxmf's full identity count
+plus the node's own destinations. Each slot is a few hundred bytes of PSRAM.
+A destination can also stop being ours — an LXMF account handed to a proxy
+server is the case in point — so `rnsdHostsDest()` answers "is this still hosted
+*now*" against the same snapshot. Anything that remembers having announced an
+address needs it: iface-lora's neighbour table builds its `us` rows from
+announces the radio was heard transmitting and never retires a local one, so
+without the check `lora n` would go on claiming an address this node no longer
+answers on.
+
 `rnsdHostedDestsForEach()` walks them — plus the transport probe and the
 remote-management destination where those are up — as flat `{dest, aspect}`
 bytes rather than µR objects. Both of those ride the ordinary hosted-announce
@@ -851,6 +864,20 @@ resolves, rnsd narrates progress with `OUT_STATUS` aux frames
 path-timeout). When the table is full, the send is **not accepted**: rnsd emits
 `OUT_STATUS:QUEUE_FULL` and the consumer holds the message and resends once a
 slot frees. This is backpressure, never a silent drop.
+
+**The per-destination accept gate** (`RNSD_DEST_SET_ACCEPT`, `rnsdDestSetAccept`).
+`our_dest_t::accept_inbound` false makes `onOurDestInbound` drop the packet
+**before** the consumer hand-off, and `onResAdvertised` / `chanResAdvertised`
+refuse an advertisement on a link that landed on that destination. Since rnsd
+proves on a successful hand-off and never on a dropped one, that leaves the
+sender's receipt open and their retry loop holding the message — which is the
+only way to tell an arbitrary LXMF sender "mailbox full", there being no such
+thing on the wire. It is deliberately NOT persisted: a store that has run out of
+room re-asserts the gate when it comes back, and a boot that has forgotten why
+accepts. The gate is on the DESTINATION, not on the consumer, because the whole
+point is to answer for one account while every other one on the box is fine.
+[lxmproxy](../lxmproxy) is the consumer, reaching it through lxmf's
+`lxmf.id.<n>.accept` because only lxmf holds the destination handle.
 
 **Wire-format asymmetry (a correctness trap).** For a SINGLE destination the
 LXMF-style wire omits the leading 16-byte destination hash, but `OUT_PACKET`/
@@ -892,7 +919,7 @@ backs off to a minute on an idle node, which would otherwise swallow them.
 
 **rnsd holds no interval.** How often a node says who it is is a property of the
 medium, so it lives in each interface straddle (`rnsdAnnounceBeat`, ±10 % jitter)
-and its own setting. Applications hold none either: `lxmf`, `rnsh` and `rlpg`
+and its own setting. Applications hold none either: `lxmf`, `rnsh` and `lxmproxy`
 announce once at bring-up and thereafter only when what they advertise changes.
 The probe destination is not special — it rides every replay rather than keeping
 the private cadence it used to have.
@@ -962,8 +989,7 @@ each retained ratchet private, newest first, then the identity key. There is no
 selector in the token, so the retained count is the ceiling on what a junk token
 costs. `Destination::decrypt` passes the destination's own set;
 `rnsdDecryptSelf(identity_key, dest_hash, …)` looks the set up by destination
-hash for payloads handed to us out of band (RLPG envelopes, propagation-node
-blobs).
+hash for payloads handed to us out of band (propagation-node blobs).
 
 **Ratchet enforcement is deliberately absent.** Upstream can refuse packets
 encrypted to the identity key; doing that here would drop mail from every sender
@@ -1192,7 +1218,12 @@ channel.
   destination's established callback to `onIncomingChannelEstablished`, which on
   each accepted Link connects the consumer inbox **first** (so no delivered
   message lands with a dead handle) and only then wires `get_channel()` + the
-  receive callback. Reuses the `rnsd_link_incoming_t` payload.
+  receive callback. Reuses the `rnsd_link_incoming_t` payload. **Who the
+  initiator is arrives later than that payload:** the identify packet follows the
+  handshake, so the payload's `remote_identity_hash` is normally zero and
+  `onChanRemoteIdentifiedCb` publishes the verified hash to
+  `rnsd.chan.<tag>.remote_identity` when it lands. A consumer gating on identity
+  — rnsh's passwordless list — reads the key, not the payload.
 - **Data path** — `onChannelRecv` sends consumer bytes as one Channel message
   (buffering to the outbox when the window is full or the link is pre-active);
   `onChannelMsgCb` forwards each delivered message to the consumer handle.
@@ -1200,8 +1231,25 @@ channel.
   arrivals wake the loop), so delivery detection and window-freeing are prompt;
   `channelTick()` runs the 1 Hz state machine (path/establishment timeouts,
   3 s terminal-grace reclaim).
+- **Resources on the hidden Link** (`rnsdChannelSendResource`, aux
+  `RNSD_CHAN_AUX_SEND_RESOURCE` on port 11) — a payload past the channel MDU has
+  nowhere else to go, because the Link is never exposed. The engine callbacks
+  are SHARED with the link table: `linkWireResource` is wired onto a channel's
+  Link in both directions, and `onResAdvertised` / `onResConcluded` fall through
+  to `chanResAdvertised` / `chanResConcluded` when the link table does not
+  recognise the Link or the resource hash. Each slot carries the same
+  one-in-flight `res_hash` / `res_outbound` / `res_opaque` triple, the same
+  `pend_res_*` pre-active deferral (flushed from `onChanLinkEstablishedCb`), and
+  the same `consumer_task` — set from `itsRemoteTask(handle)` outbound and from
+  the listening destination's task inbound. Completion lands on the shared
+  `RNSD_LINK_RESOURCE_AUX_PORT` (101), so a channel consumer that sends or
+  receives one must open that port like any link consumer, and inbound frames
+  are told apart by `rnsd.chan.byid.<link_id>` → the tag. A Resource is **not**
+  ordered against the channel's own messages: the channel sequences what it
+  carries and the Resource rides beside it.
 - **State tree** — `rnsd.chan.<tag>.{state,direction,aspect,remote_hash,
-  link_id,mtu,rtt_ms,opened_s,activated_s,tx_msgs,rx_msgs,last_error}` plus the
+  remote_identity,link_id,mtu,rtt_ms,opened_s,activated_s,tx_msgs,rx_msgs,
+  resource.{state,size,parts},last_error}` plus the
   reverse index `rnsd.chan.byid.<link_id>`. Closing the ITS handle tears the
   Channel + hidden Link down and deletes the subtree — same 1:1 handle==channel
   lifetime as Links (§5.2).
@@ -1249,7 +1297,7 @@ which *is* live — it's read at runtime for forwarding.)
 ### 6.1 Ecosystem lifecycle (`rns start`/`rns stop`) and what quiesce leaves behind
 
 The whole RNS ecosystem — rnsd plus every interface and client (iface-lora/tcp/
-auto/espnow, lxmf, nomad, rlpg, rnsh) — starts and stops as a unit, orchestrated
+auto/espnow, lxmf, nomad, lxmproxy, rnsh) — starts and stops as a unit, orchestrated
 in one place (`rnsServiceRegister` / `rnsStart` / `rnsStop`, `rnsd.cpp`). A
 component registers a start/stop hook pair from its `onInit()` instead of
 self-spawning a task that waits on `rns.ready`; the rnsd task, once past the boot

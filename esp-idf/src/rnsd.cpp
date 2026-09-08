@@ -255,11 +255,14 @@ typedef struct {
 static_assert(sizeof(rnsd_channel_connect_t) <= ITS_MAX_MSG_DATA,
               "rnsd_channel_connect_t must fit ITS_MAX_MSG_DATA");
 
-/* Hosted IN destinations. lxmf.delivery, rnsh, rlpg.mailbox and
- * netgraph.discovery are all standing hosts on a fully-loaded node, and lxmf
- * hosts one per identity slot, so the table has to leave headroom above the
- * four an application-only node needs. */
-#define RNSD_MAX_OUR_DESTS    6
+/* Hosted IN destinations. rnsh, lxmproxy.server and netgraph.discovery are
+ * standing hosts on a fully-loaded node, and lxmf hosts one lxmf.delivery per
+ * identity slot. An lxmproxy SERVER hosts one more lxmf.delivery per account it
+ * serves — the whole point of it is that a hosted account is an ordinary lxmf
+ * identity — so the ceiling is lxmf's full identity count plus the node's own
+ * destinations, not the handful an application-only node needs. Each slot is a
+ * few hundred bytes of PSRAM. */
+#define RNSD_MAX_OUR_DESTS    12
 /* Per-conn pending path-search slots. Each holds one parked OUT_PACKET (its
  * full LXM wire, ~≤500B) whose path hasn't resolved yet, so multiple sends to
  * different peers can search for routes concurrently instead of evicting one
@@ -305,6 +308,12 @@ struct our_dest_t {
      * time so inbound Links back-connect without a name lookup. */
     TaskHandle_t               link_listener_task = nullptr;
     uint16_t                   link_inbox_port    = 0;
+
+    /* RNSD_DEST_SET_ACCEPT. False makes every inbound packet and every
+     * Resource advertisement for this destination drop WITHOUT a proof, which
+     * is what leaves a message on the sender's side for their own retry loop
+     * to hold. Not persisted: a re-registration accepts again. */
+    bool                       accept_inbound = true;
 
     /* The last RNSD_DEST_ANNOUNCE, kept so a newly registered interface can
      * be given every hosted announce without waiting for each client's own
@@ -559,7 +568,7 @@ static_assert(RNSD_MAX_IFACES <= 32, "replay bitmask holds one bit per iface slo
 #define RNSD_REPLAY_DEBOUNCE_MS   1500
 
 /* An application setting a new stored announce is coalesced for a minute and
- * then aired on EVERY interface. Boot is what this is for: lxmf, rnsh and rlpg
+ * then aired on EVERY interface. Boot is what this is for: lxmf, rnsh and lxmproxy
  * all announce within a few seconds of the ecosystem coming up, and each one
  * arriving separately would put four sweeps on a LoRa segment where one says
  * exactly the same thing. A minute is long enough to gather a boot and any
@@ -1022,6 +1031,15 @@ static void hostedDestsRefresh(void)
     s_hosted_n = n;
 }
 
+bool rnsdHostsDest(const uint8_t dest[RNSD_DEST_HASH_LEN])
+{
+    if (!dest) return false;
+    std::lock_guard<std::mutex> lk(s_hosted_mtx);
+    for (int i = 0; i < s_hosted_n; i++)
+        if (std::memcmp(s_hosted[i].dest, dest, RNSD_DEST_HASH_LEN) == 0) return true;
+    return false;
+}
+
 int rnsdHostedDestsForEach(void (*cb)(const rnsd_hosted_dest_t*, void*), void* ctx)
 {
     rnsd_hosted_dest_t snap[RNSD_MAX_OUR_DESTS + 1];
@@ -1057,9 +1075,14 @@ static our_dest_t* ourDestAlloc(void)
 {
     for (int j = 0; j < RNSD_MAX_OUR_DESTS; j++)
         if (!s_our_dests[j].used) {
-            /* A recycled slot must not inherit its predecessor's announce. */
+            /* A recycled slot must not inherit its predecessor's announce —
+             * nor its accept gate. The gate says "this store is full right
+             * now", which is a fact about the consumer that closed it, and a
+             * fresh registration has made no such claim: inheriting it would
+             * silently black-hole a brand-new destination's inbound. */
             s_our_dests[j].want_announce      = false;
             s_our_dests[j].last_announce_data = RNS::Bytes();
+            s_our_dests[j].accept_inbound     = true;
             return &s_our_dests[j];
         }
     return nullptr;
@@ -1601,6 +1624,14 @@ static void onOurDestInbound(const RNS::Bytes& plaintext, const RNS::Packet& pac
              packet.destination().hash().toHex().c_str(), plaintext.size());
         return;
     }
+    if (!c->accept_inbound) {
+        /* The gate is shut (RNSD_DEST_SET_ACCEPT). Drop without proving: the
+         * sender's receipt stays open and their retry loop keeps the message,
+         * which is the only "mailbox full" LXMF has. */
+        info("our-dest inbound: dest %s not accepting — dropped unproved (%zuB)",
+             packet.destination().hash().toHex().c_str(), plaintext.size());
+        return;
+    }
     /* Opportunistic LXMF wire on the network omits the leading 16-byte
      * destination hash; reconstruct the full LXM wire by prepending our
      * own destination hash (the IN destination that received this packet)
@@ -1986,6 +2017,13 @@ static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
             }
             info("our-dest conn %d: listening for inbound Channels → port %u",
                  (int)(c - s_our_dests), (unsigned)port);
+            break;
+        }
+        case RNSD_DEST_SET_ACCEPT: {
+            if (n < 2) { err("our-dest: SET_ACCEPT too short (%zu)", n); break; }
+            c->accept_inbound = (buf[1] != 0);
+            info("our-dest conn %d: inbound %s", (int)(c - s_our_dests),
+                 c->accept_inbound ? "accepting" : "GATED (dropping unproved)");
             break;
         }
         default:
@@ -4580,7 +4618,7 @@ bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
 
 /* Every directory write happens on the rnsd task — that is what lets every
  * other task read the store without a lock. Claims and seeded keys originate
- * on app tasks (lxmf/nomad/rlpg react to a storage write on their own task), so
+ * on app tasks (lxmf/nomad/lxmproxy react to a storage write on their own task), so
  * they ride an aux frame to RNSD_PORT_DIR and are applied by dirAuxRecv below.
  * Fire-and-forget: a claim is advisory, so there is no reply to wait for. */
 static void dirSendAux(const rnsd_dir_aux_t& m)
@@ -4802,6 +4840,29 @@ bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
     return ok;
 }
 
+bool rnsdChannelSendResource(const char* tag, void* buf, size_t len,
+                             uint32_t opaque_id)
+{
+    if (!tag || !*tag || !buf || len == 0) {
+        warn("rnsdChannelSendResource: bad args");
+        if (buf) free(buf);
+        return false;
+    }
+    rnsd_link_send_resource_t p = {};
+    p.op = RNSD_CHAN_AUX_SEND_RESOURCE;
+    safeStrncpy(p.tag, tag, sizeof(p.tag));
+    p.buf       = buf;
+    p.len       = (uint32_t)len;
+    p.opaque_id = opaque_id;
+    bool ok = itsSendAux("rnsd", RNSD_PORT_CHANNEL, &p, sizeof(p),
+                         pdMS_TO_TICKS(1000));
+    if (!ok) {
+        warn("rnsdChannelSendResource: aux send failed, freeing buf");
+        free(buf);
+    }
+    return ok;
+}
+
 int rnsdLinkRequest(const char* tag, const char* path,
                     const void* data, size_t data_len,
                     uint16_t resp_port, bool data_packed)
@@ -4891,6 +4952,13 @@ bool rnsdDestListenChannels(int dest_handle, uint16_t target_port)
         (uint8_t)(target_port >> 8),
         (uint8_t)(target_port & 0xFF),
     };
+    return itsSend(dest_handle, f, sizeof(f), pdMS_TO_TICKS(500)) == sizeof(f);
+}
+
+bool rnsdDestSetAccept(int dest_handle, bool accept)
+{
+    if (dest_handle < 0) { warn("rnsdDestSetAccept: bad handle"); return false; }
+    uint8_t f[2] = { RNSD_DEST_SET_ACCEPT, (uint8_t)(accept ? 1 : 0) };
     return itsSend(dest_handle, f, sizeof(f), pdMS_TO_TICKS(500)) == sizeof(f);
 }
 
@@ -5681,6 +5749,16 @@ static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packe
  * onResConcluded matches r.hash() against the slot's in-flight
  * res_hash recorded at advertisement (inbound) or send (outbound). */
 
+/* A Channel slot owns a hidden Link, so an advertisement or a conclusion the
+ * LINK table does not recognise may still belong to a channel. These resolve it
+ * against the channel table and run the same accept/hand-off logic; they are
+ * defined in the RNSD_PORT_CHANNEL block below and return false when the
+ * channel table does not know it either. Without them a Resource on a Channel's
+ * Link is refused, which is the one thing a Channel consumer cannot work
+ * around: the Link is never exposed to it. */
+static bool chanResAdvertised(const RNS::ResourceAdvertisement& adv);
+static bool chanResConcluded(const RNS::Resource& r);
+
 static link_conn_t* linkFindByResHash(const RNS::Bytes& h)
 {
     if (h.size() == 0) return nullptr;
@@ -5741,7 +5819,20 @@ static bool onResAdvertised(const RNS::ResourceAdvertisement& adv)
 {
     if (!adv.link) { warn("resource adv: no link"); return false; }
     link_conn_t* c = linkFindByLink(*adv.link);
-    if (!c) { warn("resource adv: no slot"); return false; }
+    if (!c) return chanResAdvertised(adv);
+
+    /* The per-destination inbound gate: a hosted destination that is not
+     * accepting drops the advertisement, so the transfer never starts and
+     * nothing is proved. `dest_hash` on an INBOUND link is the hosted dest the
+     * link landed on; on one we opened it is the remote's, which matches no
+     * hosted destination and so passes. */
+    if (our_dest_t* od = ourDestFindByDestHash(c->dest_hash)) {
+        if (!od->accept_inbound) {
+            info("link[%s]: dest not accepting — resource advertisement refused",
+                 c->tag);
+            return false;
+        }
+    }
 
     if (c->res_hash.size()) {
         warn("link[%s]: resource already in flight, rejecting", c->tag);
@@ -5800,7 +5891,11 @@ static const char* resStatusName(int s)
 static void onResConcluded(const RNS::Resource& r)
 {
     link_conn_t* c = linkFindByResHash(r.hash());
-    if (!c) { warn("resource concluded: no slot for hash"); return; }
+    if (!c) {
+        if (chanResConcluded(r)) return;
+        warn("resource concluded: no slot for hash");
+        return;
+    }
 
     bool ok = (r.status() == RNS::Type::Resource::COMPLETE);
     char k[96];
@@ -6690,6 +6785,22 @@ struct chan_conn_t {
     uint32_t     link_timeout_ms;
     double       dead_at;
     std::vector<std::vector<uint8_t>> outbox; /* messages awaiting a ready channel */
+
+    /* Resource transfer on the hidden Link — the only way a Channel consumer
+     * can carry a payload past the channel MDU, since it never sees the Link.
+     * Same one-in-flight rule and the same aux lifecycle as the link table's,
+     * resolved through chanResAdvertised / chanResConcluded. */
+    TaskHandle_t consumer_task = nullptr;   /* where the resource aux goes */
+    RNS::Bytes   res_hash;                  /* in-flight resource hash; empty = idle */
+    bool         res_outbound = false;
+    uint32_t     res_opaque = 0;
+    /* Pre-active deferral: a consumer may open the channel and send at once,
+     * before the handshake finishes. Hold the buffer and start the Resource
+     * from the establish callback, exactly as the link table's pend_res_* does. */
+    bool         pend_res_used = false;
+    void*        pend_res_buf = nullptr;
+    uint32_t     pend_res_len = 0;
+    uint32_t     pend_res_opaque = 0;
 };
 
 static chan_conn_t* s_chan_conns = nullptr;
@@ -6707,6 +6818,13 @@ static chan_conn_t* chanFindByLink(const RNS::Link& l) {
 static chan_conn_t* chanFindByTag(const char* tag) {
     for (int j = 0; j < RNSD_MAX_CHAN_CONNS; j++)
         if (s_chan_conns[j].used && strcmp(s_chan_conns[j].tag, tag) == 0) return &s_chan_conns[j];
+    return nullptr;
+}
+static chan_conn_t* chanFindByResHash(const RNS::Bytes& h) {
+    if (h.size() == 0) return nullptr;
+    for (int j = 0; j < RNSD_MAX_CHAN_CONNS; j++)
+        if (s_chan_conns[j].used && s_chan_conns[j].res_hash.size() &&
+            s_chan_conns[j].res_hash == h) return &s_chan_conns[j];
     return nullptr;
 }
 static void chanTouch(chan_conn_t& c) { c.last_activity = RNS::Utilities::OS::time(); }
@@ -6739,6 +6857,11 @@ static void chanFreeSlot(chan_conn_t& c) {
     c.opened_at = c.last_activity = c.path_deadline = c.estab_deadline = c.dead_at = 0;
     c.link_timeout_ms = 0;
     c.outbox.clear();
+    c.consumer_task = nullptr;
+    c.res_hash = RNS::Bytes(); c.res_outbound = false; c.res_opaque = 0;
+    if (c.pend_res_used && c.pend_res_buf) free(c.pend_res_buf);
+    c.pend_res_used = false; c.pend_res_buf = nullptr;
+    c.pend_res_len = 0; c.pend_res_opaque = 0;
 }
 
 static chan_conn_t* chanAlloc() {
@@ -6816,6 +6939,196 @@ static void chanFlushOutbox(chan_conn_t& c) {
     }
 }
 
+/* ── Resources on a Channel's hidden Link ──
+ *
+ * A Channel slot never exposes its Link, so a consumer with a payload past the
+ * channel MDU has nowhere else to put it. These mirror the link table's
+ * resSendAux / linkStartOutboundResource / onResAdvertised / onResConcluded
+ * against the channel table; the engine callbacks themselves are shared
+ * (linkWireResource), and they fall through to here when the link table does
+ * not recognise the Link or the resource hash. */
+
+static void chanResSendAux(chan_conn_t& c, uint8_t opcode,
+                           void* buf, uint32_t len, uint8_t flags)
+{
+    if (!c.consumer_task) {
+        warn("chan[%s]: resource aux but no consumer task", c.tag);
+        if (buf) free(buf);
+        return;
+    }
+    rnsd_link_resource_done_t d = {};
+    d.opcode = opcode;
+    if (c.link && c.link.link_id().size() >= 16)
+        memcpy(d.link_id, c.link.link_id().data(), 16);
+    if (c.res_hash.size() >= 32) memcpy(d.resource_hash, c.res_hash.data(), 32);
+    if (c.dest_hash.size() >= 16) memcpy(d.local_dest_hash, c.dest_hash.data(), 16);
+    d.buf       = buf;
+    d.len       = len;
+    d.opaque_id = c.res_opaque;
+    d.flags     = flags;
+    if (!itsSendAuxByTaskHandle(c.consumer_task, RNSD_LINK_RESOURCE_AUX_PORT,
+                                &d, sizeof(d), pdMS_TO_TICKS(2000))) {
+        warn("chan[%s]: resource aux send failed (op=%s)",
+             c.tag, lnkAuxOpName(opcode));
+        if (buf) free(buf);   /* consumer never took ownership */
+    }
+}
+
+static void chanStartOutboundResource(chan_conn_t& c, void* buf,
+                                      uint32_t reqlen, uint32_t opaque)
+{
+    if (c.res_hash.size()) {
+        warn("chan[%s]: resource already in flight, dropping send", c.tag);
+        if (buf) free(buf);
+        return;
+    }
+    try {
+        RNS::Resource res(RNS::Bytes((const uint8_t*)buf, reqlen),
+                          c.link, /*advertise=*/true,
+                          /*auto_compress=*/false,
+                          /*concluded=*/onResConcluded,
+                          /*progress=*/nullptr);
+        if (buf) free(buf);
+        c.res_hash     = res.hash();
+        c.res_outbound = true;
+        c.res_opaque   = opaque;
+        storageBegin();
+        chanSetStr(c, "resource.state", "sending");
+        chanSetInt(c, "resource.size",  (int)reqlen);
+        storageEnd();
+        info("chan[%s]: sending %uB resource (opaque=%u)",
+             c.tag, (unsigned)reqlen, (unsigned)opaque);
+    } catch (const std::exception& e) {
+        warn("chan[%s]: resource send threw: %s", c.tag, e.what());
+        if (buf) free(buf);
+        chanResSendAux(c, RNSD_LINK_RESOURCE_FAILED, nullptr, 0, 0);
+    }
+}
+
+static bool chanResAdvertised(const RNS::ResourceAdvertisement& adv)
+{
+    if (!s_chan_conns || !adv.link) return false;
+    chan_conn_t* c = chanFindByLink(*adv.link);
+    if (!c) { warn("resource adv: no slot"); return false; }
+
+    /* The per-destination inbound gate, as on a plain link: an inbound channel
+     * whose hosted destination is not accepting refuses the advertisement, so
+     * nothing is transferred and nothing is proved. */
+    if (c->direction == 1) {
+        if (our_dest_t* od = ourDestFindByDestHash(c->dest_hash)) {
+            if (!od->accept_inbound) {
+                info("chan[%s]: dest not accepting — resource advertisement refused",
+                     c->tag);
+                return false;
+            }
+        }
+    }
+    if (c->res_hash.size()) {
+        warn("chan[%s]: resource already in flight, rejecting", c->tag);
+        return false;
+    }
+    uint32_t maxsz = (uint32_t)storageGetInt("s.lxmf.max_resource_size", 262144);
+    if (adv.d > maxsz) {
+        warn("chan[%s]: resource %uB > max %uB, rejecting",
+             c->tag, (unsigned)adv.d, (unsigned)maxsz);
+        return false;
+    }
+    c->res_hash     = adv.h;
+    c->res_outbound = false;
+    c->res_opaque   = 0;
+    storageBegin();
+    chanSetStr(*c, "resource.state", "receiving");
+    chanSetInt(*c, "resource.size",  (int)adv.d);
+    chanSetInt(*c, "resource.parts", (int)adv.n);
+    storageEnd();
+    info("chan[%s]: accepting resource %uB (%u parts)",
+         c->tag, (unsigned)adv.d, (unsigned)adv.n);
+    return true;
+}
+
+static bool chanResConcluded(const RNS::Resource& r)
+{
+    if (!s_chan_conns) return false;
+    chan_conn_t* c = chanFindByResHash(r.hash());
+    if (!c) return false;
+
+    bool ok = (r.status() == RNS::Type::Resource::COMPLETE);
+    if (ok && !c->res_outbound) {
+        const RNS::Bytes& d = r.data();
+        size_t len = d.size();
+        void* buf = (len > 0) ? gp_alloc(len) : nullptr;
+        if (len > 0 && !buf) {
+            warn("chan[%s]: resource malloc %zuB failed", c->tag, len);
+            chanResSendAux(*c, RNSD_LINK_RESOURCE_FAILED, nullptr, 0, 0);
+        } else {
+            if (len > 0) memcpy(buf, d.data(), len);
+            chanSetStr(*c, "resource.state", "received");
+            info("chan[%s]: inbound resource complete %zuB → consumer", c->tag, len);
+            chanResSendAux(*c, RNSD_LINK_RESOURCE_INBOUND_DONE, buf, (uint32_t)len, 0);
+        }
+    } else if (ok && c->res_outbound) {
+        chanSetStr(*c, "resource.state", "sent");
+        info("chan[%s]: outbound resource delivered (proof ok)", c->tag);
+        chanResSendAux(*c, RNSD_LINK_RESOURCE_OUTBOUND_DONE, nullptr, 0, 0);
+    } else {
+        char st[24];
+        snprintf(st, sizeof(st), "failed:%s:%d",
+                 c->res_outbound ? "out" : "in", (int)r.status());
+        chanSetStr(*c, "resource.state", st);
+        warn("chan[%s]: resource %s failed (status=%s)", c->tag,
+             c->res_outbound ? "outbound" : "inbound",
+             resStatusName((int)r.status()));
+        chanResSendAux(*c, RNSD_LINK_RESOURCE_FAILED, nullptr, 0, 0);
+    }
+    c->res_hash     = RNS::Bytes();
+    c->res_outbound = false;
+    c->res_opaque   = 0;
+    return true;
+}
+
+/* Out-of-band aux on RNSD_PORT_CHANNEL: the big-Resource send. Mirrors
+ * onLinkAux, resolving the tag against the channel table. */
+static void onChannelAux(TaskHandle_t /*sender*/, const void* data, size_t len)
+{
+    if (!data || len < 1) return;
+    uint8_t op = *(const uint8_t*)data;
+    if (op != RNSD_CHAN_AUX_SEND_RESOURCE) {
+        warn("chan aux: unknown opcode 0x%02x", (unsigned)op);
+        return;
+    }
+    if (len < sizeof(rnsd_link_send_resource_t)) {
+        err("chan aux: SEND_RESOURCE too short (%zu)", len);
+        return;
+    }
+    rnsd_link_send_resource_t req;
+    memcpy(&req, data, sizeof(req));
+    char tag[24]; safeStrncpy(tag, req.tag, sizeof(tag));
+    void* buf = req.buf;
+    chan_conn_t* c = chanFindByTag(tag);
+    if (!c) {
+        warn("chan aux: no channel tagged '%s' — freeing %uB", tag, (unsigned)req.len);
+        if (buf) free(buf);
+        return;
+    }
+    if (c->res_hash.size() || c->pend_res_used) {
+        warn("chan[%s]: resource already pending/in-flight, dropping", c->tag);
+        if (buf) free(buf);
+        return;
+    }
+    if (c->state != LST_ACTIVE || !c->link) {
+        /* Pre-active: hold it and start the Resource from the establish
+         * callback, so a consumer can open and send back to back. */
+        c->pend_res_used   = true;
+        c->pend_res_buf    = buf;
+        c->pend_res_len    = req.len;
+        c->pend_res_opaque = req.opaque_id;
+        verb("chan[%s]: resource send deferred until ACTIVE (%uB)",
+             c->tag, (unsigned)req.len);
+        return;
+    }
+    chanStartOutboundResource(*c, buf, req.len, req.opaque_id);
+}
+
 static void onChanLinkEstablishedCb(RNS::Link& link) {
     chan_conn_t* c = chanFindByLink(link);
     if (!c) return;
@@ -6850,6 +7163,27 @@ static void onChanLinkEstablishedCb(RNS::Link& link) {
     info("chan[%s]: ACTIVE link_id=%s mtu=%u", c->tag,
          link.link_id().toHex().c_str(), (unsigned)link.get_mtu());
     chanFlushOutbox(*c);
+    /* A Resource handed over before the handshake finished starts now. */
+    if (c->pend_res_used) {
+        c->pend_res_used = false;
+        void* b = c->pend_res_buf; c->pend_res_buf = nullptr;
+        chanStartOutboundResource(*c, b, c->pend_res_len, c->pend_res_opaque);
+    }
+}
+
+/* A peer identified on a channel Link we host (µR validated the LINKIDENTIFY
+ * signature before firing this). Publish `remote_identity` so the consumer can
+ * gate on who the initiator is — an inbound Channel is forwarded the moment the
+ * Link comes up, which is before the initiator's identify packet arrives, so
+ * the connect payload's remote_identity_hash is normally still zero and this
+ * key is where the answer lands. rnsh's passwordless-identity list reads it. */
+static void onChanRemoteIdentifiedCb(const RNS::Link& link,
+                                     const RNS::Identity& identity)
+{
+    chan_conn_t* c = chanFindByLink(link);
+    if (!c) { warn("chan: remote identified, no slot"); return; }
+    chanSetStr(*c, "remote_identity", identity.hash().toHex().c_str());
+    info("chan[%s]: peer identified as %s", c->tag, identity.hash().toHex().c_str());
 }
 
 static void onChanLinkClosedCb(RNS::Link& link) {
@@ -6895,6 +7229,7 @@ static bool chanKickoff(chan_conn_t& c) {
         c.link.set_link_closed_callback(onChanLinkClosedCb);
         /* No packet callback: the Channel consumes CHANNEL-context packets via
          * Link::receive; plain link packets are unused on this path. */
+        linkWireResource(c.link);   /* a payload past the channel MDU rides here */
         c.state = LST_ESTABLISHING;
         double estab;
         if (c.link_timeout_ms != 0) {
@@ -6944,6 +7279,7 @@ static int onChannelConnect(int handle, const void* data, size_t len) {
     c->dead_at = 0; c->estab_deadline = 0;
     c->link_timeout_ms = req->link_timeout_ms;
     c->outbox.clear();
+    c->consumer_task = itsRemoteTask(handle);   /* resource aux target */
     int path_to_s = req->path_timeout_ms ? (int)(req->path_timeout_ms / 1000)
                                          : storageGetInt("s.rnsd.link.path_timeout_s", 30);
     c->path_deadline = c->opened_at + path_to_s;
@@ -7039,7 +7375,12 @@ static void onIncomingChannelEstablished(RNS::Link& link) {
     c->opened_at = c->last_activity = RNS::Utilities::OS::time();
     c->dead_at = 0; c->estab_deadline = 0;
     c->outbox.clear();
+    c->consumer_task = mc->link_listener_task;   /* resource aux target */
+    linkWireResource(link);   /* a payload past the channel MDU rides here */
     link.set_link_closed_callback(onChanLinkClosedCb);
+    /* The initiator identifies just after the handshake, so who it is arrives
+     * after this forward — publish it when it does (rnsh gates on it). */
+    link.set_remote_identified_callback(onChanRemoteIdentifiedCb);
 
     RNS::Bytes rid;
     { const RNS::Identity& ri = link.get_remote_identity(); if (ri) rid = ri.hash(); }
@@ -7667,6 +8008,7 @@ static void rnsdTaskMain(void*)
     itsServerOnConnect(RNSD_PORT_CHANNEL,    onChannelConnect);
     itsServerOnDisconnect(RNSD_PORT_CHANNEL, onChannelDisconnect);
     itsServerOnRecv(RNSD_PORT_CHANNEL,       onChannelRecv);
+    itsOnAux(RNSD_PORT_CHANNEL,              onChannelAux);  /* big-Resource send */
 
     loadOrCreateIdentity();
     storageBegin();

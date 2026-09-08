@@ -169,8 +169,31 @@ touches the channel, exactly as it would a link:
 - `rnsdDestListenChannels(dest_handle, port)` — inbound. Like
   `rnsdDestListenLinks`, but forwards a Channel per accepted inbound Link.
 
-A message must fit the channel MDU (Link MDU − 6). [rnsh](../rnsh) is built on
-this. See [INTERNALS.md §5.6](INTERNALS.md).
+A message must fit the channel MDU (Link MDU − 6). A payload past it rides a
+**Resource on the Channel's hidden Link** —
+`rnsdChannelSendResource(tag, buf, len, opaque_id)`, with the same ownership
+rules and the same `RNSD_LINK_RESOURCE_*` aux lifecycle as
+`rnsdLinkSendResource`. It exists because the Link is never exposed: a Channel
+consumer with something large has nowhere else to put it. A Resource is *not*
+ordered against the channel's own messages — the channel sequences what it
+carries and the Resource rides beside it — so a protocol that needs the two
+ordered says so itself, the way a fetch/answer exchange does.
+
+[rnsh](../rnsh) and [lxmproxy](../lxmproxy) are built on this. See
+[INTERNALS.md §5.6](INTERNALS.md).
+
+### Refusing inbound without acknowledging it
+
+`rnsdDestSetAccept(dest_handle, false)` makes rnsd **drop** everything addressed
+to that hosted destination — packets, and Resource advertisements on its inbound
+links alike — **without proving it**. rnsd proves on successful hand-off to the
+consumer and never on a dropped one, so withholding the proof leaves the message
+on the sender's side, where their own retry loop holds it.
+
+That is the whole mechanism, and it exists for one situation: a store that has
+run out of room. There is no "mailbox full" on the LXMF wire, and accepting what
+cannot be kept is worse than making the sender wait. A destination accepts by
+default and the gate is not persisted, so a re-registration accepts again.
 
 `rnsd` is started for you: the build's generated init brings up the identity,
 µR `Reticulum` + `Transport`, the interface table, and the announce fan-out.
@@ -209,7 +232,7 @@ frame's buffer.) Opcode tables for the framed ports
 An application's job is to keep its **stored announce** current; rnsd holds the
 bytes. **When** those bytes go on the air is each interface's call, because only
 the interface knows what airtime costs on its medium — so `lxmf`, `rnsh` and
-`rlpg` carry no announce timer and no interval setting, and every interface pane
+`lxmproxy` carry no announce timer and no interval setting, and every interface pane
 carries one plus an **Announce now** button.
 
 rnsd never schedules an announce on its own. It airs one when:

@@ -70,7 +70,7 @@ enum {
     RDIR_CONSUMER_LXMF  = 0,
     RDIR_CONSUMER_NOMAD = 1,
     RDIR_CONSUMER_RNSH  = 2,
-    RDIR_CONSUMER_RLPG  = 3,
+    RDIR_CONSUMER_LXMPROXY = 3,
     RDIR_CONSUMER_RNSD  = 4,
     RDIR_CONSUMER_COUNT = 8,      /* width of each per-consumer bit field */
 };

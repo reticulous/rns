@@ -350,7 +350,7 @@ enum {
     RNSD_CLAIM_LXMF  = 0,
     RNSD_CLAIM_NOMAD = 1,
     RNSD_CLAIM_RNSH  = 2,
-    RNSD_CLAIM_RLPG  = 3,
+    RNSD_CLAIM_LXMPROXY = 3,
     RNSD_CLAIM_RNSD  = 4,
     /** netgraph, on the management destinations it wants to be able to reach.
      *  The announce table evicts by memory pressure and never by time, so an
@@ -416,7 +416,7 @@ void rnsdDropPath(const uint8_t dest_hash[RNSD_DEST_HASH_LEN]);
  * application. An application's job is to keep its stored announce current —
  * `RNSD_DEST_ANNOUNCE` sets it, and rnsd holds the bytes; when to put those
  * bytes on the air is the interface's call, because only the interface knows
- * what airtime costs there. So lxmf, rnsh and rlpg carry no timer, and each
+ * what airtime costs there. So lxmf, rnsh and lxmproxy carry no timer, and each
  * interface straddle drives its own beat from its own setting.
  *
  * rnsd never schedules an announce on its own. It announces when:
@@ -617,6 +617,15 @@ typedef struct {
  *  many were visited. The callback runs on the caller's task against a private
  *  copy, so this is safe from any task; it must not call back in. */
 int rnsdHostedDestsForEach(void (*cb)(const rnsd_hosted_dest_t*, void*), void* ctx);
+
+/** Is `dest` one of the destinations this node hosts RIGHT NOW? The same
+ *  snapshot the walk reads, so it is safe from any task.
+ *
+ *  "Right now" is the point. A destination can stop being ours — an LXMF
+ *  account handed to a proxy server is the case in point — and anything that
+ *  remembers having announced one needs a way to ask whether that is still
+ *  true, rather than reporting an address this node no longer answers on. */
+bool rnsdHostsDest(const uint8_t dest[RNSD_DEST_HASH_LEN]);
 
 /* ──────────────── the routing table, as evidence ────────────────
  *
@@ -870,6 +879,22 @@ size_t rnsdBz2Decompress(const uint8_t* in, size_t in_len, uint8_t* out, size_t 
 bool rnsdDestListenLinks(int      dest_handle,
                          uint16_t target_port);
 
+/** The per-destination inbound gate. `accept` false makes rnsd DROP everything
+ *  addressed to the destination behind `dest_handle` without proving it —
+ *  packets, and Resource advertisements on its inbound links alike.
+ *
+ *  rnsd proves on successful hand-off to the consumer and never on a dropped
+ *  one, so withholding the proof leaves the message on the sender's side, where
+ *  their own retry loop holds it. That is the only way to tell an arbitrary
+ *  LXMF sender "mailbox full": there is no such thing on the wire. A store that
+ *  has run out of room closes this gate rather than accepting what it cannot
+ *  keep.
+ *
+ *  A destination accepts by default; the gate is not persisted, so a
+ *  re-registration accepts again until the owner says otherwise. Returns true
+ *  if the request was queued. */
+bool rnsdDestSetAccept(int dest_handle, bool accept);
+
 /* ──────────────── Resource transfer ────────────────
  *
  * Messages larger than a single Link packet (~440 B encrypted) ride a
@@ -896,6 +921,24 @@ bool rnsdDestListenLinks(int      dest_handle,
  *  Returns true if the aux was queued to rnsd (not delivery success). */
 bool rnsdLinkSendResource(const char* tag, void* buf, size_t len,
                           uint32_t opaque_id);
+
+/** Send `buf`/`len` as a Resource on the **Channel** identified by `tag` — the
+ *  rnsdChannelOpen tag, or the rnsd-generated `cin.<8hex>` an inbound Channel
+ *  arrives with (rnsd_link_incoming_t.tag).
+ *
+ *  A Channel slot owns a hidden Link that is never exposed, so a consumer with
+ *  a payload past the channel MDU has nowhere else to put it; this runs the
+ *  Resource on that Link. Ownership, the `opaque_id` echo, and the
+ *  RNSD_LINK_RESOURCE_* aux lifecycle are exactly rnsdLinkSendResource()'s —
+ *  including the completion aux, which lands on the same shared
+ *  RNSD_LINK_RESOURCE_AUX_PORT.
+ *
+ *  A Resource is NOT ordered against the Channel's own messages: the channel
+ *  sequences what it carries, and this rides beside it. A protocol that needs
+ *  the two ordered says so itself, the way a fetch/answer exchange does.
+ *  Returns true if the aux was queued to rnsd (not delivery success). */
+bool rnsdChannelSendResource(const char* tag, void* buf, size_t len,
+                             uint32_t opaque_id);
 
 /** Free a buffer received via RNSD_LINK_RESOURCE_INBOUND_DONE. Thin
  *  wrapper over free() — a symmetry hook in case the allocator changes. */

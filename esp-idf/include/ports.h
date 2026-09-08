@@ -84,7 +84,7 @@ constexpr uint16_t RNSD_PORT_CHANNEL = 11;
  *
  *  Every write to the directory store must happen on the rnsd task — the store
  *  is single-writer by construction, which is what lets every other task read
- *  it lock-free. Claims originate on an app task (lxmf/nomad/rlpg observe a
+ *  it lock-free. Claims originate on an app task (lxmf/nomad/lxmproxy observe a
  *  storage write and react on their own task), so they are marshalled here as
  *  one `rnsd_dir_aux_t` and applied by rnsd's aux handler.
  *
@@ -175,14 +175,29 @@ typedef struct {
 static_assert(sizeof(rnsd_link_request_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_request_t must fit ITS_MAX_MSG_DATA");
 
-/** Outbound Resource send request (RNSD_PORT_LINK aux).
- *  Sent by rnsdLinkSendResource(). `buf` is a heap pointer in the shared
- *  address space; rnsd reads it on its own task, constructs the Resource
- *  (the engine copies the bytes), then free()s it. Caller must not touch
- *  buf after the call returns. */
+/* ---- RNSD_PORT_CHANNEL aux opcodes ----
+ *
+ * A Channel slot owns a hidden Link, and a payload too large for one Channel
+ * message rides a Resource on that Link. The aux is addressed to
+ * RNSD_PORT_CHANNEL and names the channel by its tag; rnsd looks the hidden
+ * Link up in the CHANNEL table, so the same Resource machinery serves both
+ * tables. Payload is `rnsd_link_send_resource_t`, unchanged. */
+enum : uint8_t {
+    RNSD_CHAN_AUX_SEND_RESOURCE = 0x02, /* payload: rnsd_link_send_resource_t —
+                                         * outbound big send (Resource) on the
+                                         * Channel's hidden Link. Sent via
+                                         * rnsdChannelSendResource(). */
+};
+
+/** Outbound Resource send request (RNSD_PORT_LINK or RNSD_PORT_CHANNEL aux).
+ *  Sent by rnsdLinkSendResource() / rnsdChannelSendResource(). `buf` is a heap
+ *  pointer in the shared address space; rnsd reads it on its own task,
+ *  constructs the Resource (the engine copies the bytes), then free()s it.
+ *  Caller must not touch buf after the call returns. */
 typedef struct {
-    uint8_t  op;            /* RNSD_LINK_AUX_SEND_RESOURCE */
-    char     tag[24];       /* outbound link tag (rnsdLinkOpen) */
+    uint8_t  op;            /* RNSD_LINK_AUX_SEND_RESOURCE / RNSD_CHAN_AUX_SEND_RESOURCE */
+    char     tag[24];       /* link tag (rnsdLinkOpen) or channel tag (rnsdChannelOpen /
+                             * the rnsd-generated "cin.<8hex>" of an inbound one) */
     void*    buf;           /* heap ptr, rnsd-owned after the aux */
     uint32_t len;
     uint32_t opaque_id;     /* echoed back in OUTBOUND_DONE (lxmf mid) */
@@ -407,6 +422,18 @@ enum : uint8_t {
                                       * Channel (inside the accepted inbound Link)
                                       * to the consumer instead of raw link
                                       * packets. Used by the rnsh server. */
+    RNSD_DEST_SET_ACCEPT = 0x09,     /* app → rnsd: accept(1) — the per-destination
+                                      * inbound gate. 0 makes rnsd DROP everything
+                                      * addressed to this destination WITHOUT
+                                      * proving it: packets, and Resource
+                                      * advertisements on its inbound links alike.
+                                      * rnsd proves on successful hand-off and
+                                      * never on a dropped one, so withholding the
+                                      * proof is what leaves the message on the
+                                      * sender's side, where their own retry loop
+                                      * holds it. That is the only way to tell an
+                                      * arbitrary LXMF sender "mailbox full".
+                                      * Defaults to 1 (accept). */
 };
 
 /** Connect payload rnsd sends to the consumer's registered

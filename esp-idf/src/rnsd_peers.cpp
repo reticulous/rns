@@ -74,7 +74,7 @@ uint32_t    s_pubNodes = 0;    /* node slots currently published, one bit each *
  * shown as its hash, which is the honest answer rather than a missing one. */
 const char* const kAspects[] = {
     "lxmf.delivery", "lxmf.propagation", "nomadnetwork.node",
-    "rnstransport.probe", "rnsh", "rlpg.mailbox", "netgraph.discovery",
+    "rnstransport.probe", "rnsh", "lxmproxy.server", "netgraph.discovery",
     /* Read constantly by the crawl: every node offering remote management
      * announces this on the stock two-hour beat, which is how a crawl finds
      * who is askable without deriving a single hash. */
