@@ -222,7 +222,7 @@ frame's buffer.) Opcode tables for the framed ports
 (`RNSD_DEST_*`, link aux, resource aux) are in
 [`include/ports.h`](esp-idf/include/ports.h).
 
-## The announce beat — who schedules saying who we are
+## The announce tick — who schedules saying who we are
 
     app  → rnsd   RNSD_DEST_ANNOUNCE <app_data>      "this is my announce now"
     rnsd            … coalesce 60 s, then every interface
@@ -255,22 +255,22 @@ peer rather than just the new one: outbound there is already a unicast fan-out,
 and a few hundred bytes each on a switched link is not worth the plumbing to
 address it.
 
-## The community radius — whom we work for
+## The service radius — whom we work for
 
-Every interface carries one number, its **Community Radius**
+Every interface carries one number, its **service radius**
 (`rnsd_iface_t.community_radius`): nodes within that many hops heard on the
 interface are this node's community — the ones it works for. A community
 member's announce is **stored** (the original signed bytes, so path requests
-for it can be answered from custody), ranked to **persist** in the directory
+for it can be answered from what is stored), ranked to **persist** in the directory
 (`RDIR_CLAIM_ANSWER_FOR`, above everything merely overheard), given the
-**custody path lifetime**, and **re-broadcast** to the rest of the community on
+**stored-path lifetime**, and **re-broadcast** to the rest of the community on
 shared media. Path requests arriving on an interface with a community
 (radius > 0) are **searched** on the requestor's behalf, out every other
 interface. Radius 0 is a pure endpoint/uplink: everything heard there is
 forwarded and resolved on demand, nothing unrequested is stored, no relay work
-is spent onto it, and no errands are run for it.
+is spent onto it, and no searches are run on its behalf.
 
-Three verbs keep the triage honest: everyone on the mesh is **heard** (they
+Three words keep the distinction honest: everyone on the mesh is **heard** (they
 appear in On The Mesh whatever the radius) and **reachable** (on-demand
 resolution, the direct peer's own announces, claims and active routes are kept
 regardless); only the community is **served**. Membership is re-evaluated on
@@ -278,16 +278,16 @@ every announce rather than latched, so a destination that drifts beyond the
 radius stops being an obligation.
 
 Two things the radius deliberately does **not** govern. **Answering** a path
-request for a destination already in custody is never gated: custody, once
-taken, is served to anyone who asks — that is what makes a gateway a gateway.
+request for a destination we have already stored is never gated: a stored
+announce, once taken, is served to anyone who asks — that is what makes a gateway a gateway.
 And the **point-to-point** no-echo rule (`point_to_point`) is a fact about the
 medium rather than a policy, so it always applies.
 
 Searching is the asymmetric one. Relaying is decided on the egress side — a
 forwarded announce is re-broadcast only within the listeners' radius, so the
-uplink's firehose is never sprayed across a radio. Searching is decided on the
+uplink's full announce load is never sprayed across a radio. Searching is decided on the
 **requestor** side: a request arriving on a radius-0 interface is not our
-errand however well we could run it — otherwise the wider network's discovery
+work to do however well we could do it — otherwise the wider network's discovery
 load lands on this node, which is exactly what being an uplink's customer must
 not mean.
 
@@ -296,7 +296,7 @@ the radio (serve the mesh), radius 0 on the TCP peer (an uplink, on-demand
 only). The hop bound is also the leak defense: another gateway relaying the
 wide network onto the radio delivers those announces *deep* (they carried
 their whole wide-network distance across it), so they fall outside the radius
-and are never taken into custody, while native mesh members arrive shallow and
+and are never stored, while native mesh members arrive shallow and
 are.
 
 ## The neighbourhood — who is one hop away
@@ -320,7 +320,7 @@ format from the same code.
 
 Kept only for an interface with a **community** (`community_radius > 0`): a
 radius-0 interface is an uplink, whose far end is a route rather than a
-neighbourhood, and whose announce firehose is the whole wide network. `n` says
+neighbourhood, and whose announce load is the whole wide network. `n` says
 so for such an interface instead of showing an empty list.
 
 ### Nodes and destinations
@@ -463,24 +463,24 @@ some other medium.
 
 ## The directory
 
-Everything `rnsd` knows about *other* destinations lives in one arena of packed
+Everything `rnsd` knows about *other* destinations lives in one record pool of packed
 fixed-size records, sized from a byte budget at boot and persisted as an image
 of the live records (`<state>/rnsd/dir.img`). There is no separate identity
 cache: the public key, the aspect hash, and the route to a destination are
 fields of the same record, so they are acquired together, evicted together, and
 cannot disagree.
 
-The image holds what the node currently knows, not the arena it knows it in:
+The image holds what the node currently knows, not the record pool it knows it in:
 records go out in eviction order (most valuable first) and the file is bounded
 by `s.rnsd.dir.img_max_kb`, so a 256 KB-`/state` board writes a few KB rather
-than its whole arena. The guard depth is never written — its ages are on the
+than its whole record pool. The seen-only depth is never written — its ages are on the
 uptime clock, which restarts at boot.
 
 Three depths, each dropped before the one under it when memory runs short:
 
 | depth | means | per record |
 |---|---|---|
-| guard | "I have seen this announce" | 28 B |
+| seen | "I have seen this announce" | 28 B |
 | + directory | "I know who this is" | 188 B |
 | + blob | "I can answer a path request for this" | 508 B |
 
@@ -488,12 +488,12 @@ The ordering is the point: losing the ability to serve a path request for a
 destination degrades a network service, while losing the ability to say who it
 is degrades information — so the former goes first.
 
-**What gets kept follows the community radius.** Every announce updates the
-guard (replay and recency suppression, which is what stops a repeat announce
+**What gets kept follows the service radius.** Every announce updates the
+seen record (replay and recency suppression, which is what stops a repeat announce
 re-entering the retransmission queue at ~1.5 s of LoRa airtime). Whether
 anything deeper is *retained* depends on where it arrived and how far away its
-origin is: within the ingress interface's community radius it is kept —
-custody of the mesh this node serves — and beyond it only what was resolved on
+origin is: within the ingress interface's service radius it is kept —
+the stored announces of the mesh this node serves — and beyond it only what was resolved on
 demand, originated by the direct peer, claimed, or is in active use. Each
 interface straddle exposes the radius as its own `community_radius` setting —
 default 3 for LoRa, ESP-NOW, the LAN interface and Bluetooth, 0 for TCP.
@@ -546,8 +546,8 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.path.ttl_roaming` | `3600` | Roaming path lifetime, seconds (`Transport::roaming_path_time`). |
 | `s.rnsd.path.escalate_s` | `3` | Cheapest-first discovery: seconds a path request we originate waits on the fast interfaces before it is also asked of the slow ones. Nearly every answer arrives over the cheap link, so the radio is usually never asked at all; the cost of being wrong is that a radio-only destination resolves this many seconds later. A node with no fast interface skips the grace entirely. |
 | `s.rnsd.path.cheap_bps` | `50000` | Bits/sec at or above which an interface counts as cheap for the above. Bitrate rather than interface type, so a metered or slow uplink is treated like a radio without naming either. An interface that declares no bitrate counts as cheap — an unknown cost must not delay discovery. |
-| `s.rnsd.path.ttl_custody` | `86400` | Lifetime for community members — destinations within their interface's community radius. Mode gets this backwards for a gateway — it hands the *shortest* lifetime (`ttl_ap`) to the access-point radio, whose destinations cost the most to re-acquire and are the ones we answer for. |
-| `s.rnsd.dir.budget_kb` | `0` | Directory arena size in KiB. `0` derives it from free PSRAM at boot, clamped to 40–96 KiB. Boot-time value: pools do not resize live. |
+| `s.rnsd.path.ttl_custody` | `86400` | Lifetime for community members — destinations within their interface's service radius. Mode gets this backwards for a gateway — it hands the *shortest* lifetime (`ttl_ap`) to the access-point radio, whose destinations cost the most to re-acquire and are the ones we answer for. |
+| `s.rnsd.dir.budget_kb` | `0` | Directory record pool size in KiB. `0` derives it from free PSRAM at boot, clamped to 40–96 KiB. Boot-time value: pools do not resize live. |
 | `s.rnsd.dir.blob_slot` | `320` | Bytes per retained-announce slot. An announce whose raw form exceeds it is not retained, and a path request for that destination falls through to normal discovery. Changing it discards the stored image (it is a structural property). |
 | `s.rnsd.dir.persist_s` | `900` | Seconds between directory image writes, when anything changed. The contents are a cache, so a crash costs at most one interval; the interval is minutes rather than the 60 s storage class because the directory changes on every retained announce. `0` = never persist (every destination is re-learned by path request after a reboot). |
 | `s.rnsd.dir.persist_routes` | `0` | Trust the routes in a restored directory image. Off by default: a key is a fact about a destination and is true whenever we next need it, while a route is a statement about the network at one moment, and nothing in a restored image can vouch for the next hop still being there or the interface still being up. Dropping them costs one path request per destination actually used and keeps every key, which is the expensive half. A transport node serving path requests for others is the one case with an appetite for the old behaviour. |
@@ -582,7 +582,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.stats.{packets_in,packets_out,bytes_in,bytes_out,ifaces_up}` | Traffic counters. |
 | `rnsd.stats.dir.{entries,blobs,guards}` | Directory pool occupancy. |
 | `rnsd.stats.dir.{guard_drops,evictions,recall_miss,seq_retries}` | Announces suppressed as replays, records evicted, public keys asked for and not held, and reader/writer races on a record. |
-| `rnsd.dir.{slots,bytes}` | Directory pool capacity and arena size, published once at boot. |
+| `rnsd.dir.{slots,bytes}` | Directory pool capacity and record pool size, published once at boot. |
 | `rnsd.gw.{rssi,snr,timestamp}` | Gateway/infrastructure signal — the received quality (rssi dBm, snr dB) of the transport node that last relayed a packet to us: the last packet addressed to one of our destinations/links that arrived on a signal-capable interface with more than one hop. `timestamp` is device unix-seconds of that sample (UIs fade the indicator out over ~30 min from it). Kept as the last qualifying sample; not cleared on a direct packet. |
 | `rnsd.links.<tag>.{state,direction,aspect,remote_hash,opened_s,last_error,…}` | Per-link state tree, keyed by the caller's `tag` — observable before the link_id exists. |
 | `rnsd.links.byid.<link_id>` | Reverse index: link_id → tag. |
@@ -590,7 +590,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.chan.byid.<link_id>` | Reverse index: channel's hidden link_id → tag. |
 | `rnsd.dest.<idx>.{aspect,dest}` | Hosted-destination (our-dest) observability. |
 | `rnsd.ifaces.<name>.{up,mode,mtu,bitrate,rx_bytes,rx_packets,tx_bytes,tx_packets}` | Per-interface state and counters. |
-| `rnsd.ifaces.<name>.{peers,nodes}` | Direct peers and the nodes they group into, on that interface; both `0` where its community radius is. |
+| `rnsd.ifaces.<name>.{peers,nodes}` | Direct peers and the nodes they group into, on that interface; both `0` where its service radius is. |
 | `rnsd.peers.count` | Direct peers across every interface with a community — the length of the list below. |
 | `rnsd.peers.<i>.{iface,node,dest,aspect,name,hops,heard,announces,rssi,snr}` | One direct peer — a destination one hop away (below). |
 | `rnsd.nodes.slots` | How far a reader iterates the node table. |
@@ -627,7 +627,7 @@ went.
 A medium that knows more publishes it under its own prefix
 ([iface-lora](../iface-lora) does); this is the floor, not the ceiling.
 
-### Command sentinels (read, self-clearing)
+### Command keys (read, self-clearing)
 
 Single-shot debug triggers — write a value and rnsd consumes it on its own task:
 `rnsd.cmd.clink`, `rnsd.cmd.creq`, `rnsd.cmd.link.open`, `rnsd.cmd.request_path`,

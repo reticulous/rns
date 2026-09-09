@@ -105,7 +105,7 @@ Our deltas, by category:
   nomad nodes resolved on demand stayed nameless, listed by address hash. The
   same outstanding `_path_requests` entry is the gate; a path response we did
   not ask for is somebody else's answer in transit and stays silent.
-- `Directory.{h,cpp}` (new) + `Identity.cpp`/`.h` — **one arena replaces the
+- `Directory.{h,cpp}` (new) + `Identity.cpp`/`.h` — **one record pool replaces the
   identity cache and the path table.** `Identity` has no `_known_destinations`
   map: `recall()` reads the directory pool, `recall_app_data()` slices the
   retained raw announce, and `remember()` is gone — validation no longer stores
@@ -243,11 +243,11 @@ Our deltas, by category:
 - `Transport.cpp` — **one announce, one line.** The relay decision is a clause
   on the announce's own `Destination %s is now %d hops away…` line, not a line
   of its own. Adding a line per decision to a path already emitting several is
-  how the firehose got built in the first place.
+  how that flood got built in the first place.
 - `Transport.cpp` — **an announce nothing could carry is refused at ingress.**
   `announce_relay_possible()` asks, before the announce table is touched,
   whether *any* OUT interface could re-broadcast this announce: an announce
-  from beyond an interface's community radius is never re-broadcast onto it
+  from beyond an interface's service radius is never re-broadcast onto it
   (radius 0 relays nothing), and a point-to-point interface
   never echoes back out what arrived on it. A node where neither survives — a
   radius-bounded radio plus the TCP link the announce came in on — used to store
@@ -283,11 +283,11 @@ Our deltas, by category:
 - `Transport.cpp` — **announce ingest splits forwarding from storage.** Upstream
   computes one `should_add` over retained state and uses it to gate the
   retransmission queue, the immediate rebroadcasts *and* the table insert. Here
-  `fresh` is the forwarding input, computed by the guard pool over every announce
+  `fresh` is the forwarding input, computed by the seen-record pool over every announce
   we ever validated rather than over whatever we happened to keep; `retain` is
   the storage decision, true when the announce was resolved on demand (an
   outstanding path request), originated within the ingress interface's
-  community radius, was originated by the direct peer, is claimed, or is in
+  service radius, was originated by the direct peer, is claimed, or is in
   active use. A longer path never
   displaces a shorter one while the shorter one is still valid, and an announce
   we have already seen and already hold is not re-stored — on a mesh where
@@ -447,7 +447,7 @@ it is now implemented, plus fork-specific behaviour for point-to-point links.
   included — so a radio-edge node whose only interface is an AP is
   undiscoverable *and* unreachable: its announce enters no cache, so no path
   request for it can ever be answered. Here the announce egress gate is the
-  community radius (`Transport::outbound` blocks a forwarded announce whose
+  service radius (`Transport::outbound` blocks a forwarded announce whose
   hops exceed the egress interface's radius), and destinations in
   `_destinations` are exempt from it — this node's own announces are a
   trickle and must reach every interface. The radius keeps the airtime
@@ -455,7 +455,7 @@ it is now implemented, plus fork-specific behaviour for point-to-point links.
   link, because it arrives deeper than any radius.
 - **Path-request handling is community-aware.** Whether a request is searched
   at all is the requestor-side gate (`path_search_possible`: an interface with
-  no community gets no errands run); a search that is taken on goes out every
+  no served set gets no searches run for it); a search that is taken on goes out every
   other interface, honouring the point-to-point echo suppression.
   The
   forwarded-request dedup table (`_discovery_pr_tags`) evicts **FIFO**
@@ -471,11 +471,11 @@ it is now implemented, plus fork-specific behaviour for point-to-point links.
 
 #### 1.1.2 The directory (`Directory.{h,cpp}`)
 
-Everything this node knows about *other* destinations is one arena of packed
+Everything this node knows about *other* destinations is one record pool of packed
 fixed-size records: the public key, the aspect name hash and the route are
 fields of the same record, so they are acquired together, evicted together, and
 cannot disagree. It depends on nothing outside µR's own types and a three-hook
-platform struct (`arena_alloc`, `image_load`, `local_minutes`) — no filesystem,
+platform struct (`record pool_alloc`, `image_load`, `local_minutes`) — no filesystem,
 no configuration store, no allocator policy. The embedder (rnsd) supplies the
 hooks, the byte budget, and the file the image lands in (§7).
 
@@ -486,12 +486,12 @@ reader and a raw persisted image.
 
 | pool | means | slot |
 |---|---|---|
-| guard | "I have seen this announce" | 28 B |
+| seen | "I have seen this announce" | 28 B |
 | directory | "I know who this is" — keys, name hash, routing, claims | 160 B |
 | blob | "I can answer a path request for this" — the raw signed announce | 320 B (`s.rnsd.dir.blob_slot`) |
 
 Slot counts come from a byte budget (`s.rnsd.dir.budget_kb`, or a share of free
-PSRAM at boot) split 8 : 4 : 1 guard : directory : blob — 664 : 332 : 83 at the
+PSRAM at boot) split 8 : 4 : 1 seen : directory : blob — 664 : 332 : 83 at the
 96 KiB ceiling. Nothing allocates after `rdirInit`, so no arrival path can fail
 for memory: a full pool evicts, and an ingest that cannot get its deeper layer
 silently keeps the weaker one. Lookup is a linear scan of the pool, which is
@@ -508,9 +508,9 @@ reset the counter: a counter restarting at zero could match a value a reader
 captured before the reuse, and that reader would accept a torn record. The
 reader's *scan* is racy by construction — a slot can be reused mid-walk — so
 the candidate is confirmed (used flag, key match) inside the seqlocked copy,
-not before it. No pointer into the arena escapes.
+not before it. No pointer into the record pool escapes.
 
-**The guard is the forwarding memory, and it is not the directory.** Every
+**The seen record is the forwarding memory, and it is not the directory.** Every
 announce we validate updates it, whether or not we keep anything else: a
 4-byte-truncated destination hash, a four-deep ring of 4-byte random-blob
 fingerprints, the announce's own emission time, and a local age in wrapping
@@ -526,12 +526,12 @@ have already heard — treat that as a replay and path discovery works exactly
 once and then goes silent.
 
 **Ingest splits forwarding from storage.** In `Transport::inbound`, `fresh` is
-the forwarding input (the guard, over every announce ever validated) and
+the forwarding input (the seen records, over every announce ever validated) and
 `retain` is the storage decision, true when a strictly-better-or-equal route
 arrives *and* one of: the announce was resolved on demand (an outstanding path
 request — the arm that keeps a radius-0 interface usable at all, or a node
 with only a cheap link would discard the path response it just asked for), its
-origin is within the ingress interface's community radius, it was originated
+origin is within the ingress interface's service radius, it was originated
 by the direct peer (hops 1 on the wire), the destination is claimed, or
 its route is in active use. A longer path never displaces a shorter valid one;
 an announce already seen and already held is not re-stored, which on a mesh
@@ -548,16 +548,16 @@ first within a category:
 
 | category | ordered by |
 |---|---|
-| guard-only | local age |
+| seen-only | local age |
 | unclaimed, no live route | `last_heard` |
 | ephemeral claim past decay | `claim_touch` |
 | ephemeral claim, live | `claim_touch` |
 | interface-retained (`EDGE`), unclaimed | `last_heard` |
-| persist claims, and custody | `claim_touch`, or `last_heard` for custody |
+| persist claims, and stored announces | `claim_touch`, or `last_heard` for a stored announce |
 | route used recently | `last_used` |
 
-`RDIR_CLAIM_ANSWER_FOR` is custody, not a consumer claim: it is set when the
-destination is a community member — within its interface's community radius —
+`RDIR_CLAIM_ANSWER_FOR` means "we answer for this", not a consumer claim: it is set when the
+destination is a community member — within its interface's service radius —
 and it ranks with the persistent claims — without it a gateway's own
 segment competes for slots with a large network's announce churn and loses
 continuously, because the churn is what keeps arriving. It is re-evaluated on
@@ -630,7 +630,7 @@ place.
 
 **Only for an interface with a community** (`community_radius > 0`). A radius-0
 interface is an uplink: its far end is a route rather than a neighbourhood, and
-its announce firehose is every node in the wide network that is one hop from
+its announce load is every node in the wide network that is one hop from
 *it*. That is also what bounds the tables — 16 nodes and 32 peers, PSRAM,
 least-recently-heard evicted — since the media that have communities have
 neighbourhoods the size of a room, a LAN or a radio's range.
@@ -734,7 +734,7 @@ task**, or the work silently no-ops (an outbound path-request packet is just
 dropped). Cross-task entry points therefore split in two: pure-crypto helpers
 (`sha256`/`sign`/`verify`/`dest_hash`) run inline on the caller; `recall*` take
 the recursive mutex; everything else is deferred to the rnsd task via an ITS
-message or a storage command sentinel (`rnsd.cmd.*`), which rnsd drains on its
+message or a storage command key (`rnsd.cmd.*`), which rnsd drains on its
 own task.
 
 **Single wait point.** `itsPoll(deadline)` is the only blocking call — it wakes
@@ -818,7 +818,7 @@ Consumer connect payloads are rnsd-private structs; callers use the `rnsd.h`
 wrappers and never build them by hand. Every framed struct `static_assert`s
 `<= ITS_MAX_MSG_DATA`.
 
-## 4. Hosted destinations (our-dests)
+## 4. Hosted destinations
 
 `rnsdDestOpen(aspect, identity_key, dest_type, …)` registers an IN destination
 on the named identity (`""` → `secrets.rnsd.identity`) and returns a
@@ -887,7 +887,7 @@ the leading 16 bytes before the Reticulum `Packet` payload on send, and prepends
 **DIRECT / Link path does NOT strip or prepend.** Don't "unify" the two: the
 opportunistic strip/prepend is required there and wrong on the Link path.
 
-### 4.1 The announce beat
+### 4.1 The announce tick
 
     app  → rnsd   RNSD_DEST_ANNOUNCE <app_data>      set my stored announce
     rnsd            … 60 s coalesce, then every interface
@@ -1373,11 +1373,11 @@ retransmission queue are not persisted; `rnsd persist` remains a no-op stub for
 them. The default identity is `secrets.rnsd.identity`; rnsd does **not**
 auto-create an application identity at boot — that is the app's call.
 
-**The image is the live set, budgeted against the partition — not the arena.**
+**The image is the live set, budgeted against the partition — not the record pool.**
 Three rules hold it there, and each exists because breaking it broke a board:
 
 - **Only live records are written**, packed, counts in the header. Writing the
-  arena verbatim (holes included) made the file the size of the *budget*, so a
+  record pool verbatim (holes included) made the file the size of the *budget*, so a
   node that knew twelve destinations still wrote 96 KB.
 - **Records go out in eviction order**, most valuable first (`dirCategory` /
   `dirOrder` — the same judgement that decides what to drop under memory
@@ -1385,16 +1385,16 @@ Three rules hold it there, and each exists because breaking it broke a board:
   condition. Blobs follow *all* the directory records, so a tight cap gives up
   answering path requests before it gives up knowing who anyone is.
 - **The cap comes from `/state`**, an eighth of it by default
-  (`s.rnsd.dir.img_max_kb`). The arena budget derives from free PSRAM, and
+  (`s.rnsd.dir.img_max_kb`). The record pool budget derives from free PSRAM, and
   PSRAM says nothing about the flash the image lands in: a T3-S3 has 2 MB of
-  PSRAM and a 256 KB state partition, sized itself a 96 KB arena, and could
+  PSRAM and a 256 KB state partition, sized itself a 96 KB record pool, and could
   then never write it — `atomicWriteFile` needs the new copy and the old one
   resident at once, which is 192 KB of a 64-block filesystem. Every write
   failed with `No more free space`, forever.
 
-The guard depth is **never** persisted, and this is a trade, not a free win.
+The seen-only depth is **never** persisted, and this is a trade, not a free win.
 Its replay check is the fingerprint ring plus `emitted` — both absolute, so a
-reloaded guard pool *would* suppress announces we forwarded before the reboot.
+reloaded seen-record pool *would* suppress announces we forwarded before the reboot.
 What it would not do is matter: the pool is 664 slots at the 96 KiB budget, and
 a node bridged to a large network hears orders of magnitude more distinct
 destinations than that, so it evicts continuously and suppression tends to zero
@@ -1405,7 +1405,7 @@ restarts at boot, so a persisted record computes an age of
 load-time reset to fix. On a small mesh, where suppression would work, the pool
 refills within one announce interval. So it stays out of the image, and the
 cost is one duplicate forward per destination after a reboot — the same reason
-guard churn does not bump `rdirGeneration`.
+seen-record churn does not bump `rdirGeneration`.
 
 An image whose `format_ver` differs is discarded whole — it is a cache, and a
 node that discards one re-learns by path request at the cost of a round trip
@@ -1415,7 +1415,7 @@ per destination.
 
 - **Run Transport-touching code on the rnsd task.** `request_path`, link
   construction, destination registration off-task silently no-op (the outbound
-  packet is dropped). Defer via ITS or a `rnsd.cmd.*` sentinel.
+  packet is dropped). Defer via ITS or a `rnsd.cmd.*` command key.
 - **One name, one interface.** `Transport::_interfaces` is keyed on
   `Interface::get_hash()`, a hash of the interface's *name* alone, and its
   insert keeps the entry already present. A second interface registering under
@@ -1424,7 +1424,7 @@ per destination.
   Transport still holds the first one. `onTransportConnect` refuses a duplicate
   name outright, and Transport warns if one reaches it anyway.
 - **Large tables go in PSRAM, FreeRTOS sync objects do not.** Internal
-  DRAM/DMA is scarce on the T-Deck, so ITS metadata, the directory arena, and recv
+  DRAM/DMA is scarce on the T-Deck, so ITS metadata, the directory record pool, and recv
   buffers live in PSRAM. But queues/stream-buffers/mutexes placed in PSRAM trip
   the `S32C1I` spinlock assert — keep every FreeRTOS sync object in internal RAM.
 - **A `LoadProhibited` in cJSON / `navigatePath` / `storageGetInt` during flash
@@ -1575,7 +1575,7 @@ host a `Destination(identity, IN, SINGLE, app_name, *aspects)`, call
 `set_proof_strategy(PROVE_ALL)` and `set_link_established_callback(...)`, then
 announce on a tight cadence at startup (every 1 s for a ~10 s warm-up, backing
 off to 30 s) so a freshly attached client sees an announce within ~1 s. It also
-prints a `READY <dest_hash_hex>` sentinel on stdout so a fixture can synchronise
+prints a `READY <dest_hash_hex>` command key on stdout so a fixture can synchronise
 instead of racing on a sleep. That variant listens on a `TCPServerInterface` for
 the LAN/loopback pytest path; `nomad_peer.py` is a NomadNet-node counterpart.
 
