@@ -1694,9 +1694,25 @@ static std::vector<RNS::Bytes> ourDestRatchetsLoad(const RNS::Bytes& dest_hash,
     if (rec.empty()) return privs;
     const size_t chars = RNSD_RATCHET_LEN * 2;
     size_t sp = rec.find(' ');
-    if (sp == std::string::npos || (rec.size() - sp - 1) % chars != 0) {
-        warn("ratchets for %s are malformed (%zu chars) — starting a fresh set",
-             dest_hash.toHex().c_str(), rec.size());
+    /* Say WHICH way it is malformed. The total length alone cannot separate the
+     * two failures, and they have different causes: a missing header means
+     * something stored a bare hex payload (this record has three writers — the
+     * two on the proxy handover path store what arrived on the wire verbatim),
+     * while a header plus a remainder that is not a whole number of keys means
+     * the record was truncated somewhere between the write and here. Both
+     * discard the whole retained set, so whichever it is, it costs every peer
+     * that encrypted to a retained ratchet until it hears a fresh announce. */
+    if (sp == std::string::npos) {
+        warn("ratchets for %s have no '<rotated_at> ' header (%zu chars, %zu keys' "
+             "worth) — a bare payload was stored; starting a fresh set",
+             dest_hash.toHex().c_str(), rec.size(), rec.size() / chars);
+        return privs;
+    }
+    if ((rec.size() - sp - 1) % chars != 0) {
+        warn("ratchets for %s are truncated: %zu chars after the header is %zu "
+             "whole keys plus %zu — starting a fresh set",
+             dest_hash.toHex().c_str(), rec.size() - sp - 1,
+             (rec.size() - sp - 1) / chars, (rec.size() - sp - 1) % chars);
         return privs;
     }
     rotated_at = (double)strtoull(rec.c_str(), nullptr, 10);
