@@ -16,7 +16,13 @@
 
 #include "../Bytes.h"
 
-#include "random.h"
+/* Angle-include on purpose. A quote-include is searched from this file's own
+ * directory first, and on a case-insensitive filesystem — a macOS checkout,
+ * which a build container bind-mounts as-is — "random.h" matches this very
+ * file. #pragma once then makes it a silent no-op and spangap-core's
+ * declarations never arrive, so every call below fails to compile. Angle
+ * brackets skip the current directory and go straight to the include path. */
+#include <random.h>
 
 #include <stdint.h>
 
