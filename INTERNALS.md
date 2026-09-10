@@ -59,7 +59,7 @@ Our deltas, by category:
 
 - **Crypto rewritten** against mbedTLS plus foreign primitives vendored under
   `src/donna/`: ed25519-donna (sign/verify/key-derivation, with SHA-512 via
-  mbedTLS and RNG via `esp_fill_random`) and x25519 (ECDH, the same MIT
+  mbedTLS and RNG via spangap-core's `randomBytes`) and x25519 (ECDH, the same MIT
   implementation [wg](../wg) uses). The donna route is a performance
   requirement, not a convenience: mbedTLS's Curve25519 scalar multiplication
   takes ~100 ms on the ESP32-S3, versus under 10 ms for the software donna

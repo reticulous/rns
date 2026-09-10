@@ -19,9 +19,10 @@
 #include "Utilities/Memory.h"
 
 //#include <TransistorNoiseSource.h>
-// Spangap fork: <RNG.h> (rweather/Crypto) gone — esp_fill_random already
-// seeds itself from the ESP32-S3 HRNG, no per-task setup needed. Calls to
-// RNG.begin() / RNG.loop() below are inert no-ops in this configuration.
+// Spangap fork: <RNG.h> (rweather/Crypto) gone — randomness comes from
+// spangap-core's DRBG (randomBytes), seeded once in spangapInit() before any
+// RNS code runs, so no per-task setup is needed here. Calls to RNG.begin() /
+// RNG.loop() below are inert no-ops in this configuration.
 
 #ifdef ARDUINO
 #include <Arduino.h>
@@ -90,7 +91,7 @@ Reticulum::Reticulum() : _object(new Object()) {
 	MEMF("Reticulum default object creating..., this: %p, data: %p", (void*)this, (void*)_object.get());
 
 	// Initialize random number generator
-	TRACE("Initializing RNG (esp_random self-seeded from HRNG)...");
+	TRACE("Initializing RNG (spangap-core DRBG, seeded in spangapInit)...");
 	TRACEF("RNG initial random value: %u", Cryptography::randomnum());
 
 #ifdef ARDUINO
@@ -254,8 +255,8 @@ void Reticulum::loop() {
 			RNS::Transport::loop();
 		}
 
-		// Spangap fork: rweather RNG.loop() removed; esp_random has no
-		// per-iteration housekeeping (HRNG fills entropy autonomously).
+		// Spangap fork: rweather RNG.loop() removed; the core DRBG reseeds
+		// itself on mbedTLS's schedule and needs no per-iteration housekeeping.
     }
     catch (const std::bad_alloc&) {
 		ERROR("Reticulum::loop: bad_alloc - OUT OF MEMORY");

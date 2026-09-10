@@ -38,7 +38,7 @@ contains:
 | `ed25519-hash.h`, `ed25519-randombytes.h` | Same upstream (donna) | Public domain |
 | `x25519.{c,h}` | © 2015–2016 Cryptography Research, Inc. (Mike Hamburg) — re-vendored from `trombik/esp_wireguard` | MIT (see `src/donna/x25519-license.txt`) |
 | `ed25519-hash-custom.h` | **New, this fork** — SHA-512 hook routed through ESP-IDF mbedTLS | Apache-2.0 |
-| `ed25519-randombytes-custom.h` | **New, this fork** — RNG hook routed through `esp_fill_random` (ESP32-S3 HRNG) | Apache-2.0 |
+| `ed25519-randombytes-custom.h` | **New, this fork** — RNG hook routed through spangap-core's DRBG (`randomBytes`) | Apache-2.0 |
 | `x25519-license.txt` | Attribution carried alongside `x25519.c` | — |
 
 Compile-time defines applied to donna: `ED25519_CUSTOMHASH`,
@@ -66,7 +66,7 @@ context) describing the local change. Summary:
 | File | Nature of change |
 |---|---|
 | `src/Log.cpp` | Upstream's Arduino `Serial.print*` and native `printf` log sinks replaced with spangap's `err()`/`warn()`/`info()`/`dbg()`/`verb()` macros (per-task `[taskname]` prefix preserved). `getTimeString()` stubbed — spangap prepends its own timestamp. |
-| `src/Reticulum.cpp` | Removed `<RNG.h>` (rweather/Crypto) include and `RNG.begin()`/`RNG.loop()` call sites — `esp_fill_random` self-seeds from the ESP32-S3 HRNG, no per-task setup or housekeeping needed. |
+| `src/Reticulum.cpp` | Removed `<RNG.h>` (rweather/Crypto) include and `RNG.begin()`/`RNG.loop()` call sites — randomness is spangap-core's DRBG, seeded once at boot; no per-task setup or housekeeping needed. |
 | `src/Transport.cpp` | Added per-destination cap on `random_blobs` matching upstream RNS (`Transport.py`: `random_blobs = random_blobs[-MAX_RANDOM_BLOBS:]`) — the C++ upstream had no cap, so the list grew without bound. Announce-propagation path implemented/fixed (see `rns/INTERNALS.md` §1.1.1): `announce_cap` throttle wired up and its `tx_time`/`wait_time` corrected from truncating integer math to `double` seconds; per-interface queue drained from `jobs()`; capped announces flagged `deferred` so `outbound()` doesn't report them as undeliverable; fork-added point-to-point echo suppression for forwarded announces (keyed on the packet's `receiving_interface()`) and for `request_path`; fork-added per-interface community radius gating announce storage/relaying, path lifetimes, and path-request searching (see `rns/README.md`); `_discovery_pr_tags` given FIFO eviction (`_discovery_pr_tags_order`) and a larger cap; `drop_announce_queues()` implemented and the announce-table retransmit gated on `transport_enabled()` so a runtime disable takes effect without a reboot. |
 | `src/Bytes.h` | ArduinoJson adapters at the bottom of the header dropped (slated for cJSON rewrite in `Utilities/Persistence`). Also: upstream's null-branch in `data()` returned a temporary `Data()` by const-ref (undefined behavior); replaced with a static empty instance. |
 | `src/Interface.h` | ArduinoJson include + adapters dropped (same reason as `Bytes.h`). Added `announce_cap`, `point_to_point` and `community_radius` accessors and their members (hidden-node-aware echo suppression + the community radius, see `rns/INTERNALS.md` §1.1.1). |
@@ -78,7 +78,7 @@ context) describing the local change. Summary:
 | `src/Cryptography/Hashes.cpp` | SHA-256/512 backed by mbedTLS (uses the ESP32-S3 SHA peripheral automatically). |
 | `src/Cryptography/Ed25519.h` | Backed by `donna/ed25519.{c,h}` (djb-style 32-byte secret + derived 32-byte public, 64-byte signature). |
 | `src/Cryptography/X25519.h` | Backed by `donna/x25519.{c,h}`. |
-| `src/Cryptography/Random.h` | Random bytes via `esp_fill_random` (HRNG-seeded) instead of rweather/Crypto's `RNG` class. |
+| `src/Cryptography/Random.h` | Random bytes via spangap-core's `randomBytes` (a CTR-DRBG seeded at boot inside an entropy-source window) instead of rweather/Crypto's `RNG` class. |
 | `src/Utilities/OS.h` | File-I/O methods no-op'd per Reticulous component plan §10.5 (`read_file`/`write_file`/`open_file`/etc. return empty / `false` / `0`). `register_filesystem()` left functional in case anything wants to attach a real backing store later. |
 | `src/Utilities/Persistence.{h,cpp}` | ArduinoJson dependency removed entirely. Upstream's globals (`JsonDocument _document`, `Bytes _buffer`) gone. `.cpp` retained as compilation placeholder pending the cJSON-based rewrite. |
 | `src/Persistence/DestinationEntry.cpp` | `WARNINGF` log demoted on the path-table hot path (`decode()` runs on every `_new_path_table.get(...)` — hundreds of times per second when Transport iterates paths during Link maintenance). |

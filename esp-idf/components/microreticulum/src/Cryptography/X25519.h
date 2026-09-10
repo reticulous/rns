@@ -70,7 +70,7 @@ namespace RNS { namespace Cryptography {
 				// Generate a fresh random scalar. RFC 7748 clamping is
 				// applied by donna's x25519_base() so the raw bytes here
 				// are pre-clamp.
-				esp_fill_random(_privateKey.writable(32), 32);
+				randomBytes(_privateKey.writable(32), 32);
 			}
 			// Derive public key = X25519_base(scalar)
 			::x25519_base(_publicKey.writable(32), _privateKey.data(), /*clamp=*/1);

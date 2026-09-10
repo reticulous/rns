@@ -11,7 +11,7 @@
 #   - x25519.c from Mike Hamburg / strobe (MIT) for X25519 ECDH —
 #     re-vendored rather than depending on spangap-core's PRIV_INCLUDE'd
 #     copy under src/esp_wireguard/.
-#   - SHA-512 backed by mbedTLS, RNG by esp_fill_random — see
+#   - SHA-512 backed by mbedTLS, RNG by spangap-core's randomBytes — see
 #     donna/ed25519-hash-custom.h and donna/ed25519-randombytes-custom.h.
 #
 # Public include path: src/ + include/. Headers reference each other as

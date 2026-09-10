@@ -66,7 +66,7 @@ namespace RNS { namespace Cryptography {
 				}
 				_privateKey = privateKey;
 			} else {
-				esp_fill_random(_privateKey.writable(32), 32);
+				randomBytes(_privateKey.writable(32), 32);
 			}
 			::ed25519_publickey(_privateKey.data(), _publicKey.writable(32));
 		}

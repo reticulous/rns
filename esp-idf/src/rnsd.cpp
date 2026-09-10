@@ -476,12 +476,17 @@ static void logWire(const char* iface, const char* dir, const uint8_t* p, size_t
          * only packets that can involve this node (single/group/link-
          * addressed, proofs, lreqs). Our own tx of these stays at debug. */
         if (ptype == 1 /*announce*/ || dtype == 2 /*plain*/) {
-            /* hops=1 stays at debug, above the verbose flood: traffic from the
-             * local neighborhood — one link away — matters more than the wider
-             * mesh's endlessly repeated announces. */
-            if (p[1] == 1) {
-                dbg("%s rx %s %s %s ctx=%s hops=1 %zuB",
-                    iface, wirePktType(ptype), wireDestType(dtype), hash, ctx, n);
+            /* The neighborhood stays at debug, above the verbose flood: it
+             * matters more than the wider mesh's endlessly repeated announces.
+             * This is the WIRE hop count, before Transport::inbound steps it —
+             * so 0 is the node at the other end of the link announcing its own
+             * destination, and 1 is one relay further out. Both are local; the
+             * firehose a busy TCP peer relays is 1 and up, but demoting 0 would
+             * hide exactly the announce that proves a direct peer was heard. */
+            if (p[1] <= 1) {
+                dbg("%s rx %s %s %s ctx=%s hops=%u %zuB",
+                    iface, wirePktType(ptype), wireDestType(dtype), hash, ctx,
+                    (unsigned)p[1], n);
             } else {
                 verb("%s rx %s %s %s ctx=%s hops=%u %zuB",
                      iface, wirePktType(ptype), wireDestType(dtype), hash, ctx,
@@ -927,7 +932,16 @@ static void onTransportRecv(int handle, size_t /*bytesAvail*/)
      * packet, updates the path table on announces, and forwards as needed. */
     if (i->mr_iface) {
         RNS::Bytes data(pkt, n);
-        i->mr_iface.handle_incoming(data);
+        /* Nothing a peer puts on the wire may take the task down. Every
+         * parser inside is meant to reject bad input by return value or by a
+         * caught exception; this is the backstop for the one that does not. */
+        try {
+            i->mr_iface.handle_incoming(data);
+        } catch (const std::exception& e) {
+            err("rnsd: inbound packet on %s threw: %s", i->info.name, e.what());
+        } catch (...) {
+            err("rnsd: inbound packet on %s threw a non-std exception", i->info.name);
+        }
     }
     /* The stash is valid for exactly that call. Transport::inbound is also
      * reached by a cache replay, which has no arriving frame behind it and must
