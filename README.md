@@ -586,7 +586,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.gw.{rssi,snr,timestamp}` | Gateway/infrastructure signal — the received quality (rssi dBm, snr dB) of the transport node that last relayed a packet to us: the last packet addressed to one of our destinations/links that arrived on a signal-capable interface with more than one hop. `timestamp` is device unix-seconds of that sample (UIs fade the indicator out over ~30 min from it). Kept as the last qualifying sample; not cleared on a direct packet. |
 | `rnsd.links.<tag>.{state,direction,aspect,remote_hash,opened_s,last_error,…}` | Per-link state tree, keyed by the caller's `tag` — observable before the link_id exists. |
 | `rnsd.links.byid.<link_id>` | Reverse index: link_id → tag. |
-| `rnsd.chan.<tag>.{state,direction,aspect,remote_hash,link_id,mtu,rtt_ms,tx_msgs,rx_msgs,last_error,…}` | Per-channel state tree (`rnsdChannelOpen`), same shape as the link tree. |
+| `rnsd.chan.<tag>.{state,direction,aspect,remote_hash,link_id,mtu,rtt_ms,tx_msgs,rx_msgs,outstanding,last_error,…}` | Per-channel state tree (`rnsdChannelOpen`), same shape as the link tree. `outstanding` is how many of this consumer's messages are still unproved: a Channel envelope is either proved by the far side or the link is torn down trying, so **zero means everything sent so far has been received** — a delivery receipt for the whole channel, and the reason a consumer protocol over a Channel needs no acknowledgement frame of its own. |
 | `rnsd.chan.byid.<link_id>` | Reverse index: channel's hidden link_id → tag. |
 | `rnsd.dest.<idx>.{aspect,dest}` | Hosted-destination (our-dest) observability. |
 | `rnsd.ifaces.<name>.{up,mode,mtu,bitrate,rx_bytes,rx_packets,tx_bytes,tx_packets}` | Per-interface state and counters. |
@@ -682,7 +682,21 @@ carries.
 
 `rnprobe [aspect] <dest_hash> [-s size] [-n count] [-t timeout_s] [-w wait_s]`
 is the Reticulum reachability probe (the `rnstatus`/`rnping` analogue): it dials
-`rnstransport.probe` on the target by default and reports round-trip status.
+`rnstransport.probe` on the target by default and reports round-trip status. The
+probe itself is `rnsdProbe()` (rnsd.h), so anything else that already knows a
+node can take a round trip to it in the same words — [iface-lora](../iface-lora)'s
+`lora probe <num>` does, against a neighbour it lists.
+
+**A probe opens an outbound-only connection, and that is not a failure.** The
+hash it names is the target's, but the connection it opens is one of *ours*: no
+identity key means rnsd's own identity, and the aspect must be the target's,
+because the outbound destination is built on it. So probing a peer's
+`rnstransport.probe` asks to host ours — which a node answering probes already
+does (`s.rnsd.respond_to_probes`). Transport allows one IN registration per
+destination hash and rnsd will not ask for a second: it notices the hash is
+hosted here and gives the consumer the connection outbound-only, which is all a
+probe ever needed — sending recalls the *target's* identity and builds an OUT
+destination of its own.
 
 Run any of these on-device through `spangap cli "<command>"`.
 

@@ -857,6 +857,26 @@ only the rnsd task may touch. It exists because a peer's report of a link names
 the *destination* it heard, so joining that report to a node means asking each
 node which destinations are its own — see [netgraph](../netgraph/README.md).
 
+**An our-dest the node already hosts opens outbound-only.** Transport keeps one
+IN registration per destination hash and throws on a second — the right rule,
+since two consumers on one hash would each believe the inbound callback and the
+proving were theirs. So `ourDestConnect` computes the hash it is about to ask
+for (`Destination::hash(identity, app, aspects)`), asks `rnsdHostsDest()`, and
+where the answer is yes hands back the connection without a listener rather than
+constructing one that cannot register. The consumer loses nothing it was using:
+`ourDestTrySend` recalls the *target's* identity and builds an OUT destination of
+its own, so sending never touches `listener_dest`.
+
+`rnprobe` is the ordinary case and is not a mistake. A probe names the target's
+hash on the frame it sends, but the connection it opens is one of ours — no
+identity key means rnsd's own identity, and the aspect has to be the target's
+because the outbound destination is built on it — so probing a peer's
+`rnstransport.probe` asks to host ours, which `rnsdProbeDestUp` has already
+registered on every node with `s.rnsd.respond_to_probes`. Such a connection has
+no `listener_hash`, so nothing is published under `rnsd.dest.<idx>.*` for it and
+its closing line reads `dest=-`; that is the whole of what it gives up, and a
+probe needed none of it.
+
 **Concurrent path searches with backpressure.** Each in-flight `OUT_PACKET` that
 lacks a path occupies one slot in a per-connection pending table. While the path
 resolves, rnsd narrates progress with `OUT_STATUS` aux frames
@@ -1249,10 +1269,23 @@ channel.
   carries and the Resource rides beside it.
 - **State tree** — `rnsd.chan.<tag>.{state,direction,aspect,remote_hash,
   remote_identity,link_id,mtu,rtt_ms,opened_s,activated_s,tx_msgs,rx_msgs,
-  resource.{state,size,parts},last_error}` plus the
+  outstanding,resource.{state,size,parts},last_error}` plus the
   reverse index `rnsd.chan.byid.<link_id>`. Closing the ITS handle tears the
   Channel + hidden Link down and deletes the subtree — same 1:1 handle==channel
   lifetime as Links (§5.2).
+- **`outstanding` is a delivery receipt for the whole channel.** A Channel
+  envelope ends one of exactly two ways: the far side proves it, or the retries
+  run out and the Channel tears the link down (`Channel::poll`, "retry count
+  exceeded … tearing down"). Nothing is lost quietly. So **zero means everything
+  sent so far has been received**, and a consumer protocol needs no
+  acknowledgement frame of its own to learn that — which is what let lxmproxy
+  delete its `SETTLED`. Published from `channelPollAll`, not the 1 Hz tick: a
+  consumer acts on this number, and a value a second stale could read zero while
+  a message it just sent is still in flight. Cached in `pub_outstanding` so the
+  unchanged case costs an int compare and touches storage not at all. It answers
+  a question about the channel, not about one message — a per-message callback
+  would have been the other design, and a consumer that reads this needs only to
+  take it before its own sends, not to correlate anything.
 
 ## 5.7 The gateway indicator
 

@@ -1824,6 +1824,31 @@ static int onOurDestConnect(int handle, const void* data, size_t len)
     if      (slot->req.dest_type == 1) dtype = RNS::Type::Destination::PLAIN;
     else if (slot->req.dest_type == 2) dtype = RNS::Type::Destination::GROUP;
 
+    /* A destination this node ALREADY hosts: the consumer gets the connection
+     * outbound-only rather than a registration that cannot happen. One IN
+     * registration per destination hash is Transport's rule — a second throws —
+     * and it is the right rule: two consumers on one hash would each think the
+     * inbound callback and the proving were theirs.
+     *
+     * `rnprobe` is the ordinary case and it is not a mistake. A probe names the
+     * TARGET's hash on the frame it sends, but the connection it opens is one of
+     * OURS: no identity key means rnsd's own identity, and the aspect has to be
+     * the target's (the outbound destination is built on it) — so probing a
+     * peer's `rnstransport.probe` opens ours, which every node answering probes
+     * already hosts. Sending needs none of it: `ourDestTrySend` recalls the
+     * target's identity and builds an OUT destination of its own. */
+    {
+        RNS::Bytes want;
+        try { want = RNS::Destination::hash(id, app_name.c_str(), aspects.c_str()); }
+        catch (const std::exception&) { want = RNS::Bytes(); }
+        if (want.size() == RNSD_DEST_HASH_LEN && rnsdHostsDest(want.data())) {
+            info("our-dest conn %d open: aspect=%s outbound-only "
+                 "(%s is already hosted here)",
+                 (int)(slot - s_our_dests), slot->req.aspect, want.toHex().c_str());
+            return (int)(slot - s_our_dests);
+        }
+    }
+
     try {
         RNS::Destination d(id, RNS::Type::Destination::IN, dtype,
                            app_name.c_str(), aspects.c_str());
@@ -4233,12 +4258,35 @@ static void cliRnprobe(const char* args)
         return;
     }
 
-    /* identity_key=nullptr → rnsd uses its default identity. */
-    int handle = rnsdDestOpen(aspect.c_str(), nullptr, /*SINGLE*/ 0,
+    /* No result struct: the narration IS this verb's output. */
+    rnsdProbe(aspect.c_str(), dh.data(), size, timeout, nullptr);
+}
+
+/* One probe, for `rnprobe` and for anything else that wants a round trip to a
+ * node it can already name (rnsd.h). It narrates to the calling task's CLI
+ * client as it goes — the path request, the send, the proof — because every
+ * caller so far is a console verb and a probe that prints only at the end reads
+ * as a hang on a slow link. A caller with no CLI session simply prints nowhere.
+ *
+ * Blocks the calling task until a terminal result or the deadline. It is the
+ * console's task doing the waiting, never the daemon's: the work all happens on
+ * rnsd's side of an ITS connection. */
+bool rnsdProbe(const char* aspect, const uint8_t dest[RNSD_DEST_HASH_LEN],
+               int size, int timeout, rnsd_probe_t* out)
+{
+    if (out) *out = rnsd_probe_t{};
+    if (!aspect || !dest) return false;
+
+    /* identity_key=nullptr → rnsd uses its default identity. The connection is
+     * outbound-only whenever this node already hosts the same aspect on that
+     * identity — which is the usual case for a probe, since the aspect must be
+     * the target's and any node answering probes hosts `rnstransport.probe`
+     * itself (ourDestConnect). Sending needs no registration of ours. */
+    int handle = rnsdDestOpen(aspect, nullptr, /*SINGLE*/ 0,
                               /*ref*/ 0, nullptr, nullptr);
     if (handle < 0) {
         cliPrintf("rnprobe: connect to rnsd failed\n");
-        return;
+        return false;
     }
 
     if (size < 0)   size = 0;
@@ -4250,16 +4298,16 @@ static void cliRnprobe(const char* args)
     frame[0] = RNSD_DEST_OUT_PACKET;
     frame[1] = (uint8_t)(send_id >> 8);
     frame[2] = (uint8_t)(send_id & 0xFF);
-    memcpy(frame.data() + 3, dh.data(), 16);
+    memcpy(frame.data() + 3, dest, 16);
     /* Probe payload after dest_hash is zeros (size bytes). */
 
     if (itsSend(handle, frame.data(), frame.size(), pdMS_TO_TICKS(1000)) == 0) {
         cliPrintf("rnprobe: send failed\n");
         itsDisconnect(handle);
-        return;
+        return false;
     }
 
-    std::string short_hash = hash_hex.substr(0, 16);
+    std::string short_hash = RNS::Bytes(dest, 16).toHex().substr(0, 16);
     cliPrintf("probing %s (%d B, %ds timeout)...\n",
               short_hash.c_str(), size, timeout);
 
@@ -4289,6 +4337,7 @@ static void cliRnprobe(const char* args)
                 uint32_t rtt_ms = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16)
                                 | ((uint32_t)buf[6] <<  8) |  (uint32_t)buf[7];
                 uint8_t  hops   = buf[8];
+                if (out) { out->status = status; out->rtt_ms = rtt_ms; out->hops = hops; }
                 switch (status) {
                     case RNSD_DEST_STATUS_SENT:
                         /* Non-terminal: a second OUT_RESULT follows when
@@ -4297,7 +4346,10 @@ static void cliRnprobe(const char* args)
                                   short_hash.c_str(), (unsigned)hops);
                         break;
                     case RNSD_DEST_STATUS_DELIVERED:
-                        cliPrintf("delivered to %s: rtt=%u ms hops=%u\n",
+                        /* What came back is the far end's cryptographic proof,
+                         * and the round trip beside it is what that proof took
+                         * to return. */
+                        cliPrintf("proof from %s: rtt=%u ms hops=%u\n",
                                   short_hash.c_str(), (unsigned)rtt_ms, (unsigned)hops);
                         done = true;
                         break;
@@ -4361,6 +4413,7 @@ static void cliRnprobe(const char* args)
     }
 
     itsDisconnect(handle);
+    return done;
 }
 
 /* ─────────────── Task ─────────────── */
@@ -6814,6 +6867,8 @@ struct chan_conn_t {
     double       estab_deadline;
     uint32_t     link_timeout_ms;
     double       dead_at;
+    int          pub_outstanding = -1;  /* last `outstanding` published, so the
+                                         * hot poll loop writes only on change */
     std::vector<std::vector<uint8_t>> outbox; /* messages awaiting a ready channel */
 
     /* Resource transfer on the hidden Link — the only way a Channel consumer
@@ -6881,7 +6936,7 @@ static void chanFreeSlot(chan_conn_t& c) {
     c.link    = RNS::Link{RNS::Type::NONE};
     if (c.tag[0]) { char p[64]; snprintf(p, sizeof(p), "rnsd.chan.%s", c.tag); storageDeleteTree(p); }
     if (c.handle >= 0) { itsDisconnect(c.handle); }
-    c.used = false; c.handle = -1; c.ref = -1; c.tag[0] = '\0';
+    c.used = false; c.handle = -1; c.ref = -1; c.tag[0] = '\0'; c.pub_outstanding = -1;
     c.dest_hash = RNS::Bytes(); c.aspect.clear(); c.identity_key.clear();
     c.direction = 0; c.state = LST_FREE;
     c.opened_at = c.last_activity = c.path_deadline = c.estab_deadline = c.dead_at = 0;
@@ -7466,6 +7521,28 @@ static void channelPollAll() {
         if (!c.used || c.state != LST_ACTIVE || !c.channel) continue;
         c.channel.poll();
         if (c.channel) chanFlushOutbox(c);   /* poll() may have torn the link down */
+        /* HOW MANY OF THIS CONSUMER'S MESSAGES ARE STILL UNPROVED.
+         *
+         * A Channel envelope has exactly two ends: the far side proves it, or
+         * the retries run out and the Channel tears the link down (Channel.cpp,
+         * "retry count exceeded ... tearing down"). Nothing is ever lost
+         * quietly. So ZERO HERE MEANS EVERYTHING SENT SO FAR HAS BEEN RECEIVED
+         * — which is why a consumer protocol needs no acknowledgement frame of
+         * its own to learn that, and need not spend the air on one.
+         *
+         * Published here rather than from the 1 Hz tick because a consumer acts
+         * on it: a value a second stale could read zero while a message it just
+         * sent is still in flight. Cached in RAM so the common case (unchanged)
+         * costs an int compare and touches storage not at all. It answers a
+         * question about the whole channel, not about one message, which is why
+         * it is a published number and not a per-message callback. */
+        if (c.channel) {
+            int out = (int)c.channel.outstanding();
+            if (out != c.pub_outstanding) {
+                c.pub_outstanding = out;
+                chanSetInt(c, "outstanding", out);
+            }
+        }
     }
 }
 

@@ -768,6 +768,35 @@ int rnsdDestOpen(const char* aspect,
                  void (*on_recv)(int handle, size_t bytes_avail),
                  void (*on_disconnect)(int handle));
 
+/** One probe's outcome. `status` is an `RNSD_DEST_STATUS_*` from ports.h —
+ *  `RNSD_DEST_STATUS_DELIVERED` is the one that carries a round trip. */
+typedef struct {
+    uint8_t  status;
+    uint32_t rtt_ms;
+    uint8_t  hops;
+} rnsd_probe_t;
+
+/** Send one probe packet to `dest` on `aspect` and wait for its delivery proof
+ *  — what `rnprobe` does, available to anything else that already knows a node
+ *  and wants the round trip to it.
+ *
+ *  `size` is the payload in bytes (clamped to 0…400); `timeout` is in seconds.
+ *  Returns true when a terminal result arrived, with `out` filled; false when
+ *  the connection could not be opened, the send failed, or the deadline passed
+ *  with nothing terminal.
+ *
+ *  **It blocks the calling task** for up to `timeout` + 2 s, and narrates to
+ *  that task's CLI client as it goes (path request, send, proof) — a probe is a
+ *  console verb's shape, and one that prints only at the end reads as a hang on
+ *  a slow link. A caller with no CLI session prints nowhere and simply waits.
+ *
+ *  The connection it opens for itself is normally outbound-only: the aspect has
+ *  to be the target's, and a node that answers probes already hosts
+ *  `rnstransport.probe` on its own identity, so the IN registration would
+ *  collide with one this node already holds. Sending needs none of it. */
+bool rnsdProbe(const char* aspect, const uint8_t dest[RNSD_DEST_HASH_LEN],
+               int size, int timeout, rnsd_probe_t* out);
+
 /** Open an outbound Reticulum Link to a remote destination
  *  (RNSD_PORT_LINK). Returned ITS handle is packet-mode: each
  *  itsSend is one Link packet, each itsRecv is one Link packet.
