@@ -67,6 +67,14 @@ Our deltas, by category:
   established Link. `Hashes`, `HKDF`, `Fernet`, `Token`,
   `X25519`, `Ed25519` are rewritten; `AES`/`HMAC`/`Random`/`PKCS7` are
   header-only; `CBC` was dropped.
+- **PKCS#7 padding fills every byte with the pad length**, `data + bytes([n])*n`,
+  not zeroes with the length in the last byte. Both the reference unpadder and
+  this one read only that last byte, so the zero-filled shortcut round-trips
+  against them and against each other and looks correct from inside the
+  ecosystem. A strict unpadder — RustCrypto's `Pkcs7`, and anything else that
+  validates all `n` bytes — rejects the token instead, *after* the HMAC has
+  verified and the AES block decrypted. A peer reporting a padding error on
+  traffic whose MAC checked out is this, not a key disagreement.
 - **MsgPack shim** — `src/MsgPack.h` is a hand-rolled msgpack encoder/decoder
   (the narrow `Packer`/`Unpacker`/`bin_t<uint8_t>` surface `Link` needs),
   replacing the Arduino `hideakitai/MsgPack` dependency — the prerequisite that
@@ -804,9 +812,12 @@ the framing details:
   need not be whose link it is — µR signs with whatever identity it is handed —
   which is how nomad browses on rnsd's identity and identifies as an LXMF one. An
   `IDENTIFY` on a link still awaiting a path or establishing is **held and run
-  at establishment, ahead of a deferred `REQUEST`** — a consumer identifying
-  for the session (nomad's ID button) issues it with the link open, and the
-  node must know who is asking before it answers the first request. Past
+  at establishment, ahead of every deferred packet, resource and `REQUEST`** —
+  a consumer identifying for the session (nomad's ID button) issues it with the
+  link open, and the node must know who is asking before it answers the first
+  request; a consumer sending a signed payload (lxmf's conversation link) needs
+  the peer holding the identity that payload is verified against before the
+  payload arrives, or the peer drops what it cannot attribute. Past
   ACTIVE there is nothing left to hold it for, so it is dropped with a warning.
   Opcode `0x01` was a teardown frame, now removed — see §5.
   On the *hosting* side, a validated inbound `LINKIDENTIFY` publishes

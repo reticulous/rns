@@ -198,6 +198,14 @@ static uint32_t s_tickMinMs      = 1000;
 static uint32_t s_tickMaxMs      = 60000;
 static uint64_t s_tickPrevPktsIn = 0;
 
+/* Take the cadence back to its floor now, rather than at the end of the next
+ * housekeeping block. Taking on work with a deadline — a delivery-proof
+ * receipt — has to shorten the very next sleep: the block that would notice
+ * the deadline may otherwise be a backed-off minute away, which is longer than
+ * the deadline itself. nextDeadline() recomputes the wait from this on every
+ * pass of the loop, so a call from the rnsd task lands on its next sleep. */
+static void tickSnapToFloor(void) { s_tickPeriodMs = s_tickMinMs; }
+
 /* ─────────────── RNSD_PORT_DEST state ───────────────
  *
  * Per-connection state for the bidirectional destination API. Apps
@@ -1450,6 +1458,7 @@ static void ourDestReceiptTrack(our_dest_t& c, uint16_t send_id,
     slot->receipt     = receipt;
     receipt.set_timeout((int16_t)window);
     receipt.set_delivery_callback(onOurDestReceiptDelivery);
+    tickSnapToFloor();
 }
 
 /* 1 Hz from the rnsd loop, beside ourDestTickPending. */
@@ -1479,6 +1488,20 @@ static void ourDestReceiptTick(void)
             ourDestReceiptSettle(r, RNSD_DEST_STATUS_PROOF_TIMEOUT, 0);
         }
     }
+}
+
+/* True while any opportunistic send is still waiting on its delivery proof.
+ * The deadline is wall clock, but ourDestReceiptTick is what enforces it, so
+ * the housekeeping cadence has to stay at its floor until the receipt is
+ * settled. Backed off to s.rnsd.tick_max_ms the tick can miss the deadline by
+ * longer than the window itself, and the consumer — whose own backstop is the
+ * shorter one — has taken the send back by the time the result arrives. */
+static bool ourDestReceiptsPending(void)
+{
+    if (!s_our_dest_receipts) return false;
+    for (int j = 0; j < RNSD_MAX_PENDING_RECEIPTS; j++)
+        if (s_our_dest_receipts[j].used) return true;
+    return false;
 }
 
 /* Consumer conn closed — drop its pending receipts (nulls callbacks). */
@@ -5534,6 +5557,7 @@ static void linkTrackTxReceipt(link_conn_t& c, const RNS::PacketReceipt& receipt
     c.tx_receipt = receipt;
     c.tx_receipt.set_timeout((int16_t)window);
     c.tx_receipt_deadline = RNS::Utilities::OS::time() + window;
+    tickSnapToFloor();
 }
 
 static void linkPublishState(link_conn_t& c)
@@ -5685,6 +5709,19 @@ static void onLinkEstablishedCb(RNS::Link& link)
     }
     storageEnd();
 
+    /* Identify BEFORE anything deferred goes out. A peer that gates a page on
+     * who is asking must have the identity in hand when the request arrives,
+     * and a peer that has to validate a signed payload against the sender's
+     * identity must have it before the payload — LXMF drops a message it
+     * cannot attribute, so an identify behind the first message is an
+     * identify the peer never gets a reason to use. The consumer queued
+     * these in that order; send them in it. */
+    if (c->pend_identify) {
+        c->pend_identify = false;
+        linkIdentifyNow(*c, c->pend_identify_key);
+        c->pend_identify_key.clear();
+    }
+
     /* Flush the one-packet pre-active outbox. */
     if (c->pend_used) {
         try {
@@ -5714,15 +5751,6 @@ static void onLinkEstablishedCb(RNS::Link& link)
         c->pend_res_buf = nullptr;
         c->pend_res_len = 0;
         c->pend_res_opaque = 0;
-    }
-
-    /* Identify BEFORE any deferred request goes out: a node that gates a page
-     * on who is asking must have the identity in hand when the request
-     * arrives, and both were queued by the consumer in that order. */
-    if (c->pend_identify) {
-        c->pend_identify = false;
-        linkIdentifyNow(*c, c->pend_identify_key);
-        c->pend_identify_key.clear();
     }
 
     /* Flush a deferred request (rnsdLinkRequest before ACTIVE). */
@@ -6257,7 +6285,15 @@ static bool linkKickoff(link_conn_t& c)
         }
         c.link.establishment_timeout(estab);
         c.estab_deadline = RNS::Utilities::OS::time() + estab;
+        /* Publish the budget, not just log it. A consumer waiting on this link
+         * has to outlast it or it tears down an establishment that was still
+         * within its own deadline — and the budget is ours to compute (it
+         * scales with the next hop's speed and the hop count), so a consumer
+         * guessing at a constant is guessing wrong on every slow interface. */
+        storageBegin();
+        linkSetInt(c, "estab_timeout_s", (int)(estab + 0.5));
         linkPublishState(c);
+        storageEnd();
         info("link[%s]: kickoff → %s aspect=%s estab_timeout=%.1fs (%s)", c.tag,
              c.dest_hash.toHex().c_str(), c.aspect.c_str(), estab, estab_src);
     } catch (const std::exception& e) {
@@ -6322,6 +6358,17 @@ static void linkFreeSlot(link_conn_t& c)
     c.pend_identify = false;
     c.pend_identify_key.clear();
     c.state = LST_FREE;
+}
+
+/* True while a link packet is still waiting on its delivery proof — the link
+ * counterpart of ourDestReceiptsPending(), and held at the floor for the same
+ * reason: linkTick is what settles a proof that never comes. */
+static bool linkTxReceiptsPending(void)
+{
+    if (!s_link_conns) return false;
+    for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)
+        if (s_link_conns[j].used && s_link_conns[j].tx_receipt) return true;
+    return false;
 }
 
 /* 1 Hz from the rnsd loop (tickPhase 0), beside ourDestTickPending. */
@@ -8391,11 +8438,21 @@ static void rnsdTaskMain(void*)
              * whole device at 1 Hz for nothing. Resource transfers stay fast
              * without the pin: their parts are packets, so dinTick keeps the tick
              * at the floor while data moves, and every inbound part snaps it back
-             * via wakeForPkt above. */
+             * via wakeForPkt above.
+             *
+             * An outstanding delivery-proof receipt DOES pin it. Its deadline is
+             * seconds-scale and ourDestReceiptTick/linkTick are the only things
+             * that enforce it, so a backed-off cadence overshoots the window by
+             * more than the window — long enough for the consumer's own backstop
+             * to take the send back first and for the result to land on a send
+             * that is gone. The pin lasts one proof window at most, and the
+             * proven case ends it the moment the proof validates. */
             uint32_t dinTick = (uint32_t)(s_stats.packets_in - s_tickPrevPktsIn);
             s_tickPrevPktsIn = s_stats.packets_in;
             bool tickBusy = dinTick > 0 ||
-                            RNS::Transport::pending_links_count() > 0;
+                            RNS::Transport::pending_links_count() > 0 ||
+                            ourDestReceiptsPending() ||
+                            linkTxReceiptsPending();
             /* The 1 Hz block is unyieldy except for publishPathTable's
              * internal yield-every-8. Running Transport::jobs() *and*
              * publishPathTable() in the same tick can park the rnsd task

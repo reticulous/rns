@@ -45,13 +45,17 @@ namespace RNS { namespace Cryptography {
 			//DEBUGF("PKCS7::pad: len: %lu", len);
 			size_t padlen = bs - (len % bs);
 			//DEBUGF("PKCS7::pad: pad len: %lu", padlen);
-			// create zero-filled byte padding array of size padlen
+			/* EVERY padding byte carries the pad length — `data + bytes([n])*n`,
+			 * which is what PKCS#7 says and what the reference writes. Setting
+			 * only the last byte and leaving the rest zero survives any unpadder
+			 * that reads just that byte (the reference's own, and this one), so
+			 * it goes unnoticed against a peer that shares the shortcut. A strict
+			 * unpadder checks all n bytes and rejects the token — the HMAC
+			 * verifies, the AES decrypt succeeds, and it fails on the padding
+			 * alone, which is the one shape that cannot be blamed on a key. */
 			//p v = bytes([padlen])
-			//uint8_t pad[padlen] = {0};
 			uint8_t pad[padlen];
-			memset(pad, 0, padlen);
-			// set last byte of padding array to size of padding
-			pad[padlen-1] = (uint8_t)padlen;
+			memset(pad, (int)padlen, padlen);
 			// concatenate data with padding
 			//p return data+v*padlen
 			data.append(pad, padlen);

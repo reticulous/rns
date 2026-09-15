@@ -987,9 +987,11 @@ void rnsdResourceRelease(void* buf);
  *
  *  Callable the moment rnsdLinkOpen() returns: a link still awaiting a path
  *  or establishing holds the identify and runs it at establishment, ahead of
- *  a request deferred the same way — so a caller that identifies for the
- *  whole session (nomad's ID button) has the peer know who is asking before
- *  it answers the first request. On the receiving node, a
+ *  every packet, resource and request deferred the same way — so a caller
+ *  that identifies for the whole session has the peer know who is asking
+ *  before it answers the first request, and a caller sending a signed
+ *  payload has the peer hold the identity it must verify that payload
+ *  against before the payload lands. On the receiving node, a
  *  validated LINKIDENTIFY publishes rnsd.links.<tag>.remote_identity
  *  (identity hash) and .remote_dest (the peer's destination hash on this
  *  link's aspect). Returns true if the aux was queued to rnsd. */
