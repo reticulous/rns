@@ -41,10 +41,11 @@ set(MICRORET_SRCS
     "src/Utilities/Memory.cpp"
     "src/Utilities/OS.cpp"
     "src/Utilities/Persistence.cpp"
-    # tlsf.c is mR's bundled allocator (used only on Arduino-NRF52). On
-    # ESP-IDF we use the platform's tlsf via heap_caps; mR's RNS_HEAP_ALLOCATOR
-    # path uses ::operator new/delete, so this file is unused. Building it
-    # collides with ESP-IDF's heap component (both export tlsf_*).
+    # tlsf.c is mR's bundled allocator (used only on Arduino-NRF52). On a chip
+    # we use the platform's tlsf via heap_caps; mR's RNS_HEAP_ALLOCATOR path
+    # uses ::operator new/delete, so this file is unused there. Building it
+    # collides with ESP-IDF's heap component (both export tlsf_*), so it is
+    # added below only on the host, whose heap wraps libc and exports none.
     # The arena store behind Identity::recall and Transport's routing — three
     # pools in one block, seqlocked for cross-task readers (src/Directory.h).
     "src/Directory.cpp"
@@ -65,6 +66,13 @@ set(MICRORET_SRCS
     # patches to Link.cpp. Link_stub.cpp is gone.
     "src/Link.cpp"
 )
+
+# The host's heap_caps_* wrap libc and export no tlsf, so the pool-stats
+# walkers in Memory.cpp have nothing to call. mR's own bundled allocator is
+# what supplies them there.
+if(IDF_TARGET STREQUAL "linux")
+    list(APPEND MICRORET_SRCS "src/Utilities/tlsf.c")
+endif()
 
 idf_component_register(
     SRCS ${MICRORET_SRCS}
@@ -123,6 +131,16 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wno-error=stringop-truncation
     -Wno-error=maybe-uninitialized
 )
+
+# Two more categories that only the 64-bit host sees in the same upstream
+# code: `%d` against a size_t in the allocator's diagnostics, and a memset
+# over a stats struct the host's headers give a constructor.
+if(IDF_TARGET STREQUAL "linux")
+    target_compile_options(${COMPONENT_LIB} PRIVATE
+        -Wno-error=format=
+        -Wno-error=class-memaccess
+    )
+endif()
 
 # ed25519-donna's reference impl raises noisy warnings on modern GCC that
 # aren't real bugs (unused functions in the table headers, casts in the

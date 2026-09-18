@@ -60,7 +60,6 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/usb_serial_jtag.h"
 
 #include <cstring>
 #include <cstdlib>
