@@ -82,14 +82,12 @@ namespace RNS {
 		Interface* _parent = nullptr;
 		bool _IN  = false;
 		bool _OUT = false;
-		bool _FWD = false;
 		/* The interface's community radius — see rnsd_iface_t. Nodes within
 		 * this many hops heard on this interface are the ones this node works
 		 * for: their announces are stored and re-broadcast, their paths get
 		 * the custody lifetime, and their path requests are searched. 0 = no
 		 * community (a pure endpoint/uplink). */
 		uint8_t _community_radius = 0;
-		bool _RPT = false;
 		std::string _name;
 		size_t _rxb = 0;
 		size_t _txb = 0;
@@ -216,9 +214,7 @@ namespace RNS {
 		// setters
 		inline void IN(bool IN) { assert(_impl); _impl->_IN = IN; }
 		inline void OUT(bool OUT) { assert(_impl); _impl->_OUT = OUT; }
-		inline void FWD(bool FWD) { assert(_impl); _impl->_FWD = FWD; }
 		inline void community_radius(uint8_t v) { assert(_impl); _impl->_community_radius = v; }
-		inline void RPT(bool RPT) { assert(_impl); _impl->_RPT = RPT; }
 		inline void name(const char* name) { assert(_impl); _impl->_name = name; }
 		inline void bitrate(uint32_t bitrate) { assert(_impl); _impl->_bitrate = bitrate; }
 		inline void online(bool online) { assert(_impl); _impl->_online = online; }
@@ -232,13 +228,11 @@ namespace RNS {
 		// getters
 		inline bool IN() const { assert(_impl); return _impl->_IN; }
 		inline bool OUT() const { assert(_impl); return _impl->_OUT; }
-		inline bool FWD() const { assert(_impl); return _impl->_FWD; }
 		/* "How far does this interface's community reach?" — the one number
 		 * every transit gate asks about: a node within the radius is served
 		 * (stored, answered for, searched for), one beyond it is merely
 		 * heard. */
 		inline uint8_t community_radius() const { assert(_impl); return _impl->_community_radius; }
-		inline bool RPT() const { assert(_impl); return _impl->_RPT; }
 		inline bool online() const { assert(_impl); return _impl->_online; }
 		inline std::string name() const { assert(_impl); return _impl->_name; }
 		inline const Bytes& ifac_identity() const { assert(_impl); return _impl->_ifac_identity; }
