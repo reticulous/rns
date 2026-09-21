@@ -258,6 +258,12 @@ enum rns_iface_mode : uint8_t {
  *  registering with rnsd. Fixed-size struct to keep the connect path cheap
  *  (fits in ITS_MAX_MSG_DATA).
  *
+ *  `in` and `out` are what the medium can do. Whether this node carries other
+ *  nodes' traffic is `s.rnsd.transport_enabled`, a property of the node rather
+ *  than of any one interface; how much work it does for the nodes reachable
+ *  through this one — announces relayed, paths kept and answered for, searches
+ *  run — is `community_radius` below.
+ *
  *  IFAC (Interface Access Codes): an interface that wants to be on an
  *  access-coded RNS network fills `ifac_netname` (network_name) and/or
  *  `ifac_netkey` (passphrase); rnsd derives the IFAC identity and applies it
@@ -270,8 +276,6 @@ typedef struct {
     uint8_t  mode;          /* rns_iface_mode */
     uint8_t  in;            /* 1 if iface accepts inbound packets */
     uint8_t  out;           /* 1 if iface sends outbound packets */
-    uint8_t  fwd;           /* 1 if iface forwards (transport node) */
-    uint8_t  rpt;           /* 1 if iface repeats announces */
     uint8_t  ifac_size;     /* IFAC access-code length in bytes; 0 => default (1) */
     uint8_t  announce_cap;  /* max % of interface bandwidth spent propagating
                                announces; 0 => rnsd applies the RNS default (2) */
@@ -397,6 +401,12 @@ static_assert(sizeof(rnsd_iface_announce_t) <= ITS_MAX_MSG_DATA,
 typedef struct {
     uint8_t  op;            /* RNSD_IFACE_AUX_PEER */
     uint8_t  up;            /* 1 = present, 0 = gone */
+    /* Withdrawals only: 1 says the key is being retired because the interface
+     * joined two of its rows into one, not because anything left the air. The
+     * destinations it hosted are still reachable, under another key, so the
+     * node row goes and the routes to and through it stay. A withdrawal
+     * without this is a departure, and takes the routes with it. */
+    uint8_t  moved;
     /* The EXACT registered name, not a prefix: this names one interface's peer,
      * and aux is addressed to a port rather than to a handle, so the message
      * has to say which registration it belongs to. */

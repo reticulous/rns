@@ -554,6 +554,11 @@ int rnsdNodesForEach(const char* iface_prefix,
  *  a medium whose peers are nodes. */
 int rnsdNodesCount(const char* iface_prefix);
 
+/** The node table index for one node, or -1 where that interface and key name
+ *  no node. It is what `rnsd_peer_t::node` is compared against, and so the only
+ *  way to tell one node's peers apart from the rest of the interface's. */
+int rnsdNodeIndex(const char* iface, const uint8_t key[RNSD_NODE_KEY_LEN]);
+
 /** The registered interface table, in registration order. `radius` is the
  *  interface's community radius, which is what decides whether it has a
  *  neighbourhood at all.

@@ -120,8 +120,6 @@ public:
         _online = true;
         _IN  = info.in  != 0;
         _OUT = info.out != 0;
-        _FWD = info.fwd != 0;
-        _RPT = info.rpt != 0;
         _HW_MTU = info.mtu;
         _FIXED_MTU = true;
         _AUTOCONFIGURE_MTU = false;
@@ -408,6 +406,44 @@ static void loadOrCreateIdentity(void)
 
     std::string hexPrv = s_identity->get_private_key().toHex();
     storageSet("secrets.rnsd.identity", hexPrv.c_str());
+}
+
+/** Load, or mint and persist, the TRANSPORT identity — the address this node
+ *  wears as a relay, stamped on every announce it forwards and named as the
+ *  next hop by every neighbour routing through it.
+ *
+ *  It is not the node identity above: that one owns destinations and is what an
+ *  announce proves, while this one is only an address in a header, and keeping
+ *  them apart is what stops a relayed packet naming who is relaying it. µR
+ *  would mint one per boot and write it to a file, but its file IO is compiled
+ *  out (routing state is the arena image), so without this the address changes
+ *  at every restart — and a restart then blackholes every path through this
+ *  node until each neighbour's next announce rebuilds its table, which is up to
+ *  a whole announce interval of silence for traffic that has no idea anything
+ *  moved. */
+static void loadOrCreateTransportIdentity(void)
+{
+    char hex[160] = {};
+    storageGetStr("secrets.rnsd.transport_identity", hex, sizeof(hex), "");
+
+    if (strlen(hex) == 128) {
+        RNS::Bytes prv;
+        prv.assignHex((const uint8_t*)hex, 128);
+        if (prv.size() == 64) {
+            RNS::Identity id(false);
+            if (id.load_private_key(prv)) {
+                RNS::Transport::identity(id);
+                info("loaded transport identity %s", id.hexhash().c_str());
+                return;
+            }
+        }
+        warn("stored transport identity malformed — regenerating");
+    }
+
+    RNS::Identity id(true);
+    RNS::Transport::identity(id);
+    storageSet("secrets.rnsd.transport_identity", id.get_private_key().toHex().c_str());
+    info("generated transport identity %s", id.hexhash().c_str());
 }
 
 /* ─────────────── iface table ─────────────── */
@@ -819,10 +855,10 @@ static int onTransportConnect(int handle, const void* data, size_t len)
     slot->info.ifac_netkey[sizeof(slot->info.ifac_netkey) - 1] = '\0';
     slot->rx_packets = slot->tx_packets = slot->rx_bytes = slot->tx_bytes = 0;
     bool hasIfac = slot->info.ifac_netname[0] != '\0' || slot->info.ifac_netkey[0] != '\0';
-    info("register: iface=%s mtu=%u bitrate=%u mode=%s in=%u out=%u fwd=%u rpt=%u ifac=%s",
+    info("register: iface=%s mtu=%u bitrate=%u mode=%s in=%u out=%u community=%u ifac=%s",
          slot->info.name, (unsigned)slot->info.mtu, (unsigned)slot->info.bitrate,
-         mode_name(slot->info.mode), slot->info.in, slot->info.out, slot->info.fwd, slot->info.rpt,
-         hasIfac ? "on" : "off");
+         mode_name(slot->info.mode), slot->info.in, slot->info.out,
+         slot->info.community_radius, hasIfac ? "on" : "off");
 
     /* Wrap in mR Interface and register with Transport so announces /
      * paths route through us. Transport stores its own copy of Interface
@@ -976,15 +1012,26 @@ static void onIfaceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
              * destinations were its, and the routes to and through it would sit
              * in the table until they expired. A connection-oriented medium
              * telling us a peer detached is the only certain evidence of a
-             * departure there is; nothing announces one. */
+             * departure there is; nothing announces one.
+             *
+             * ONE node's peers, never the interface's: on a shared radio every
+             * neighbour is a peer of the same interface, and taking them all
+             * would drop this node's routes to and through every neighbour it
+             * has each time any one of them detaches — which on a mesh is the
+             * difference between being able to forward a packet to the node
+             * next door and not. `rnsd_peer_t::node` is the index the peer was
+             * filed under, so the departing node's index is the filter. */
+            int gone = rnsdNodeIndex(p.iface, p.key);
             uint8_t dests[8][RDIR_DEST_LEN];
-            struct Ctx { const char* iface; uint8_t (*d)[RDIR_DEST_LEN]; int n; }
-                c{ p.iface, dests, 0 };
-            rnsdPeersForEach(p.iface, [](const rnsd_peer_t* pe, void* vp) {
-                Ctx* c = (Ctx*)vp;
-                if (c->n >= 8) return;
-                std::memcpy(c->d[c->n++], pe->dest, RDIR_DEST_LEN);
-            }, &c);
+            struct Ctx { int node; uint8_t (*d)[RDIR_DEST_LEN]; int n; }
+                c{ gone, dests, 0 };
+            if (gone >= 0 && !p.moved) {
+                rnsdPeersForEach(p.iface, [](const rnsd_peer_t* pe, void* vp) {
+                    Ctx* c = (Ctx*)vp;
+                    if (c->n >= 8 || pe->node != c->node) return;
+                    std::memcpy(c->d[c->n++], pe->dest, RDIR_DEST_LEN);
+                }, &c);
+            }
 
             rnsdNodeDeclare(p.iface, p.key, p.label, false);
 
@@ -5696,8 +5743,12 @@ static void onLinkEstablishedCb(RNS::Link& link)
             linkSetInt(*c, "hops", (int)RNS::Transport::hops_to(c->dest_hash));
     }
     /* Per-link delivery-proof counters (consumers baseline these at send
-     * time and watch for increments — publish zeros so the keys exist). */
+     * time and watch for increments — publish zeros so the keys exist).
+     * tx_rtt_ms is the round trip µR measured for the packet the latest
+     * increment of tx_proven settled, so a consumer that sees the counter
+     * move has the measurement to go with it rather than a clock of its own. */
     linkSetInt(*c, "tx_proven", 0);
+    linkSetInt(*c, "tx_rtt_ms", 0);
     linkSetInt(*c, "proof_timeouts", 0);
     linkPublishState(*c);
     /* Reverse index for inbound/link_id-only lookups. */
@@ -6387,9 +6438,18 @@ static void linkTick(void)
         if (c.tx_receipt) {
             RNS::Type::PacketReceipt::Status pst = c.tx_receipt.status();
             if (pst == RNS::Type::PacketReceipt::DELIVERED) {
+                /* µR timed this one itself, from the packet going out to its
+                 * proof validating. Publish it with the counter, in the same
+                 * transaction: a consumer watching tx_proven move (lxmf's
+                 * Ping) then reads a measurement instead of timing the poll
+                 * that noticed — this tick runs at 1 Hz, so its own clock
+                 * would round a 200 ms round trip up to a second. */
+                int rtt_ms = (int)(c.tx_receipt.get_rtt() * 1000.0);
+                storageBegin();
+                linkSetInt(c, "tx_rtt_ms", rtt_ms);
                 linkBumpInt(c, "tx_proven");
-                info("link[%s]: packet delivery proven (rtt=%d ms)",
-                     c.tag, (int)(c.tx_receipt.get_rtt() * 1000.0));
+                storageEnd();
+                info("link[%s]: packet delivery proven (rtt=%d ms)", c.tag, rtt_ms);
                 c.tx_receipt = RNS::PacketReceipt{RNS::Type::NONE};
                 c.tx_receipt_deadline = 0;
             } else if (pst != RNS::Type::PacketReceipt::SENT ||
@@ -7969,8 +8029,9 @@ static void clinkEnsureTask()
  * s.rns.boot_max_s (default 5 min) — the wild-mesh safeguard — and drops that
  * hold the moment `sys.human_detected` says somebody is at the controls, since
  * an attended device isn't a bootloop. Every input path feeds that flag (a
- * keystroke on any console, a USB host enumerating, a woken screen, a click in
- * the browser UI), so the hold ends on the first sign of a person. Measured from
+ * keystroke on any console, a USB host enumerating, any touch/button/key on the
+ * screen, a click in the browser UI), so the hold ends on the first sign of a
+ * person rather than only on one who found the screen dark. Measured from
  * boot (uptime); both waits light-sleep, so the window itself costs nothing. */
 static void rnsBootWindow(void) {
     uint32_t min_ms = (uint32_t)storageGetInt("s.rns.boot_min_s", 10) * 1000;
@@ -8313,6 +8374,9 @@ static void rnsdTaskMain(void*)
      * persistent flag into it before start(). */
     try {
         s_reticulum = std::make_unique<RNS::Reticulum>();
+        /* Before start(): Transport mints its own on start when it has none,
+         * and that one would not survive the reboot. */
+        loadOrCreateTransportIdentity();
         /* Transport-node participation. Mirror the persistent flag into mR's
          * static before start(), and re-mirror on live changes: Transport reads
          * transport_enabled() per forwarding decision, so flipping the setting

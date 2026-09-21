@@ -93,6 +93,22 @@ Our deltas, by category:
 - **Event-driven** — no top-level `Reticulum::loop()`; rnsd drives µR from its
   own ITS wait loop.
 
+**Interface capability flags upstream never used**
+
+- `Interface.h` — **an interface declares `IN` and `OUT`, and nothing else
+  about its role.** Upstream's base `Interface` also carries `FWD` ("may carry
+  transit traffic") and `RPT` ("repeats announces"); in RNS 1.5.0 both are
+  declared on the class and never assigned or read, left over from before
+  transport became a property of the node. They are not in this fork, and
+  `rnsd_iface_t` has no field for them. The two questions they gesture at are
+  both answered elsewhere and per-node or per-interface as the question
+  deserves: whether this node forwards at all is `s.rnsd.transport_enabled`,
+  and how much work it does for the nodes reachable through one interface —
+  announces relayed onto it, paths kept and answered for, searches run — is
+  that interface's **community radius**, which is a distance rather
+  than a bit, and the reason a radius-0 uplink is still routed over while
+  nothing is advertised into it.
+
 **Correctness patches against upstream behaviour**
 
 - `Transport.cpp` — **RAII guard for `_jobs_locked`.** Upstream leaks the lock
@@ -191,6 +207,43 @@ Our deltas, by category:
   other carried it fine. `validate_request` now looks the id up
   (`Transport::find_active_link`) and answers a repeat by re-proving the
   existing link, which is what makes retransmission idempotent.
+- `Transport.cpp` — **a link proof is forwarded from one distance and once.**
+  An LRPROOF is deliberately kept out of the packet hashlist (it may arrive on
+  the wrong interface first, and recording it early would filter the real
+  arrival), so nothing downstream will ever call a second copy a duplicate.
+  What tells a proof in transit from a reflection of it is therefore the hop
+  count alone, and each of the three places that handle one carries its own
+  guard:
+  - the **link table** path forwards only when `packet.hops() ==
+    link_entry._remaining_hops` — the distance the proof was always going to
+    come back from. Dropping that test (the port did) forwards every copy,
+    including the neighbour's forward of the one just sent, one hop further
+    along; on a shared medium that is a permanent reflection between the relays
+    of a path, hop counts climbing past a hundred and the carrier saturated by
+    one packet.
+  - the **reverse table** path spends its entry: one request going out earns
+    one proof coming back, so the entry is erased as it is used. A relay that
+    keeps it transports every further copy it hears, and the interface test
+    below it cannot help — on one radio the outbound and receiving interfaces
+    are the same, so it passes for a rebroadcast as readily as for the original.
+  - the **initiator** takes the answer only from the distance it asked over
+    (`Link::expected_hops()`, or anything when that is `PATHFINDER_M` — we had
+    no path when we asked, so there is no distance to check against), and arms
+    the hashlist as it does. Nothing forwards here, so this is what stops a
+    reflected copy being another signature to verify rather than what stops a
+    loop; it is also the one node that knows the proof has arrived, which is
+    what makes it the place the packet stops being novel.
+
+  Spending the link-table entry instead of testing the hop count would be
+  wrong, tempting as the symmetry is: a repeated LINKREQUEST names the same
+  link id and is answered by re-proving the existing link, so a relay that had
+  spent its forward would black-hole the re-proof.
+- `Transport.cpp` — **an announce folded into a queued copy is deferred, not
+  dropped.** Under an interface's announce cap a re-broadcast joins that
+  interface's queue; when a copy for the same destination is already waiting,
+  the newer one replaces its payload instead of taking a second slot. That is
+  still deferral, and saying otherwise reports a relay that does happen as one
+  that found nowhere to go — in the log, and in what `outbound()` returns.
 - `Transport.{h,cpp}` — **the packet hashlist evicts oldest-first.**
   `_packet_hashlist` is a `std::set<Bytes>`, and the cull erased from its
   `begin()` — the *lowest hashes*, which is unrelated to age: a hash inserted
@@ -470,6 +523,14 @@ it is now implemented, plus fork-specific behaviour for point-to-point links.
   (`_discovery_pr_tags_order`) instead of by `std::set` content order, and its
   cap (`RNS_PR_TAGS_MAX`) is 256 — the old content-ordered eviction dropped
   tags still circulating and let path requests loop between parallel uplinks.
+  A consequence worth stating outright: **"every other interface" is none on a
+  node whose only interface is the one the request arrived on**, which is every
+  ordinary LoRa node. A path request there travels exactly one hop and is
+  answered only by a neighbour that already holds the destination, so on a
+  single-radio mesh what makes a far destination reachable at all is the
+  announce flood covering the distance — i.e. `community_radius` at least the
+  network's diameter. Discovery is a shortcut for what the flood already
+  delivered, never a substitute for it.
 - **`transport_enabled` is live.** rnsd mirrors `s.rnsd.transport_enabled` into
   the µR static via `NOW_AND_ON_CHANGE`, so toggling it takes effect without a
   reboot (Transport reads the flag per forwarding decision). On the *disable*
@@ -692,6 +753,20 @@ since nothing announces a departure. Peers age out under it on `s.rnsd.path.ttl`
 and its interface would re-learn it exactly as the directory does); the node
 does not, because a silent peer is still a peer.
 
+**A departure invalidates ONE node's routes.** A withdrawal drops the routes to
+the destinations that node hosted and the routes through it, and it finds them
+by the node index its peers were filed under (`rnsd_peer_t::node`) — never by
+the interface. On a shared radio every neighbour is a peer of the same
+interface, so taking the interface's peers would drop the routes to and through
+every neighbour each time any one of them detaches, and a node would lose the
+ability to forward a packet to the station next door — which is the last hop of
+every path that ends there.
+
+**A row merged is not a node gone.** An interface that joins two of its own rows
+into one withdraws the absorbed key, but its destinations are still on the air
+under the surviving key, so the withdrawal carries `moved` and the routes stay.
+Only a withdrawal without it says something left.
+
 **No µR types.** `rnsd_peers.cpp` takes byte arrays and C strings, exactly as a
 consumer would, so the tables have no opinion about the protocol engine
 underneath. The seam is `rnsd_peers.h`: `rnsdNodeDeclare` and `rnsdPeersObserve`
@@ -757,7 +832,7 @@ Port numbers and the high-level purpose are in the [README](README.md#its-port-m
 the framing details:
 
 - **`RNSD_PORT_IFACE` (1)** — connect with `rnsd_iface_t` (name, MTU,
-  bitrate, mode, in/out/fwd/rpt, IFAC fields). The connect *is* the
+  bitrate, mode, in/out, community radius, IFAC fields). The connect *is* the
   registration; the handle is then a packet-mode pipe (one RNS packet per
   send/recv). Disconnect deregisters. `rns_iface_mode` is a rnsd-facing enum and
   does **not** share µR's `Type::Interface::modes` bit layout — `mapIfaceMode`
@@ -1136,7 +1211,11 @@ bounded 8-entry table (oldest evicted with a synthetic timeout) correlated to
 **Link packets (`RNSD_PORT_LINK`):** the receipt lives in the link slot
 (consumers serialize sends per link, so one suffices); `linkTick` publishes
 `rnsd.links.<tag>.tx_proven` and `.proof_timeouts` counters. Consumers baseline
-both at send time and watch for increments. Resource transfers don't use packet
+both at send time and watch for increments. `tx_rtt_ms` rides the same
+transaction as a `tx_proven` increment and carries µR's own measurement of that
+packet's round trip, so a consumer that sees the counter move reads the
+measurement instead of timing the poll that noticed — `linkTick` runs at 1 Hz,
+which would round a 200 ms round trip up to a second. Resource transfers don't use packet
 receipts — the Resource ACK (`RNSD_LINK_RESOURCE_OUTBOUND_DONE`) is already
 proof-grade.
 
@@ -1416,6 +1495,17 @@ retained announces, compiled claims — persists as the directory image at
 retransmission queue are not persisted; `rnsd persist` remains a no-op stub for
 them. The default identity is `secrets.rnsd.identity`; rnsd does **not**
 auto-create an application identity at boot — that is the app's call.
+
+**A relay's address is durable state, because it is in somebody else's table.**
+µR mints a transport identity on `start()` when it has none and writes it to a
+file, which here writes nowhere — so rnsd loads or mints it from
+`secrets.rnsd.transport_identity` and hands it over before `start()`. What makes
+it durable is not this node: the address is what every neighbour routing through
+this one names as its next hop, so coming back as somebody else silently
+blackholes every path through it until each neighbour's next announce rebuilds
+its table. Nothing reports that as a fault — the packets are simply addressed to
+a node that no longer answers to the name. It stays a separate key from the node
+identity so a relayed packet does not name who is relaying it.
 
 **The image is the live set, budgeted against the partition — not the record pool.**
 Three rules hold it there, and each exists because breaking it broke a board:

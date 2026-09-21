@@ -254,6 +254,13 @@ void rnsdNodeDeclare(const char* iface, const uint8_t key[RNSD_NODE_KEY_LEN],
     s_gen++;
 }
 
+int rnsdNodeIndex(const char* iface, const uint8_t key[RNSD_NODE_KEY_LEN])
+{
+    if (!iface || !*iface) return -1;
+    std::lock_guard<std::mutex> g(s_lock);
+    return nodeFind(iface, key ? key : kNoKey);
+}
+
 int rnsdNodesForEach(const char* iface_prefix,
                      void (*cb)(int idx, const rnsd_node_t*, void*), void* ctx)
 {

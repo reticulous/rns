@@ -93,8 +93,11 @@ An interface straddle gets Reticulum packets to and from the outside world
 (TCP, LoRa, ESP-NOW…). To plug into Transport it opens an ITS connection to
 **`RNSD_PORT_IFACE`** with an `rnsd_iface_t` connect payload describing
 the interface: name (`"tcp/0"`, `"lora/0"`), MTU, bitrate, mode
-(full/gateway/access-point/roaming/boundary), in/out/forward/repeat flags, and
-optionally IFAC credentials for an access-coded network. After that the handle
+(full/gateway/access-point/roaming/boundary), whether it takes packets in and
+sends them out, its service radius (below), and optionally IFAC credentials
+for an access-coded network. Nothing in that payload says whether this node
+carries other nodes' traffic — that is `s.rnsd.transport_enabled`, one answer
+for the node. After that the handle
 *is* the packet pipe — every `itsSend` is one outbound RNS packet leaving on
 that interface, every `itsRecv` is one inbound packet arriving. Disconnecting
 deregisters the interface.
@@ -536,7 +539,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | Key | Default | Meaning |
 |---|---|---|
 | `s.rnsd.enable` | `1` | Master switch — is this node on the mesh at all. **Read once at boot**: when `0`, rnsd brings up no Transport/ports and never sets `rns.ready`, so interfaces and clients never start. **Changing it requires a reboot.** |
-| `s.rnsd.transport_enabled` | `0` | Act as a Reticulum transport node (forward for others). Live (no reboot). |
+| `s.rnsd.transport_enabled` | `0` | Act as a Reticulum transport node (forward for others). The whole of that decision: it is per node, not per interface, and no interface setting overrides it either way — an interface's mode and service radius shape which routes are kept and advertised, never whether traffic is carried. Live (no reboot). |
 | `s.rnsd.announce.table_max` | `100` | Slots in the announce retransmission queue. Read once at Transport start: the queue is one fixed ring, so raising it later clamps rather than growing. |
 | `s.rnsd.hashlist_max` | `100` | Packet-hashlist (dedup) capacity cap (`Transport::hashlist_maxsize`). |
 | `s.rnsd.path.max` | `100` | Soft cap on resident directory records with a route. The directory's own slot count is the hard bound; this holds the resident set below it. |
@@ -568,7 +571,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.lxmf.max_resource_size` | `262144` | Size gate for accepting an inbound Resource. |
 | `s.net.up_wait_s` | `20` | Boot barrier: how long to wait for the network at startup. |
 | `s.rns.boot_min_s` | `10` | Mesh-safety boot window, floor: seconds from boot before the ecosystem may come up and first transmit. Always served — a boot-looping node must not be able to spam the shared medium with re-announces, and nothing cancels this part. |
-| `s.rns.boot_max_s` | `300` | Same window, ceiling: how much longer an *unattended* node holds. Cancelled by `sys.human_detected` — the first keystroke on a console, USB host on the console, screen wake, or click in the web UI drops the rest of the hold, since someone at the controls is not a bootloop. |
+| `s.rns.boot_max_s` | `300` | Same window, ceiling: how much longer an *unattended* node holds. Cancelled by `sys.human_detected` — the first keystroke on a console, USB host on the console, any touch/button/key on the device's screen, or click in the web UI drops the rest of the hold, since someone at the controls is not a bootloop. A node with a screen therefore serves the full ceiling only while nobody is touching it. |
 
 ### Runtime state & telemetry (written)
 
@@ -586,6 +589,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.gw.{rssi,snr,timestamp}` | Gateway/infrastructure signal — the received quality (rssi dBm, snr dB) of the transport node that last relayed a packet to us: the last packet addressed to one of our destinations/links that arrived on a signal-capable interface with more than one hop. `timestamp` is device unix-seconds of that sample (UIs fade the indicator out over ~30 min from it). Kept as the last qualifying sample; not cleared on a direct packet. |
 | `rnsd.links.<tag>.{state,direction,aspect,remote_hash,opened_s,last_error,…}` | Per-link state tree, keyed by the caller's `tag` — observable before the link_id exists. |
 | `rnsd.links.<tag>.estab_timeout_s` | Seconds rnsd will spend establishing this link, published at kickoff. Scales with the next hop's interface speed and the hop count (tens of seconds on LoRa), or is the caller's own `link_timeout_ms` when one was supplied. A consumer with its own deadline on the send must outlast this, or it takes the send back from a link still inside its budget. |
+| `rnsd.links.<tag>.{tx_proven,proof_timeouts,tx_rtt_ms}` | Delivery-proof accounting for consumer packets sent over the link. Consumers baseline the two counters at send time and watch for an increment; `tx_rtt_ms` is published in the same transaction as a `tx_proven` increment and is µR's own measurement of that packet's round trip, so the consumer reads a measurement rather than timing the 1 Hz poll that noticed. |
 | `rnsd.links.byid.<link_id>` | Reverse index: link_id → tag. |
 | `rnsd.chan.<tag>.{state,direction,aspect,remote_hash,link_id,mtu,rtt_ms,tx_msgs,rx_msgs,outstanding,last_error,…}` | Per-channel state tree (`rnsdChannelOpen`), same shape as the link tree. `outstanding` is how many of this consumer's messages are still unproved: a Channel envelope is either proved by the far side or the link is torn down trying, so **zero means everything sent so far has been received** — a delivery receipt for the whole channel, and the reason a consumer protocol over a Channel needs no acknowledgement frame of its own. |
 | `rnsd.chan.byid.<link_id>` | Reverse index: channel's hidden link_id → tag. |
@@ -638,6 +642,16 @@ Single-shot debug triggers — write a value and rnsd consumes it on its own tas
 
 `secrets.rnsd.identity` — the 128-hex private key of rnsd's default identity
 (used by `rnprobe` and any consumer that passes `""` for `identity_key`).
+
+`secrets.rnsd.transport_identity` — the 128-hex private key behind this node's
+**transport address**: what it stamps on every announce it forwards, and what
+its neighbours name as the next hop in every route through it. Kept apart from
+the identity above so a relayed packet does not name who is relaying it. It
+must survive a reboot: the address is in other nodes' routing tables, and a
+node that comes back as somebody else blackholes every path through it until
+each neighbour's next announce rebuilds its table — up to a whole announce
+interval of traffic going nowhere, with nothing anywhere reporting a fault.
+Deleting it re-mints the address and costs exactly that.
 
 `secrets.rnsd.ratchets.<dest_hex>` — one per hosted destination: the epoch
 seconds of its last ratchet rotation, a space, then its retained ratchet
