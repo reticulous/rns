@@ -1407,6 +1407,14 @@ static const Bytes& ifac_salt() {
 													entry._emitted = emission_timestamp;
 													entry._raw = packet.raw();
 												}
+												/* Folding into the copy already
+												 * waiting is still deferral: the
+												 * announce goes out when the cap
+												 * lets the queue move. Saying
+												 * otherwise reports a relay that
+												 * did happen as one that found
+												 * nowhere to go. */
+												deferred = true;
 												break;
 											}
 										}
@@ -2763,7 +2771,19 @@ static const Bytes& ifac_salt() {
 				if ((Reticulum::transport_enabled() || for_local_client_link || from_local_client) && _link_table.find(packet.destination_hash()) != _link_table.end()) {
 					TRACE("Handling link request proof...");
 					LinkEntry& link_entry = (*_link_table.find(packet.destination_hash())).second;
-					if (packet.receiving_interface() == link_entry._outbound_interface) {
+					/* The proof is forwarded from exactly the distance the
+					 * link request was going to have to come back from, and
+					 * from nowhere else. Without that test a relay forwards
+					 * every copy it hears — and on a shared medium the copy it
+					 * hears next is its own neighbour's forward of the one it
+					 * just sent, one hop further along, which comes back round
+					 * for as long as the entry lives. An LRPROOF is
+					 * deliberately kept out of the packet hashlist (it may
+					 * arrive on the wrong interface first), so the hop count is
+					 * the only thing that tells a proof travelling from a
+					 * reflection of it. */
+					if (packet.hops() == link_entry._remaining_hops &&
+					    packet.receiving_interface() == link_entry._outbound_interface) {
 						try {
 							if (packet.data().size() == (Type::Identity::SIGLENGTH/8 + Type::Link::ECPUBSIZE/2) || packet.data().size() == (Type::Identity::SIGLENGTH/8 + Type::Link::ECPUBSIZE/2 + Type::Link::LINK_MTU_SIZE)) {
 								Bytes signalling_bytes;
@@ -2822,6 +2842,30 @@ static const Bytes& ifac_salt() {
 					for (auto& link : pending_links) {
 						TRACEF("Checking for link request handling by pending link %s", link.link_id().toHex().c_str());
 						if (link.link_id() == packet.destination_hash()) {
+							/* The answer comes back from the distance the
+							 * request went out to, and an echo of it does not.
+							 * PATHFINDER_M is "we had no path when we asked",
+							 * where there is no distance to check against.
+							 *
+							 * This is the one node that knows the proof has
+							 * arrived, so it is also where the packet stops
+							 * being novel: an LRPROOF is held out of the
+							 * hashlist at ingress (it may arrive on the wrong
+							 * interface first), and arming it here is what
+							 * makes every further copy a duplicate rather than
+							 * another signature to verify. Nothing forwards on
+							 * this branch, so it is a cost and a correctness
+							 * guard rather than a loop guard — the loop guards
+							 * are the hop tests on the two relay paths above. */
+							if (packet.hops() != link.expected_hops() &&
+							    link.expected_hops() != PATHFINDER_M) {
+								DBGF_DEMOTE("Link proof for %s arrived %u hops away, expected %u — ignoring",
+								            packet.destination_hash().toHex().c_str(),
+								            (unsigned)packet.hops(),
+								            (unsigned)link.expected_hops());
+								continue;
+							}
+							remember_hash(packet.packet_hash());
 							TRACE("Requesting pending link to validate proof");
 							const_cast<Link&>(link).validate_proof(packet);
 						}
@@ -2856,8 +2900,21 @@ static const Bytes& ifac_salt() {
 				}
 
 				// Check if this proof needs to be transported
-				if ((Reticulum::transport_enabled() || from_local_client || proof_for_local_client) && _reverse_table.find(packet.destination_hash()) != _reverse_table.end()) {
-					ReverseEntry reverse_entry = (*_reverse_table.find(packet.destination_hash())).second;
+				auto reverse_proof_iter = _reverse_table.find(packet.destination_hash());
+				if ((Reticulum::transport_enabled() || from_local_client || proof_for_local_client) && reverse_proof_iter != _reverse_table.end()) {
+					ReverseEntry reverse_entry = (*reverse_proof_iter).second;
+					/* The entry is spent by being used: one request going out
+					 * earns one proof coming back, and a relay that keeps it
+					 * transports every further copy it hears. On a shared
+					 * medium that is fatal — the outbound and receiving
+					 * interfaces are the same radio, so the direction test
+					 * below passes for a neighbour's rebroadcast as readily as
+					 * for the real thing, and every relay along the path
+					 * reflects every other's copy for as long as the entry
+					 * lives. An LRPROOF is deliberately kept out of the packet
+					 * hashlist (it may arrive on the wrong interface first), so
+					 * nothing else would ever call it a duplicate. */
+					_reverse_table.erase(reverse_proof_iter);
 					if (packet.receiving_interface() == reverse_entry._outbound_interface) {
 						TRACEF("Proof received on correct interface, transporting it via %s", reverse_entry._receiving_interface.toString().c_str());
 						//p new_raw = packet.raw[0:1]

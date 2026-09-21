@@ -2085,6 +2085,11 @@ uint16_t Link::establishment_cost() const {
 	return _object->_establishment_cost;
 }
 
+uint8_t Link::expected_hops() const {
+	assert(_object);
+	return _object->_expected_hops;
+}
+
 uint8_t Link::traffic_timeout_factor() const {
 	assert(_object);
 	return _object->_traffic_timeout_factor;

@@ -273,6 +273,10 @@ namespace RNS {
 		Type::Link::status status() const;
 		double establishment_timeout() const;
 		uint16_t establishment_cost() const;
+		/* How far away the destination was when this link was requested. The
+		 * proof has to come back from exactly there, so Transport needs to
+		 * read it to tell an answer from an echo of one. */
+		uint8_t expected_hops() const;
 		uint8_t traffic_timeout_factor() const;
 		double request_time() const;
 		double last_inbound() const;
