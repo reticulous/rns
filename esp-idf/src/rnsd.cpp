@@ -8695,6 +8695,8 @@ void RnsdService::onInit()
     }
 
 
+    rnsdPillPaletteInit();
+
     cliRegisterCmd("rns",      cliRns);
     cliRegisterCmd("rnsd",     cliRnsd);
     cliRegisterCmd("rnstatus", cliRnstatus);

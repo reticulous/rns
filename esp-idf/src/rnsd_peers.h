@@ -51,6 +51,11 @@ void rnsdPeersIfaceGone(const char* iface);
  *  housekeeping tick. */
 void rnsdPeersTick(void);
 
+/** Publish the palette entries rnsd states itself, rather than waiting for a
+ *  straddle that may not be in the image. Called once from RnsdService::onInit.
+ *  See the comment at its definition for which media those are and why. */
+void rnsdPillPaletteInit(void);
+
 /** One interface's community radius, 0 for an unregistered name. Implemented in
  *  rnsd.cpp, where the interface table lives: the listing needs it per node, to
  *  tell "nobody has announced yet" from "this is an uplink and its destinations

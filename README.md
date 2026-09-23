@@ -464,6 +464,16 @@ draws the whole community's links, including media this node does not run, and a
 class whose colour had never been published would fall back to grey and read as
 some other medium.
 
+**LoRa's entry is `rnsd`'s own**, published from `RnsdService::onInit`
+(`rnsdPillPaletteInit`, `src/rnsd_peers.cpp`) — yellow `ffd400`, order 4, titled
+`LoRa`. The radio straddle rides on the board that carries a modem, so a
+screen-and-WiFi board has no `iface-lora` in its image at all, and the argument
+above is strongest exactly there: that node still draws the community's LoRa
+links. Only the medium that may be absent needs this; every straddle that IS in
+the image states its own. `iface-lora` keeps the pill, which is about this node
+and appears only where a radio is switched on, and its `LORA_PILL_*` carry the
+same colour and order.
+
 ## The directory
 
 Everything `rnsd` knows about *other* destinations lives in one record pool of packed
@@ -600,7 +610,7 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.peers.<i>.{iface,node,dest,aspect,name,hops,heard,announces,rssi,snr}` | One direct peer — a destination one hop away (below). |
 | `rnsd.nodes.slots` | How far a reader iterates the node table. |
 | `rnsd.nodes.<i>.{iface,key,label,transport,heard,peers}` | One node — the thing at the far end (below). |
-| `rns.pill.<id>.{text,color,order,title}` | One interface class's status-line pill, plus the colour and operator-facing name of the medium itself; `text` empty = no pill. Written by the interface straddles through `rnsdPillSet` / `rnsdPillColor`. |
+| `rns.pill.<id>.{text,color,order,title}` | One interface class's status-line pill, plus the colour and operator-facing name of the medium itself; `text` empty = no pill. Written by the interface straddles through `rnsdPillSet` / `rnsdPillColor` — except LoRa's colour, order and title, which `rnsd` states itself so the network graph has them on a board with no radio straddle in its image. |
 
 Together these are this node's own neighbourhood: **nodes** are the things one
 hop away and **peers** the destinations hanging off them, in the same shape

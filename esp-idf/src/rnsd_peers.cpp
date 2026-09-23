@@ -785,3 +785,21 @@ void rnsdPillClear(const char* id)
     std::snprintf(key, sizeof key, "rns.pill.%s.text", id);
     storageSet(key, "");
 }
+
+/* LoRa's palette entry, stated here because it is not this node's to own.
+ *
+ * A colour is a property of the MEDIUM, and the network graph draws the whole
+ * community's links — including the LoRa ones between other nodes. A board with
+ * no radio in it still renders those, and rendering them grey would say
+ * something false about the network. So the one medium whose straddle may not
+ * be in the build at all gets its colour from rnsd, which is always here; the
+ * radio straddle keeps the pill, which IS about this node and appears only
+ * where a radio is switched on.
+ *
+ * The values match iface-lora's LORA_PILL_* (lora_priv.h), which its pill
+ * carries — one medium, one colour and one place on the status line whether or
+ * not it is running here. */
+void rnsdPillPaletteInit(void)
+{
+    rnsdPillColor("lora", "ffd400", 4, "LoRa");
+}
