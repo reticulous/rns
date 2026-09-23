@@ -56,6 +56,32 @@ void rnsdPeersTick(void);
  *  See the comment at its definition for which media those are and why. */
 void rnsdPillPaletteInit(void);
 
+/* The gateway-distance table's rnsd-side hooks (rnsd_gateway.cpp); the public
+ * half is in rnsd.h. */
+
+/** A stock interface-discovery announce for a wired interface type was heard
+ *  directly: that transport identity is a gateway. */
+void rnsdGatewayDiscoveryNote(const uint8_t transport_id[RNSD_IDENT_HASH_LEN]);
+
+/** Any announce heard directly from this identity. Keeps alive a row that only
+ *  the operator's word put in the table (a declaration lives as long as the
+ *  announce that carried it), and adds one for an identity the operator named. */
+void rnsdGatewayHeard(const uint8_t ident[RNSD_IDENT_HASH_LEN]);
+
+/** Whether this node has an uplink, recomputed on every interface change. */
+void rnsdGatewaySetUplink(bool up);
+
+/** Expire declarations past the horizon; called from the housekeeping tick. */
+void rnsdGatewayTick(void);
+
+/** True once after the distance moved, so the next management announce goes
+ *  out early rather than on the beat. */
+bool rnsdGatewayAnnounceOwed(void);
+
+/** Air the management announce as it stands within a few seconds (rnsd.cpp).
+ *  Any task. */
+void rnsdManagementReair(void);
+
 /** One interface's community radius, 0 for an unregistered name. Implemented in
  *  rnsd.cpp, where the interface table lives: the listing needs it per node, to
  *  tell "nobody has announced yet" from "this is an uplink and its destinations

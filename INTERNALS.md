@@ -514,23 +514,52 @@ it is now implemented, plus fork-specific behaviour for point-to-point links.
   trickle and must reach every interface. The radius keeps the airtime
   purpose: the transport network's announce flood never lands on an edge
   link, because it arrives deeper than any radius.
-- **Path-request handling is community-aware.** Whether a request is searched
-  at all is the requestor-side gate (`path_search_possible`: an interface with
-  no served set gets no searches run for it); a search that is taken on goes out every
-  other interface, honouring the point-to-point echo suppression.
-  The
+- **Path-request handling is community-aware.** Whether a request is carried
+  on to other interfaces is the requestor-side gate (`path_search_possible`: a
+  request from an interface with no community is answered from what is stored
+  or not at all, and passed on nowhere, §1.1.3); a search that is taken on goes
+  out every other interface, honouring the point-to-point echo suppression. The
   forwarded-request dedup table (`_discovery_pr_tags`) evicts **FIFO**
   (`_discovery_pr_tags_order`) instead of by `std::set` content order, and its
   cap (`RNS_PR_TAGS_MAX`) is 256 — the old content-ordered eviction dropped
   tags still circulating and let path requests loop between parallel uplinks.
-  A consequence worth stating outright: **"every other interface" is none on a
-  node whose only interface is the one the request arrived on**, which is every
-  ordinary LoRa node. A path request there travels exactly one hop and is
-  answered only by a neighbour that already holds the destination, so on a
-  single-radio mesh what makes a far destination reachable at all is the
-  announce flood covering the distance — i.e. `community_radius` at least the
-  network's diameter. Discovery is a shortcut for what the flood already
-  delivered, never a substitute for it.
+  "Every other interface" is none on a node whose only interface is the one
+  the request arrived on, which is every ordinary LoRa node — so on a shared
+  radio the same-interface repeat of §1.1.3 is what carries a question further,
+  toward a gateway. Nothing carries one inward.
+- **On a radio, the weakest hearer repeats an announce first, and one repeat
+  heard is enough.**
+
+  ```
+  S  → radio   announce (hops 0)
+  N1           heard at −9 dB, usual −2 → share 0.15 of the window
+  N2           heard at +4 dB           → share 0.8
+  N1 → radio   rebroadcast (hops 1)      first: it is the furthest out
+  N2           hears N1's repeat at hops 1 → one is enough, its own dropped
+  ```
+
+  Upstream queues every heard announce for rebroadcast after a random
+  `PATHFINDER_RW` (0.5 s) and drops it once `LOCAL_REBROADCASTS_MAX` (2) repeats
+  of it were heard. On a shared radio that makes most neighbours repeat into
+  the same ears. Here an announce heard with a signal level on an interface
+  that is not point-to-point waits a share of a window instead: the window is
+  four airtimes of the announce at the interface's bitrate (never under
+  `PATHFINDER_RW`, never over 4 s), and the share runs from 0.1 for 10 dB or
+  more below the SNR announces usually arrive at on that interface
+  (`Interface::announce_snr_typical`, a running average kept in `inbound`) to 1
+  for 10 dB or more above it (`announce_radio_share`), jittered by up to 40%
+  so equal levels do not collide. The record is flagged `ANNOUNCE_F_RADIO`;
+  `timers()` sends its first rebroadcast at that moment rather than at the next
+  `jobs()` sweep, which on a quiet node is seconds away and would erase the
+  ordering; and one heard repeat at the same hop count drops it. A later try,
+  and every announce heard on a point-to-point or signal-less interface, keeps
+  upstream's timing and its two-repeat rule. The one crossing: an announce
+  heard on the radio and also due onto a community TCP peer is dropped for
+  both once one radio neighbour repeats it. An emission the interface's
+  announce cap defers goes into that interface's `announce_queue`, which drains
+  lowest hop count first whenever the cap allows; a repeat heard on that
+  interface drops the deferred copy along with the ring entry, since the
+  neighbours it was for have it already.
 - **`transport_enabled` is live.** rnsd mirrors `s.rnsd.transport_enabled` into
   the µR static via `NOW_AND_ON_CHANGE`, so toggling it takes effect without a
   reboot (Transport reads the flag per forwarding decision). On the *disable*
@@ -653,6 +682,68 @@ task over `RNSD_PORT_DIR`, §3), and `rnsd.dir.<hex32>.{pubkey,name_hash,hops,`
 store per key, not a mirrored subtree, so nothing is published against the
 chance that someone asks. Occupancy and the counters that explain it are in
 `rnsd.stats.dir.*`; the persisted image is §7.
+
+#### 1.1.3 Path requests on one radio (`Transport.cpp`, `rnsd_gateway.cpp`)
+
+```
+A → radio   path.request X (asker A, tag T)       A at distance 2
+B           distance 1 < 2 → repeat_schedule(REQUEST, delay ≈ 1 s × 1)
+B → radio   path.request X (asker B, tag T)       timers() fires it
+G           distance 0 → the existing cross-interface forward, to the uplink
+up → G      path response → discovery entry → G → radio → B (entry) → radio → A
+
+up → G      path.request Y                         from a radius-0 interface
+G → up      path response, if G stores Y; else nothing (path_search_possible)
+```
+
+The README section "Finding the way out" is the behaviour; this is where it
+sits.
+
+- **Distance comes from outside µR.** `Transport::set_distance_hooks` takes two
+  functions: this node's distance and the distance of an identity by its hash.
+  rnsd supplies `rnsdGatewayDistance` / `rnsdGatewayDistanceOf` from
+  `rnsd_gateway.cpp`, a 48-row table filled from netgraph (a verified member's
+  management announce heard at hops 1, `rnsdGatewayNote`), from the stock
+  discovery listener in `rnsd.cpp` (`DiscoveryListener`, which checks
+  upstream's stamp — LXMF's workblock over the packed dict — before counting a
+  wired interface) and from the operator's overrides. Without hooks every node
+  is `DISTANCE_NONE` and nothing is repeated onto the interface it arrived on,
+  which is upstream's behaviour. The requestor's transport id is compared
+  against the table, which is only meaningful because rnsd hands Transport the
+  node identity as its own (§7).
+- **Repeats wait in a table, not in jobs().** `PendingRepeat` (24 slots, one
+  per destination) is serviced by `Transport::timers()`, which rnsd calls on
+  every wake and whose `next_timer()` it folds into its sleep: `jobs()` runs on
+  a cadence that backs off to minutes on an idle node, and the delays are a
+  second or two. `timers()` also sends a path response whose grace is over, and
+  the first rebroadcast of an announce heard on a radio (§1.1.1), for the same
+  reason — the ring emission is shared with jobs() as `announce_rec_emit`.
+- **Direction.** A request is repeated only by a relay nearer a gateway than
+  the asker. Nothing is repeated the other way: a question from an uplink is
+  answered from what the gateway stores, so the world finds only the nodes
+  within some gateway's radius.
+- **Suppression.** `repeat_heard` is called from the path-request handler's
+  duplicate-tag branch: a repeat from a node whose distance is no greater than
+  ours cancels ours. `repeats_cancel` runs on every validated announce, since
+  any announce for the destination answers the question, and a path response
+  heard on the medium ours was queued for drops ours while it is still inside
+  its grace — every holder of the destination answers the same question.
+- **A relay keeps the answer it is waiting for.** An unanswered discovery entry
+  makes an arriving path response bypass the replay guard (a relay answering
+  from its store sends a blob this node may already have heard) and count for
+  retention, and the entry is marked `_answered` when the response is passed
+  back, so it is passed back once. The entry also records the transport id the
+  question came from (`_requestor`); an answer transmitted by that node is
+  already on the asker's side and is not passed back. A multi-hop route is
+  answered back out the interface it was learned on everywhere except on a
+  point-to-point interface, where that is an echo; on a shared radio the asker
+  is somebody else.
+- **Timeouts.** `discovery_timeout()` is `2 × ESTABLISHMENT_TIMEOUT_PER_HOP ×
+  DISTANCE_NONE` (96 s), never below `PATH_REQUEST_TIMEOUT`: a question may
+  walk the widest gateway distance and its answer walk back. `rnsdPathBudgetS()`
+  gives consumers at least as long, re-asking every 30 s. A discovery entry
+  older than `DISCOVERY_RETRY_AFTER` (45 s) no longer blocks a fresh forward for
+  the same destination: the asker asking again means the answer went missing.
 
 ### 1.2 The rnsd layer (all new on top of µR)
 
@@ -937,8 +1028,9 @@ answers on.
 
 `rnsdHostedDestsForEach()` walks them — plus the transport probe and the
 remote-management destination where those are up — as flat `{dest, aspect}`
-bytes rather than µR objects. Both of those ride the ordinary hosted-announce
-beat, which is what advertises the management service at no extra cost. The walk is backed by a
+bytes rather than µR objects. The management destination rides the ordinary
+hosted-announce beat, which is what advertises the service at no extra cost;
+the probe does only where `s.rnsd.announce_probe` is set (§4.1). The walk is backed by a
 snapshot rebuilt under a mutex at each of the four points the set can change (an
 our-dest opening or closing, the probe dial either way), because its callers are
 on other tasks and `our_dest_t` holds `RNS::Destination` and `RNS::Bytes` that
@@ -1006,8 +1098,9 @@ opportunistic strip/prepend is required there and wrong on the Link path.
 `RNSD_DEST_ANNOUNCE` **sets** an our-dest's announce (`last_announce_data` +
 `want_announce`); it schedules nothing. Everything that airs one goes through
 `replayOurDestAnnounces()`, which walks a bitmask of interface slots and emits
-each hosted destination's stored bytes — plus the probe destination — **pinned**
-to that slot's `mr_iface`. Three things arm it, all through `armDestReplay()`:
+each hosted destination's stored bytes — plus the management destination, and
+the probe destination where `s.rnsd.announce_probe` is set — **pinned** to that
+slot's `mr_iface`. Three things arm it, all through `armDestReplay()`:
 
 | trigger | delay | slots |
 |---|---|---|
@@ -1030,8 +1123,14 @@ backs off to a minute on an idle node, which would otherwise swallow them.
 medium, so it lives in each interface straddle (`rnsdAnnounceBeat`, ±10 % jitter)
 and its own setting. Applications hold none either: `lxmf`, `rnsh` and `lxmproxy`
 announce once at bring-up and thereafter only when what they advertise changes.
-The probe destination is not special — it rides every replay rather than keeping
-the private cadence it used to have.
+The management destination rides every replay; so does the probe destination,
+but only where `s.rnsd.announce_probe` asks for it — the node answers probes
+either way, and the management announce is what tells a community it is there.
+
+One announce is aired outside the beat: the management announce alone, a few
+seconds (2–8 s, jittered) after this node's gateway distance moves or after a
+neighbour declares a distance that shows it has not heard ours
+(`rnsdManagementReair`, `s_rm_early_due_tick`). §1.1.3 says why.
 
 Addressing by **name prefix** rather than by handle is what makes one call per
 straddle enough: `ble` matches every per-peer registration, `tcp` matches
@@ -1501,14 +1600,22 @@ auto-create an application identity at boot — that is the app's call.
 
 **A relay's address is durable state, because it is in somebody else's table.**
 µR mints a transport identity on `start()` when it has none and writes it to a
-file, which here writes nowhere — so rnsd loads or mints it from
-`secrets.rnsd.transport_identity` and hands it over before `start()`. What makes
-it durable is not this node: the address is what every neighbour routing through
-this one names as its next hop, so coming back as somebody else silently
-blackholes every path through it until each neighbour's next announce rebuilds
-its table. Nothing reports that as a fault — the packets are simply addressed to
-a node that no longer answers to the name. It stays a separate key from the node
-identity so a relayed packet does not name who is relaying it.
+file, which here writes nowhere — so rnsd hands it the node identity
+(`secrets.rnsd.identity`) before `start()` (`adoptTransportIdentity`). What
+makes it durable is not this node: the address is what every neighbour routing
+through this one names as its next hop, so coming back as somebody else
+silently blackholes every path through it until each neighbour's next announce
+rebuilds its table. Nothing reports that as a fault — the packets are simply
+addressed to a node that no longer answers to the name.
+
+**One identity, not two.** The relay address is the node identity, the one
+`rnstransport.remote.management` is announced on. That is what lets a relay
+weigh a path request by who asked: the transport id a request carries is an
+identity whose management announce declared how far it is from a gateway
+(§1.1.3). It also puts the address in the radio's announce join for free.
+Upstream keeps them apart so a relayed packet does not name who relays it; a
+community that draws its own graph from those announces gains nothing from
+that.
 
 **The image is the live set, budgeted against the partition — not the record pool.**
 Three rules hold it there, and each exists because breaking it broke a board:

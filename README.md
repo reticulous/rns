@@ -269,9 +269,11 @@ for it can be answered from what is stored), ranked to **persist** in the direct
 **stored-path lifetime**, and **re-broadcast** to the rest of the community on
 shared media. Path requests arriving on an interface with a community
 (radius > 0) are **searched** on the requestor's behalf, out every other
-interface. Radius 0 is a pure endpoint/uplink: everything heard there is
-forwarded and resolved on demand, nothing unrequested is stored, no relay work
-is spent onto it, and no searches are run on its behalf.
+interface — and on a shared radio, back onto that radio toward the nearest
+gateway ("Finding the way out", below). Radius 0 is an endpoint/uplink:
+everything heard there is forwarded and resolved on demand, nothing
+unrequested is stored, and no relay work is spent onto it; a question arriving
+on it is answered from what this node already stores, or not at all.
 
 Three words keep the distinction honest: everyone on the mesh is **heard** (they
 appear in On The Mesh whatever the radius) and **reachable** (on-demand
@@ -289,10 +291,12 @@ medium rather than a policy, so it always applies.
 Searching is the asymmetric one. Relaying is decided on the egress side — a
 forwarded announce is re-broadcast only within the listeners' radius, so the
 uplink's full announce load is never sprayed across a radio. Searching is decided on the
-**requestor** side: a request arriving on a radius-0 interface is not our
-work to do however well we could do it — otherwise the wider network's discovery
-load lands on this node, which is exactly what being an uplink's customer must
-not mean.
+**requestor** side. A request from the community is carried everywhere it might
+be answered. A request arriving on a radius-0 interface is not this node's
+errand: it is answered from a stored route — a community member, whose
+announce this node keeps — and passed on nowhere, neither into the community
+nor to this node's other uplinks, or the wider network's discovery load would
+land here, which is exactly what being an uplink's customer must not mean.
 
 A LoRa gateway with an internet uplink is therefore the defaults: radius 3 on
 the radio (serve the mesh), radius 0 on the TCP peer (an uplink, on-demand
@@ -301,6 +305,94 @@ wide network onto the radio delivers those announces *deep* (they carried
 their whole wide-network distance across it), so they fall outside the radius
 and are never stored, while native mesh members arrive shallow and
 are.
+
+## Finding the way out — gateway distance and path requests
+
+```
+distance (every member, on its management announce beat):
+  G (uplink)  → radio   management announce, distance 0
+  B           → radio   management announce, distance 1      (heard G directly)
+  A                     heard B directly → distance 2
+
+outbound (A, two hops from G, wants X out on the internet):
+  A → radio   rnstransport.path.request  X, asker A, tag T
+  B           1 < 2: waits ~1 s × its distance, hears no nearer repeat
+  B → radio   rnstransport.path.request  X, asker B, tag T
+  G           gateway: asks its uplink
+  G → uplink  rnstransport.path.request  X, asker G, tag T
+  uplink → G  path response for X
+  G → radio   path response            (G remembered who asked)
+  B → radio   path response            (B remembered who asked)
+  A           has a route: X via B
+
+inbound (the uplink asks G for Y):
+  uplink → G  rnstransport.path.request  Y
+  G → uplink  path response            only if G stores Y (Y within G's radius)
+              nothing otherwise — G does not ask its community
+```
+
+The service radius keeps a radio from carrying the wide network's announces,
+and it also means a node deep in a radio-only area never hears of anything far
+away. Upstream Reticulum repeats a path request only onto *other* interfaces,
+never back onto the one it arrived on, so on a single radio a question travels
+one hop and stops. What reaches the wider world from there is a question that
+walks toward a gateway.
+
+**Gateway distance.** A node with an uplink — a radius-0 point-to-point
+interface whose far end is named, the same thing netgraph draws as an `up` line
+— is a gateway, distance 0; `s.rnsd.gateway.self` makes one by hand. Every
+other member is one more than the nearest neighbour it heard directly,
+capped at 8, which means none. The number rides inside the community-encrypted
+management announce, so only members read it and only a verified member's word
+counts (`rnstatus`, `rnstatus -g`, `netgraph members`). It lives as long as
+`s.rnsd.gateway.horizon_s` after the announce that carried it. When it moves,
+the management announce goes out again within seconds rather than on the
+half-hour beat, and a node that hears a neighbour declare more than its own
+distance plus one — a neighbour that evidently missed it — says it again, at
+most once a minute. Two things make a neighbour a gateway without its declaring
+anything: `s.rnsd.gateway.peer.<identity hex>` = 1, and a stock
+`rnstransport.discovery.interface` announce for a wired interface type
+(TCP server or client, backbone, I2P) heard directly from it, whose stamp is
+checked the way upstream checks it.
+
+**Outbound: a question walks downhill.** A relay that hears a path request it
+cannot answer, on a shared radio, repeats it onto that same radio when its own
+distance is finite and smaller than the asker's. The asker is whoever the
+request names as its transport address — the node identity, which is why a
+node has one identity rather than two — and an asker that declared nothing (a
+stock node) counts as infinitely far. The relay waits a second per hop of its
+own distance plus a little, and drops its repeat if in that time it hears the
+answer or a repeat of the same question from a node no further out than
+itself; so the relay nearest a gateway speaks first and the question takes one
+path downhill. A gateway does what it always did with a question from its
+community: it asks its uplink.
+
+**Inbound: a gateway answers for what it stores.** A question arriving over an
+uplink is not the gateway's to search for. It is answered from the announces
+the gateway already keeps — every community member within its radius on the
+radio — and otherwise not at all, and it is never carried into the community.
+So the world can find a community node only when it is within some gateway's
+radius: a node deeper than every gateway's radius has its announce stop short
+of all of them (relays re-broadcast only within their own radius), so no
+gateway holds it and a question from outside goes unanswered. Such a node can
+still reach out, since its question walks to a gateway.
+
+**The answer comes back the way the question went.** Every node that passed a
+question on remembers it (the discovery table) and passes the answer back once,
+keeping the route itself, since the asker's traffic will come through it — but
+not an answer it heard from the node that brought it the question, which is
+already on the asker's side. Every node holding the destination answers, so a
+node that hears another's answer on its own medium before its own has gone out
+drops its own. A path response is sent after upstream's short grace without
+waiting for the announce queue, and is not held back by the service radius: it
+is an answer to somebody who asked, not an announce spreading.
+
+**Budgets.** A relay remembers a question for a round trip at 6 s a hop across
+the widest gateway distance there is (8 hops, 96 s), and a link or channel
+waiting for a path gets at least that long, asking again every 30 s — one
+question or answer lost on a radio would otherwise be the whole budget. A relay
+that is asked the same question again 45 s after it passed the first one on
+takes that as a sign the answer was lost, and passes it on again.
 
 ## The neighbourhood — who is one hop away
 
@@ -407,8 +499,8 @@ asking (`rnstatus -R <hash>` / `rnpath -R <hash>`, and the netgraph crawl):
 ```
 
 The address is the stock one — `rnstransport.remote.management` on this node's
-identity (the one that hosts destinations, not the transport identity it relays
-under) — so `rnstatus -R <our identity hash>` from an unmodified
+identity, which is also the identity it relays under — so
+`rnstatus -R <our identity hash>` from an unmodified
 `pip install rns` works with nothing on the other side but that hash in a config
 file. `/path` answers upstream's list of `{hash, timestamp, via, hops, expires,
 interface}` and `/status` its `[stats-dict, link-count]`.
@@ -572,10 +664,14 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `s.rnsd.tick_max_ms` | `60000` | Idle ceiling the tick backs off to (×2 per idle tick) on a silent LoRa-only node. Any inbound packet, any open/pending link, or any send still waiting on its delivery proof snaps the cadence back to `tick_min_ms` — a proof window is the tick's own deadline to meet, and a backed-off tick overshoots it by longer than the window. |
 | `s.rnsd.log.trace` | `0` | Add microReticulum's per-call step narration to `log rnsd verbose`. Off, verbose gives one line per event; on, it narrates the steps inside each one — a dozen lines per packet, which on a busy TCP link is the load rather than a description of it. Flips live. |
 | `s.rnsd.respond_to_probes` | `1` | Host `rnstransport.probe` and answer probes (PROVE_ALL). |
+| `s.rnsd.announce_probe` | `0` | Also announce `rnstransport.probe` on the interfaces' beat. Answering needs no announce — a prober without the key asks for the path and this node answers it — and the management announce is what tells a community a node is there. |
+| `s.rnsd.gateway.self` | `0` | Count this node as a gateway (distance 0) though it has no uplink. |
+| `s.rnsd.gateway.peer.<identity hex>` | — | The operator's word on one neighbour: `1` counts it as a gateway whatever it declares, `0` ignores its declarations. For a neighbour that runs stock Reticulum and so declares nothing. |
+| `s.rnsd.gateway.horizon_s` | `5400` | How long a neighbour's declared distance counts after the announce that carried it — three of LoRa's default half-hour beats. |
 | `s.rnsd.prove_incoming` | `1` | Emit delivery proofs for inbound packets we receive. |
 | `s.rnsd.ratchets` | `1` | Advertise a rotating ratchet key on every hosted destination's announces, so senders encrypt to it instead of our long-term identity key and past traffic stays unreadable if that key later leaks. Costs 32 bytes per announce. Live — a change reaches destinations already up. Off is interoperable in both directions: senders fall back to the identity key, and we still encrypt to a peer's ratchet when they advertise one. |
 | `s.rnsd.proof_timeout_s` | `60` | Deadline for an outbound delivery-proof receipt, stamped onto the µR receipt too so Transport keeps it validatable for exactly as long as rnsd waits. Consumers read this knob to set their own backstop above it, so raising it here moves both. |
-| `s.rnsd.link.path_timeout_s` | `30` | Path-request / link-request retry budget. |
+| `s.rnsd.link.path_timeout_s` | `30` | Path-request / link-request retry budget: how long a link or channel waits for a path, asking again every 30 s. A floor — the budget is never shorter than a round trip across the widest gateway distance, 96 s (`rnsdPathBudgetS`, "Finding the way out"). |
 | `s.rnsd.link.request_timeout_s` | `15` | Request/response (page fetch) timeout. |
 | `s.rnsd.link.max_inbound_resources_total` | `4` | Concurrent inbound Resource cap across all links. |
 | `s.rnsd.its_no_pool` | `0` | Disable the ITS server inbox pool (debug). |
@@ -591,7 +687,9 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rns.ready` | Boot barrier — set once the clock, network, and a settle delay have passed; consumers wait on this before using rnsd. |
 | `rnsd.up` | Task is alive and the mesh is running. |
 | `rnsd.enabled` | `1` running, `0` when `s.rnsd.enable=0` held the node off (distinguishes "disabled by config" from "not up yet"). |
-| `rnsd.identity_hash` | Hex hash of rnsd's default identity. |
+| `rnsd.identity_hash` | Hex hash of rnsd's identity — the node identity, which is also the transport address. |
+| `rnsd.gateway.distance` | This node's hops to the nearest gateway: `0`..`7`, or `none`. |
+| `rnsd.gateway.uplink` | `1` while this node holds an uplink (a radius-0 point-to-point interface whose far end is named). |
 | `rnsd.iface_event_seq` | Monotonic counter bumped on interface up/down. |
 | `rnsd.stats.{packets_in,packets_out,bytes_in,bytes_out,ifaces_up}` | Traffic counters. |
 | `rnsd.stats.dir.{entries,blobs,guards}` | Directory pool occupancy. |
@@ -651,18 +749,18 @@ Single-shot debug triggers — write a value and rnsd consumes it on its own tas
 
 ### Secrets
 
-`secrets.rnsd.identity` — the 128-hex private key of rnsd's default identity
-(used by `rnprobe` and any consumer that passes `""` for `identity_key`).
-
-`secrets.rnsd.transport_identity` — the 128-hex private key behind this node's
-**transport address**: what it stamps on every announce it forwards, and what
-its neighbours name as the next hop in every route through it. Kept apart from
-the identity above so a relayed packet does not name who is relaying it. It
-must survive a reboot: the address is in other nodes' routing tables, and a
-node that comes back as somebody else blackholes every path through it until
-each neighbour's next announce rebuilds its table — up to a whole announce
-interval of traffic going nowhere, with nothing anywhere reporting a fault.
-Deleting it re-mints the address and costs exactly that.
+`secrets.rnsd.identity` — the 128-hex private key of rnsd's identity: the
+**node identity**. It hosts `rnstransport.remote.management` and
+`rnstransport.probe` (and any consumer that passes `""` for `identity_key`),
+and it is also this node's **transport address** — what it stamps on every
+announce it forwards, and what its neighbours name as the next hop in every
+route through it. One identity for both is what lets a relay read how far the
+node that asked a path request is from a gateway ("Finding the way out",
+below). It must survive a reboot: the address is in other nodes' routing
+tables, and a node that comes back as somebody else blackholes every path
+through it until each neighbour's next announce rebuilds its table — up to a
+whole announce interval of traffic going nowhere, with nothing anywhere
+reporting a fault. Deleting it re-mints the identity and costs exactly that.
 
 `secrets.rnsd.ratchets.<dest_hex>` — one per hosted destination: the epoch
 seconds of its last ratchet rotation, a space, then its retained ratchet
@@ -690,6 +788,7 @@ rnsd clink listen <aspect> | off  host a destination, accept inbound links
 rnsd creq <dest_hash> <path>      request/response smoke test (page fetch)
 
 rnstatus [filter] [-t] [-j]       interfaces & traffic — node header + per-iface block
+rnstatus -g                       gateway distance and the neighbour declarations behind it
 rnstatus -R <identity hash>       ask that node instead (answer goes to the log)
 rnpath [dest] [-n N|-a] [-s] [-j] routing path table (dest prefix-matches the hash)
 rnpath -r                         name and aspect instead of the hash, where known

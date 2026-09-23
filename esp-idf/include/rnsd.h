@@ -260,7 +260,7 @@ bool rnsdSeedPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
  *     ◄ RESPONSE (upstream's shapes, from Transport's own tables)
  *
  * The address is the stock one — `rnstransport.remote.management` on this
- * node's transport identity — so `rnstatus -R <our identity hash>` from an
+ * node's identity — so `rnstatus -R <our identity hash>` from an
  * unmodified `pip install rns` works with nothing on the other side but that
  * hash in a config file.
  *
@@ -293,8 +293,51 @@ bool rnsdRemoteManagementServing(void);
 /** Set the `app_data` this node's management announce carries — a community
  *  membership signature, say. Upstream announces this destination with no
  *  app_data and stock clients ignore whatever is there, so anything put here
- *  breaks nothing. Pass nullptr/0 to carry none. Airs one announce. */
+ *  breaks nothing. Pass nullptr/0 to carry none. Airs one announce: within a
+ *  few seconds when this node's gateway distance moved since it was last
+ *  aired, otherwise on the minute-long coalesce every hosted announce uses. */
 void rnsdRemoteManagementAnnounceData(const uint8_t* data, size_t n);
+
+/* ──────────────── gateway distance ────────────────
+ *
+ *   gateway G  → air   management announce, distance 0
+ *   node    B  → air   management announce, distance 1   (heard G at hops 1)
+ *   node    A          heard B at hops 1 → distance 2
+ *
+ * How many radio hops this node is from a gateway — a node with a way out of
+ * the community. 0 is a gateway: it has an uplink (a radius-0 point-to-point
+ * interface whose far end is named) or `s.rnsd.gateway.self` is set. Anything
+ * else is one more than the smallest distance a direct neighbour declared in a
+ * management announce within `s.rnsd.gateway.horizon_s`, and RNSD_GW_NONE
+ * means no gateway can be reached. Transport uses it to decide which way a
+ * path request walks (see rns/README.md, "Finding the way out"). The consumer
+ * that composes the management announce carries the number and reports what
+ * neighbours declare; rnsd holds the table. */
+constexpr uint8_t RNSD_GW_NONE    = 8;    /* the ceiling: no gateway reachable */
+constexpr uint8_t RNSD_GW_UNKNOWN = 255;  /* this identity declared nothing */
+
+/** This node's own distance, 0..RNSD_GW_NONE. Published as
+ *  `rnsd.gateway.distance` ("0".."7", or "none"). Any task. */
+uint8_t rnsdGatewayDistance(void);
+
+/** A direct neighbour's declared distance, from a management announce heard at
+ *  hops 1 whose community signature verified. Any task. */
+void rnsdGatewayNote(const uint8_t ident[RNSD_IDENT_HASH_LEN], uint8_t distance);
+
+/** What one identity counts as: its declaration while inside the horizon, 0 for
+ *  one the operator named a gateway or that announced a wired interface,
+ *  RNSD_GW_UNKNOWN otherwise. Any task. */
+uint8_t rnsdGatewayDistanceOf(const uint8_t ident[RNSD_IDENT_HASH_LEN]);
+
+/** `rnstatus -g`: the distance and the neighbour table behind it. CLI task. */
+void rnsdGatewayPrint(void);
+
+/** Seconds a path search may take before a consumer calls it failed:
+ *  `s.rnsd.link.path_timeout_s`, or a round trip at six seconds a hop across
+ *  the widest gateway distance (RNSD_GW_NONE hops, 96 s) if that is longer — a
+ *  question may walk that far to a gateway and the answer walk back. Any
+ *  task. */
+int rnsdPathBudgetS(void);
 
 /** The `-R` half: ask ANOTHER node instead of ourselves.
  *

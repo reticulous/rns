@@ -46,6 +46,7 @@
 #include "Compression.h"
 #include "Resource.h"
 #include "MsgPack.h"      /* the remote-management answers, packed by hand */
+#include "Cryptography/HKDF.h"   /* the stock discovery stamp */
 #include "Directory.h"    /* rdirForEach — the path table /path answers from */
 #include "Persistence/DestinationEntry.h"
 #include "Utilities/OS.h"
@@ -366,6 +367,9 @@ static double ourDestRetryDelay(int attempts) {
 }
 #define RNSD_OUR_DEST_PATH_GIVEUP_S   (6.0 * 3600.0)
 
+/* A link or channel waiting for a path asks again this often inside its budget. */
+#define RNSD_PATH_REASK_S             30.0
+
 /* ─────────────── Identity ─────────────── */
 
 static const char* mode_name(uint8_t mode)
@@ -408,42 +412,24 @@ static void loadOrCreateIdentity(void)
     storageSet("secrets.rnsd.identity", hexPrv.c_str());
 }
 
-/** Load, or mint and persist, the TRANSPORT identity — the address this node
- *  wears as a relay, stamped on every announce it forwards and named as the
- *  next hop by every neighbour routing through it.
+/** Hand the node identity to Transport as its transport identity — the address
+ *  this node wears as a relay, stamped on every announce it forwards and named
+ *  as the next hop by every neighbour routing through it.
  *
- *  It is not the node identity above: that one owns destinations and is what an
- *  announce proves, while this one is only an address in a header, and keeping
- *  them apart is what stops a relayed packet naming who is relaying it. µR
- *  would mint one per boot and write it to a file, but its file IO is compiled
- *  out (routing state is the arena image), so without this the address changes
- *  at every restart — and a restart then blackholes every path through this
- *  node until each neighbour's next announce rebuilds its table, which is up to
- *  a whole announce interval of silence for traffic that has no idea anything
- *  moved. */
-static void loadOrCreateTransportIdentity(void)
+ *  One identity, deliberately. The address a path request carries is then the
+ *  identity whose management announce says how far this node is from a
+ *  gateway, so a relay can compare the asker's distance with its own; and a
+ *  neighbour's relay address is an identity it announces, so the radio's own
+ *  tables join the two without a second key to learn. It must survive a reboot
+ *  for the same reason the identity must: the address is in other nodes'
+ *  routing tables, and a node that came back as somebody else would blackhole
+ *  every path through it until each neighbour's next announce rebuilt them.
+ *  µR would mint one per boot, so this runs before Transport starts. */
+static void adoptTransportIdentity(void)
 {
-    char hex[160] = {};
-    storageGetStr("secrets.rnsd.transport_identity", hex, sizeof(hex), "");
-
-    if (strlen(hex) == 128) {
-        RNS::Bytes prv;
-        prv.assignHex((const uint8_t*)hex, 128);
-        if (prv.size() == 64) {
-            RNS::Identity id(false);
-            if (id.load_private_key(prv)) {
-                RNS::Transport::identity(id);
-                info("loaded transport identity %s", id.hexhash().c_str());
-                return;
-            }
-        }
-        warn("stored transport identity malformed — regenerating");
-    }
-
-    RNS::Identity id(true);
+    if (!s_identity) return;
+    RNS::Identity id(*s_identity);
     RNS::Transport::identity(id);
-    storageSet("secrets.rnsd.transport_identity", id.get_private_key().toHex().c_str());
-    info("generated transport identity %s", id.hexhash().c_str());
 }
 
 /* ─────────────── iface table ─────────────── */
@@ -582,10 +568,11 @@ static int s_iface_event_seq = 0;
  * packet that reaches the destination, so `rnprobe` from a peer
  * round-trips at the protocol level (no application code involved).
  *
- * State lives here (above publishIfaceUp) so the iface-up debounce
- * arm fits inline; the helpers (Up/Down/sendAnnounce) are defined
- * lower alongside the rest of the protocol plumbing. Same 10 s
- * debounce-after-iface-up + periodic schedule as lxmf's announces. */
+ * It is announced only where `s.rnsd.announce_probe` is set: answering needs
+ * no announce (a prober that lacks the key asks for the path, and the node
+ * answers that like any request for a destination it hosts), and the management
+ * announce is what tells a community a node is there. State lives here, above
+ * the announce replay that reads it; rnsdProbeDestUp/Down are further down. */
 static RNS::Destination s_probe_dest{RNS::Type::NONE};
 
 /* ─────────────── remote management ───────────────
@@ -598,6 +585,10 @@ static RNS::Destination s_probe_dest{RNS::Type::NONE};
  * stock clients ignore whatever is there, so carrying something breaks nobody. */
 static RNS::Destination s_rm_dest{RNS::Type::NONE};
 static RNS::Bytes       s_rm_announce_data;
+/* The management announce alone, aired early because this node's gateway
+ * distance moved: its neighbours' distances follow from it, and on LoRa's
+ * half-hour beat a change would take hours to cross a community. 0 = none. */
+static volatile TickType_t s_rm_early_due_tick = 0;
 
 /* Hosted-destination announce replay, PINNED per interface via
  * attached_interface: an event on one interface must never cause announces on
@@ -822,6 +813,22 @@ uint8_t rnsdIfaceRadius(const char* name)
     return 0;
 }
 
+/* An uplink is the same thing netgraph's `up` line names: a radius-0
+ * point-to-point interface whose far end rnsd has named. Holding one makes this
+ * node a gateway. */
+static void gatewayUplinkRecompute(void)
+{
+    bool up = false;
+    for (int j = 0; j < RNSD_MAX_IFACES && s_ifaces; j++) {
+        const iface_t& i = s_ifaces[j];
+        if (!i.used) continue;
+        if (i.info.community_radius == 0 && i.info.point_to_point && !i.info.rx_origin &&
+            i.info.peer_label[0])
+            up = true;
+    }
+    rnsdGatewaySetUplink(up);
+}
+
 /* ─────────────── ITS callbacks ─────────────── */
 
 static int onTransportConnect(int handle, const void* data, size_t len)
@@ -885,6 +892,7 @@ static int onTransportConnect(int handle, const void* data, size_t len)
     }
 
     publishIfaceUp(*slot);
+    gatewayUplinkRecompute();
     return (int)(slot - s_ifaces);
 }
 
@@ -904,6 +912,7 @@ static void onTransportDisconnect(int ref)
     publishIfaceDown(i);
     i.used = false;
     i.handle = -1;
+    gatewayUplinkRecompute();
 }
 
 static void onTransportRecv(int handle, size_t /*bytesAvail*/)
@@ -1184,7 +1193,9 @@ static void replayOurDestAnnounces(void)
                     c.listener_hash.toHex().c_str(), e.what());
             }
         }
-        if (s_probe_dest) {
+        /* The probe answers whether or not it is announced; announcing it is
+         * opt-in, since the management announce is what says a node is here. */
+        if (s_probe_dest && storageGetInt("s.rnsd.announce_probe", 0)) {
             try {
                 s_probe_dest.announce({}, /*path_response=*/false, ifc.mr_iface);
                 n++;
@@ -2527,6 +2538,10 @@ public:
                              app_data.size(), sig,
                              RNS::Type::isNan(rssi) ? 0 : (int16_t)rssi,
                              RNS::Type::isNan(snr)  ? 0 : (int16_t)(snr * 10.0f));
+            /* Heard directly: whatever the gateway table holds for this
+             * identity is still fresh. */
+            if (hops == 1 && receiving_interface.community_radius() > 0 && announced_identity)
+                rnsdGatewayHeard(announced_identity.hash().data());
         }
 
         /* Build the frame once. RNS announce app_data is bounded by mR's
@@ -2592,6 +2607,106 @@ public:
 
 static std::shared_ptr<AnnounceFanout> s_announce_fanout;
 
+/* ─────────────── interface discovery (stock) ───────────────
+ *
+ *   stock node → air   ANNOUNCE rnstransport.discovery.interface
+ *                      app_data = flags(1) ‖ msgpack{0x00: type, 0xFE: transport id, …} ‖ stamp(32)
+ *
+ * Upstream Reticulum advertises its interfaces on this aspect. One heard
+ * directly for a wired type — the node sits on a TCP server, a backbone or I2P —
+ * says its transport identity has a way out of any radio community, so the
+ * gateway table counts it at distance 0 whether or not it runs this firmware.
+ * The stamp is upstream's proof of work (LXMF's stamp scheme over the packed
+ * dict); one below upstream's default value of 16 is ignored as upstream does.
+ * An encrypted one belongs to a network identity we do not hold. */
+#define RNSD_DISCOVERY_STAMP_LEN   32
+#define RNSD_DISCOVERY_STAMP_VALUE 16
+#define RNSD_DISCOVERY_EXPAND      20
+
+static int discoveryStampValue(const RNS::Bytes& packed, const RNS::Bytes& stamp)
+{
+    RNS::Bytes infohash = RNS::Identity::full_hash(packed);
+    RNS::Bytes workblock;
+    for (uint8_t n = 0; n < RNSD_DISCOVERY_EXPAND; n++) {
+        RNS::Bytes salt_src = infohash;
+        salt_src.append(n);                 /* msgpack of a small int is the byte */
+        workblock.append(RNS::Cryptography::hkdf(256, infohash, RNS::Identity::full_hash(salt_src)));
+    }
+    workblock.append(stamp);
+    RNS::Bytes h = RNS::Identity::full_hash(workblock);
+    int value = 0;
+    for (size_t i = 0; i < h.size(); i++) {
+        uint8_t b = h.data()[i];
+        if (b == 0) { value += 8; continue; }
+        while (!(b & 0x80)) { value++; b <<= 1; }
+        break;
+    }
+    return value;
+}
+
+class DiscoveryListener : public RNS::AnnounceHandler {
+public:
+    DiscoveryListener() : RNS::AnnounceHandler("rnstransport.discovery.interface") {}
+    void received_announce(const RNS::Bytes& /*dest_hash*/,
+                           const RNS::Identity& /*announced_identity*/,
+                           const RNS::Bytes& app_data,
+                           const RNS::Bytes& /*name_hash*/,
+                           const RNS::Bytes& /*ratchet*/,
+                           uint8_t hops,
+                           const RNS::Interface& receiving_interface) override
+    {
+        if (hops != 1 || !receiving_interface || receiving_interface.community_radius() == 0) return;
+        if (app_data.size() <= 1 + RNSD_DISCOVERY_STAMP_LEN) return;
+        if (app_data.data()[0] & 0x02) return;              /* encrypted */
+        const uint8_t* p = app_data.data() + 1;
+        size_t n = app_data.size() - 1 - RNSD_DISCOVERY_STAMP_LEN;
+        std::string type;
+        RNS::Bytes tid;
+        try {
+            size_t count = 0, off = MsgPack::detail::unpack_map_header(p, n, count);
+            for (size_t k = 0; k < count && off < n; k++) {
+                uint64_t key = 0;
+                if ((p[off] & 0x80) == 0 || p[off] == 0xcc) off += MsgPack::detail::unpack_uint(p + off, n - off, key);
+                else { off += MsgPack::detail::skip_value(p + off, n - off);
+                       off += MsgPack::detail::skip_value(p + off, n - off); continue; }
+                if (key == 0x00) off += MsgPack::detail::unpack_str(p + off, n - off, type);
+                else if (key == 0xFE) {
+                    MsgPack::bin_t<uint8_t> b;
+                    off += MsgPack::detail::unpack_bin(p + off, n - off, b);
+                    tid = RNS::Bytes(b.data(), b.size());
+                }
+                else off += MsgPack::detail::skip_value(p + off, n - off);
+            }
+        } catch (const std::exception& e) {
+            verb("discovery announce: unreadable (%s)", e.what());
+            return;
+        }
+        if (tid.size() != RNSD_IDENT_HASH_LEN) return;
+        if (type != "TCPServerInterface" && type != "BackboneInterface" &&
+            type != "I2PInterface" && type != "TCPClientInterface") return;
+
+        /* Validate each distinct advertisement once. */
+        RNS::Bytes packed(p, n);
+        RNS::Bytes fh = RNS::Identity::full_hash(RNS::Bytes(app_data.data() + 1, app_data.size() - 1));
+        for (auto& c : s_valid) if (c == fh) { rnsdGatewayDiscoveryNote(tid.data()); return; }
+        int value = discoveryStampValue(packed,
+            RNS::Bytes(app_data.data() + app_data.size() - RNSD_DISCOVERY_STAMP_LEN, RNSD_DISCOVERY_STAMP_LEN));
+        if (value < RNSD_DISCOVERY_STAMP_VALUE) {
+            verb("discovery announce from %s: stamp value %d, ignored", tid.toHex().c_str(), value);
+            return;
+        }
+        s_valid[s_validNext] = fh;
+        s_validNext = (s_validNext + 1) % (sizeof(s_valid) / sizeof(s_valid[0]));
+        info("discovery announce: %s offers a %s, counted as a gateway", tid.toHex().c_str(), type.c_str());
+        rnsdGatewayDiscoveryNote(tid.data());
+    }
+private:
+    RNS::Bytes s_valid[8];
+    size_t     s_validNext = 0;
+};
+
+static std::shared_ptr<DiscoveryListener> s_discovery_listener;
+
 static void rnsdProbeDestUp(void)
 {
     if (s_probe_dest) return;
@@ -2608,10 +2723,10 @@ static void rnsdProbeDestUp(void)
         info("probe dest up: %s (auto-proves incoming packets)",
              s_probe_dest.hash().toHex().c_str());
         hostedDestsRefresh();
-        /* The probe rides every replay (replayOurDestAnnounces airs it
-         * alongside the hosted destinations), so turning it on mid-run needs
-         * only the sweep an application announce would get. */
-        if (!s_dest_announce_due_tick) {
+        /* Where the probe is announced it rides every replay alongside the
+         * hosted destinations, so turning it on mid-run needs only the sweep
+         * an application announce would get. */
+        if (storageGetInt("s.rnsd.announce_probe", 0) && !s_dest_announce_due_tick) {
             s_dest_announce_due_tick = xTaskGetTickCount() +
                 pdMS_TO_TICKS(RNSD_ANNOUNCE_COALESCE_MS);
             if (!s_dest_announce_due_tick) s_dest_announce_due_tick = 1;
@@ -2958,10 +3073,24 @@ static bool cliRemoteAsk(const std::string& hex)
     return true;
 }
 
+void rnsdManagementReair(void)
+{
+    TickType_t due = xTaskGetTickCount() + pdMS_TO_TICKS(2000 + esp_random() % 6000);
+    if (!due) due = 1;
+    s_rm_early_due_tick = due;
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
 void rnsdRemoteManagementAnnounceData(const uint8_t* data, size_t n)
 {
     s_rm_announce_data = (data && n) ? RNS::Bytes(data, n) : RNS::Bytes();
     if (!s_rm_dest) return;
+    /* A moved gateway distance goes out on its own within seconds, jittered so
+     * neighbours that learned the same news together do not answer together. */
+    if (rnsdGatewayAnnounceOwed()) {
+        rnsdManagementReair();
+        return;
+    }
     /* Air it once now rather than waiting out the beat: the thing this carries
      * is membership, and a node that has just been given the community key
      * should be findable as a member without a two-hour wait. */
@@ -3666,6 +3795,7 @@ static void cliRnsd(const char* args)
     }
     if (strcmp(args, "reload") == 0) {
         loadOrCreateIdentity();
+        adoptTransportIdentity();
         return;
     }
     if (strcmp(args, "memory") == 0 || strcmp(args, "mem") == 0) {
@@ -4095,11 +4225,13 @@ static bool ifaceMatchesFilter(const iface_t& i, const std::string& filter)
 static void rnstatusHeader(void)
 {
     bool tx_en = storageGetInt("s.rnsd.transport_enabled", 0) != 0;
-    const RNS::Identity& tid = RNS::Transport::identity();
-    if (tid)        cliPrintf("Reticulum transport instance %s\n", tid.hexhash().c_str());
-    if (s_identity) cliPrintf("Node identity %s\n", s_identity->hexhash().c_str());
-    if (!tid && !s_identity) cliPrintf("Reticulum (no identity)\n");
+    if (s_identity) cliPrintf("Reticulum transport instance %s\n", s_identity->hexhash().c_str());
+    else            cliPrintf("Reticulum (no identity)\n");
     cliPrintf("Transport    %s\n", tx_en ? "enabled" : "disabled");
+    uint8_t gd = rnsdGatewayDistance();
+    if (gd == 0)                 cliPrintf("Gateway      this node (distance 0)\n");
+    else if (gd >= RNSD_GW_NONE) cliPrintf("Gateway      none reachable\n");
+    else                         cliPrintf("Gateway      %u hop%s away\n", (unsigned)gd, gd == 1 ? "" : "s");
     cliPrintf("Interfaces   %d up\n", countActiveIfaces());
 }
 
@@ -4144,6 +4276,11 @@ static void rnstatusJson(const std::string& filter)
     if (s_identity) cJSON_AddStringToObject(root, "identity", s_identity->hexhash().c_str());
     cJSON_AddBoolToObject(root, "transport_enabled",
                           storageGetInt("s.rnsd.transport_enabled", 0) != 0);
+    {
+        uint8_t gd = rnsdGatewayDistance();
+        if (gd >= RNSD_GW_NONE) cJSON_AddNullToObject(root, "gateway_distance");
+        else                    cJSON_AddNumberToObject(root, "gateway_distance", gd);
+    }
 
     cJSON* arr = cJSON_CreateArray();
     for (int j = 0; j < RNSD_MAX_IFACES; j++) {
@@ -4203,6 +4340,7 @@ static void cliRnstatus(const char* args)
             if      (t == "-h" || t == "--help")   show_help = true;
             else if (t == "-t" || t == "--totals") show_totals = true;
             else if (t == "-j" || t == "--json")   json = true;
+            else if (t == "-g" || t == "--gateway") { rnsdGatewayPrint(); return; }
             else if (t == "-R" || t == "--remote") {
                 /* Stock switch, stock argument: a transport identity hash. */
                 while (i < a.size() && (a[i] == ' ' || a[i] == '\t')) i++;
@@ -4214,7 +4352,7 @@ static void cliRnstatus(const char* args)
             else if (!t.empty() && t[0] != '-')    filter = t;
             else {
                 cliPrintf("unknown option: %s\n", t.c_str());
-                cliPrintf("usage: rnstatus [filter] [-t] [-j] [-R hash]\n");
+                cliPrintf("usage: rnstatus [filter] [-t] [-j] [-g] [-R hash]\n");
                 return;
             }
         }
@@ -4224,6 +4362,8 @@ static void cliRnstatus(const char* args)
         cliPrintf("%-*s interfaces & traffic\n", CLI_HELP_COL, "rnstatus [filter]");
         cliPrintf("%-*s global traffic totals\n", CLI_HELP_COL, "  -t  --totals");
         cliPrintf("%-*s JSON output\n", CLI_HELP_COL, "  -j  --json");
+        cliPrintf("%-*s gateway distance and the neighbours it comes from\n",
+                  CLI_HELP_COL, "  -g  --gateway");
         cliPrintf("%-*s ask that node instead (answer goes to the log)\n",
                   CLI_HELP_COL, "  -R  <identity hash>");
         return;
@@ -4504,7 +4644,19 @@ static TickType_t nextDeadline(void)
     if (s_dest_announce_due_tick != 0 &&
         (int32_t)(s_dest_announce_due_tick - due) < 0)
         due = s_dest_announce_due_tick;
-    if (due <= now) return 0;
+    if (s_rm_early_due_tick != 0 &&
+        (int32_t)(s_rm_early_due_tick - due) < 0)
+        due = s_rm_early_due_tick;
+    /* Path responses past their grace, first rebroadcasts of announces heard
+     * on a radio and path requests waiting to be repeated are a second or two
+     * out; the housekeeping cadence may be a minute. */
+    double t = RNS::Transport::next_timer();
+    if (t > 0) {
+        double dt = t - RNS::Utilities::OS::time();
+        TickType_t at = now + (dt <= 0 ? 0 : pdMS_TO_TICKS((uint32_t)(dt * 1000.0)) + 1);
+        if ((int32_t)(at - due) < 0) due = at;
+    }
+    if ((int32_t)(due - now) <= 0) return 0;
     return due - now;
 }
 
@@ -4953,6 +5105,13 @@ void rnsdIfaceAnnounceNow(const char* prefix)
     itsSendAux("rnsd", RNSD_PORT_IFACE, &m, sizeof(m), pdMS_TO_TICKS(50));
 }
 
+int rnsdPathBudgetS(void)
+{
+    int s = storageGetInt("s.rnsd.link.path_timeout_s", 30);
+    int search = (int)RNS::Transport::discovery_timeout();
+    return s > search ? s : search;
+}
+
 void rnsdAnnounceBeat(uint32_t* next_ms, int interval_min, const char* prefix)
 {
     if (!next_ms) return;
@@ -5389,6 +5548,7 @@ struct link_conn_t {
     double               opened_at;     /* OS::time() */
     double               last_activity; /* OS::time() of last open/establish/traffic — LRU eviction key */
     double               path_deadline; /* OS::time() a path must answer by */
+    double               path_asked_at; /* OS::time() of the last path request */
     double               estab_deadline;/* OS::time() ACTIVE must arrive by */
     uint32_t             link_timeout_ms;/* consumer override; 0 = ref-impl budget */
     double               dead_at;       /* OS::time() entered CLOSED/FAILED; 0 = n/a */
@@ -6323,11 +6483,13 @@ static bool linkKickoff(link_conn_t& c)
         c.state = LST_ESTABLISHING;
 
         /* Establishment timeout. A consumer-supplied value is THE timeout,
-         * used verbatim. Otherwise match the Python reference's outbound
-         * budget: the next hop's first-hop timeout (which mR already stored
-         * in the Link) plus ESTABLISHMENT_TIMEOUT_PER_HOP (6 s) per hop — mR
-         * itself omits the per-hop term. Push it back onto the Link so mR's
-         * own watchdog uses the same deadline rather than its shorter one. */
+         * used verbatim. Otherwise the Link's own budget — the next hop's
+         * first-hop timeout plus ESTABLISHMENT_TIMEOUT_PER_HOP (6 s) per hop,
+         * as the initiator in Link.cpp sets it — plus the same 6 s per hop
+         * again: a relay under a SUPE hold keeps a link request for tens of
+         * seconds, and the Python reference's initiator budget is the first
+         * hop alone. Pushed back onto the Link so mR's own watchdog uses
+         * this deadline rather than its shorter one. */
         double estab;
         const char* estab_src;
         if (c.link_timeout_ms != 0) {
@@ -6494,6 +6656,13 @@ static void linkTick(void)
                      oif ? oif.toString().c_str() : "<none>",
                      (unsigned)RNS::Transport::hops_to(c.dest_hash));
                 linkKickoff(c);
+            } else if (now - c.path_asked_at >= RNSD_PATH_REASK_S && now < c.path_deadline) {
+                /* A question or its answer lost on a radio would otherwise
+                 * cost the whole budget; paced, because every question is a
+                 * walk across the radio. */
+                c.path_asked_at = now;
+                try { RNS::Transport::request_path(c.dest_hash); }
+                catch (const std::exception& e) { warn("link[%s]: request_path threw: %s", c.tag, e.what()); }
             } else if (now >= c.path_deadline) {
                 warn("link[%s]: no path within budget", c.tag);
                 c.state = LST_FAILED;
@@ -6597,9 +6766,10 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     c->pend_identify = false;
     c->pend_identify_key.clear();
 
-    int path_to_s = storageGetInt("s.rnsd.link.path_timeout_s", 30);
+    int path_to_s = rnsdPathBudgetS();
     if (req.path_timeout_ms != 0) path_to_s = (int)(req.path_timeout_ms / 1000);
     c->path_deadline = c->opened_at + (path_to_s > 0 ? path_to_s : 30);
+    c->path_asked_at = c->opened_at;
     c->link_timeout_ms = req.link_timeout_ms;   /* 0 = ref-impl budget (linkKickoff) */
 
     /* Initial state tree. storageSet (not Default) so the browser /
@@ -6981,6 +7151,7 @@ struct chan_conn_t {
     double       opened_at;
     double       last_activity;
     double       path_deadline;
+    double       path_asked_at;
     double       estab_deadline;
     uint32_t     link_timeout_ms;
     double       dead_at;
@@ -7483,8 +7654,9 @@ static int onChannelConnect(int handle, const void* data, size_t len) {
     c->outbox.clear();
     c->consumer_task = itsRemoteTask(handle);   /* resource aux target */
     int path_to_s = req->path_timeout_ms ? (int)(req->path_timeout_ms / 1000)
-                                         : storageGetInt("s.rnsd.link.path_timeout_s", 30);
+                                         : rnsdPathBudgetS();
     c->path_deadline = c->opened_at + path_to_s;
+    c->path_asked_at = c->opened_at;
 
     storageBegin();
     chanSetStr(*c, "direction", "out");
@@ -7677,10 +7849,12 @@ static void channelTick() {
                     chanKickoff(c);
                 } else if (now >= c.path_deadline) {
                     c.state = LST_FAILED; chanSetError(c, "no_path"); chanPublishState(c); c.dead_at = now;
-                } else {
-                    /* Keep asking until the path resolves or the deadline hits —
-                     * on a churning public mesh a single request often races an
-                     * eviction. */
+                } else if (now - c.path_asked_at >= RNSD_PATH_REASK_S) {
+                    /* Keep asking until the path resolves or the deadline hits:
+                     * one question or its answer lost on a radio is otherwise
+                     * the whole budget gone. Paced, because every question is
+                     * a walk across the radio. */
+                    c.path_asked_at = now;
                     try { RNS::Transport::request_path(c.dest_hash); } catch (...) {}
                 }
                 break;
@@ -8356,6 +8530,7 @@ static void rnsdTaskMain(void*)
     NOW_AND_ON_CHANGE("s.rnsd.path.cheap_bps", {
         RNS::Transport::path_cheap_bitrate(storageGetInt(key, 50000));
     });
+    NOW_AND_ON_CHANGE("s.rnsd.gateway.self", { (void)key; rnsdGatewayTick(); });
     /* jobs() cadence + table-cull cadence. */
     NOW_AND_ON_CHANGE("s.rnsd.jobs_interval_ms", {
         RNS::Transport::job_interval(storageGetInt(key, 250) / 1000.0f);
@@ -8387,7 +8562,7 @@ static void rnsdTaskMain(void*)
         s_reticulum = std::make_unique<RNS::Reticulum>();
         /* Before start(): Transport mints its own on start when it has none,
          * and that one would not survive the reboot. */
-        loadOrCreateTransportIdentity();
+        adoptTransportIdentity();
         /* Transport-node participation. Mirror the persistent flag into mR's
          * static before start(), and re-mirror on live changes: Transport reads
          * transport_enabled() per forwarding decision, so flipping the setting
@@ -8416,6 +8591,12 @@ static void rnsdTaskMain(void*)
          * lives in AnnounceFanout::received_announce. */
         s_announce_fanout = std::make_shared<AnnounceFanout>();
         RNS::Transport::register_announce_handler(s_announce_fanout);
+
+        /* Gateway distance: which way a path request walks. */
+        s_discovery_listener = std::make_shared<DiscoveryListener>();
+        RNS::Transport::register_announce_handler(s_discovery_listener);
+        RNS::Transport::set_distance_hooks(rnsdGatewayDistanceOf, rnsdGatewayDistance);
+        gatewayUplinkRecompute();
 
         /* Probe responder, gated by s.rnsd.respond_to_probes (default
          * 1). Bring it up if enabled and subscribe for runtime flips of
@@ -8480,7 +8661,23 @@ static void rnsdTaskMain(void*)
          * than aired itself: same bytes, same per-interface pinning, same
          * debounce — a sweep that lands mid-window simply joins the pass that
          * was already coming. */
+        try { RNS::Transport::timers(); }
+        catch (const std::exception& e) { warn("Transport::timers threw: %s", e.what()); }
+
         TickType_t wake = xTaskGetTickCount();
+        if (s_rm_early_due_tick != 0 &&
+            (int32_t)(wake - s_rm_early_due_tick) >= 0) {
+            s_rm_early_due_tick = 0;
+            if (s_rm_dest) {
+                try {
+                    s_rm_dest.announce(s_rm_announce_data);
+                    info("management announce aired early: gateway distance %u",
+                         (unsigned)rnsdGatewayDistance());
+                } catch (const std::exception& e) {
+                    err("early management announce threw: %s", e.what());
+                }
+            }
+        }
         if (s_dest_announce_due_tick != 0 &&
             (int32_t)(wake - s_dest_announce_due_tick) >= 0) {
             s_dest_announce_due_tick = 0;
@@ -8581,6 +8778,7 @@ static void rnsdTaskMain(void*)
                  * a neighbourhood moves at announce intervals, so it has no
                  * claim to share a tick with the sweep. */
                 rnsdPeersTick();
+                rnsdGatewayTick();
             }
             publishStats();   /* cheap, every tick */
             tickPhase ^= 1;

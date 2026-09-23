@@ -177,6 +177,11 @@ namespace RNS {
 			 * response has gone out. A flag, not a second table: the only thing
 			 * that ever differed was which of the two was due next. */
 			ANNOUNCE_F_HELD     = 0x08,
+			/* Heard on a shared radio, with a signal level: its first
+			 * rebroadcast waits a delay set by how weak it arrived, is sent by
+			 * timers() at that moment, and is dropped once one neighbour is
+			 * heard repeating it rather than LOCAL_REBROADCASTS_MAX. */
+			ANNOUNCE_F_RADIO    = 0x10,
 		};
 
 #pragma pack(push, 1)
@@ -255,6 +260,11 @@ namespace RNS {
 			const Bytes _destination_hash;
 			double _timeout = 0;
 			const Interface _requesting_interface = {Type::NONE};
+			/* The answer has been passed back toward the asker once. */
+			bool _answered = false;
+			/* The transport id the question came from, when it named one: an
+			 * answer heard from that node is already past us. */
+			Bytes _requestor;
 		};
 		using PathRequestTable = std::map<Bytes, PathRequestEntry>;
 
@@ -391,6 +401,58 @@ namespace RNS {
 		static void request_path(const Bytes& destination_hash);
 		static void path_request_handler(const Bytes& data, const Packet& packet);
 		static void path_request(const Bytes& destination_hash, bool is_from_local_client, const Interface& attached_interface, const Bytes& requestor_transport_id = {}, const Bytes& tag = {});
+
+		/* Gateway distance — how many hops the embedder says this node, or a
+		 * node known by its transport id, is from a way out of the community.
+		 * DISTANCE_NONE is "no gateway reachable", DISTANCE_UNKNOWN "declared
+		 * nothing". Without hooks every node is DISTANCE_NONE and nothing
+		 * below repeats a path request onto the interface it arrived on. */
+		static constexpr uint8_t DISTANCE_NONE    = 8;
+		static constexpr uint8_t DISTANCE_UNKNOWN = 255;
+		using distance_of_fn  = uint8_t (*)(const uint8_t transport_id[16]);
+		using own_distance_fn = uint8_t (*)();
+		static inline void set_distance_hooks(distance_of_fn of, own_distance_fn own) { _distance_of = of; _own_distance = own; }
+		static uint8_t own_distance();
+		static uint8_t distance_of(const Bytes& transport_id);
+
+		/* A path request waiting out its delay before it is repeated onto the
+		 * interface it arrived on, one step nearer a gateway. Serviced by
+		 * timers(), never by jobs(): the delays are a second or two and jobs()
+		 * runs on a backed-off cadence. */
+		static constexpr uint16_t PENDING_REPEATS_MAX = 24;
+		struct PendingRepeat {
+			uint8_t dest[Type::Reticulum::DESTINATION_LENGTH];
+			uint8_t tag[Type::Reticulum::DESTINATION_LENGTH];
+			uint8_t iface[Type::Reticulum::DESTINATION_LENGTH];
+			uint8_t asker[Type::Reticulum::DESTINATION_LENGTH];
+			bool    have_asker;
+			double  due;
+			uint8_t tag_len;
+			bool    used;
+		};
+		static void repeat_schedule(const Bytes& destination_hash, const Bytes& tag,
+		                            const Interface& on_interface, double delay,
+		                            const Bytes& asker);
+		static void repeat_heard(const Bytes& destination_hash, const Bytes& tag,
+		                         const Bytes& sender_transport_id);
+		static void repeats_cancel(const Bytes& destination_hash);
+
+		/* Deadline work that cannot wait for jobs(): due path responses, due
+		 * first rebroadcasts of announces heard on a radio, and due repeats.
+		 * The embedder calls timers() on every wake and sleeps no longer than
+		 * next_timer() (absolute OS::time(), 0 = nothing due). */
+		static void timers();
+		static double next_timer();
+
+		/* How long a relay remembers a question it passed on, and how long an
+		 * asker should wait for the answer: a round trip at the per-hop
+		 * allowance across the widest gateway distance there is, never below
+		 * upstream's PATH_REQUEST_TIMEOUT. */
+		static double discovery_timeout();
+		/* Seconds after which a question asked again is taken as a sign the
+		 * first answer went missing: a discovery entry this old no longer
+		 * holds back a fresh forward. */
+		static constexpr double DISCOVERY_RETRY_AFTER = 45.0;
 		static bool from_local_client(const Packet& packet);
 		static bool is_local_client_interface(const Interface& interface);
 		static bool interface_to_shared_instance(const Interface& interface);
@@ -607,6 +669,10 @@ namespace RNS {
 		static uint32_t _path_escalate_time;    /* s.rnsd.path.escalate_s */
 		static uint32_t _path_cheap_bitrate;    /* s.rnsd.path.cheap_bps  */
 		static uint32_t _roaming_path_time;
+		static distance_of_fn _distance_of;
+		static own_distance_fn _own_distance;
+		static PendingRepeat _repeats[PENDING_REPEATS_MAX];
+		static Packet announce_rec_emit(AnnounceRec& rec);
 
 		static Reticulum _owner;
 		static Identity _identity;

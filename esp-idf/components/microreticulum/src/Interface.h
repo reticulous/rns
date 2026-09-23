@@ -96,6 +96,11 @@ namespace RNS {
 		// (and Link.cpp onto the Link). NaN = interface reports no signal metric.
 		float _r_stat_rssi = Type::NaN<float>;
 		float _r_stat_snr  = Type::NaN<float>;
+		// A running average of the SNR announces arrive at on this interface,
+		// kept by Transport::inbound. An announce well below it came from far
+		// off, and the node that heard it is the one whose rebroadcast reaches
+		// most new ground, so it goes first. NaN until the first one.
+		float _announce_snr_typical = Type::NaN<float>;
 		bool _online = false;
 		Bytes _ifac_identity;
 		// IFAC (Interface Access Codes). _ifac_identity doubles as the
@@ -263,6 +268,9 @@ namespace RNS {
 		inline float r_stat_snr()  const { assert(_impl); return _impl->_r_stat_snr; }
 		inline void  r_stat_rssi(float v) { assert(_impl); _impl->_r_stat_rssi = v; }
 		inline void  r_stat_snr(float v)  { assert(_impl); _impl->_r_stat_snr = v; }
+		// The level announces usually arrive at here (see InterfaceImpl).
+		inline float announce_snr_typical() const { assert(_impl); return _impl->_announce_snr_typical; }
+		inline void  announce_snr_typical(float v) { assert(_impl); _impl->_announce_snr_typical = v; }
 		inline std::list<AnnounceEntry>& announce_queue() const { assert(_impl); return _impl->_announce_queue; }
 		inline bool is_connected_to_shared_instance() const { assert(_impl); return _impl->_is_connected_to_shared_instance; }
 		inline bool is_local_shared_instance() const { assert(_impl); return _impl->_is_local_shared_instance; }

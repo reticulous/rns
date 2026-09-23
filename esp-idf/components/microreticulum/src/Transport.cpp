@@ -172,6 +172,9 @@ using namespace RNS::Persistence;
 /*static*/ uint32_t Transport::_path_escalate_time	= 3;       /* s.rnsd.path.escalate_s */
 /*static*/ uint32_t Transport::_path_cheap_bitrate	= 50000;   /* s.rnsd.path.cheap_bps  */
 /*static*/ uint32_t Transport::_roaming_path_time	= Type::Transport::ROAMING_PATH_TIME;
+/*static*/ Transport::distance_of_fn Transport::_distance_of = nullptr;
+/*static*/ Transport::own_distance_fn Transport::_own_distance = nullptr;
+/*static*/ Transport::PendingRepeat Transport::_repeats[Transport::PENDING_REPEATS_MAX] = {};
 
 /*static*/ Reticulum Transport::_owner({Type::NONE});
 /*static*/ Identity Transport::_identity({Type::NONE});
@@ -556,66 +559,7 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 					emit_budget--;
 					announce_cursor = (uint16_t)((slot + 1) % _announce_slots);
 
-					TRACEF("Performing announce processing for %s...", destination_hash.toHex().c_str());
-					rec.retransmit_at = OS::time() + Type::Transport::PATHFINDER_G + Type::Transport::PATHFINDER_RW;
-					rec.retries += 1;
-
-					bool block_rebroadcasts = (rec.flags & ANNOUNCE_F_BLOCK) != 0;
-					Type::Packet::context_types announce_context =
-						block_rebroadcasts ? Type::Packet::PATH_RESPONSE : Type::Packet::CONTEXT_NONE;
-					Interface attached_interface = (rec.flags & ANNOUNCE_F_ATTACHED)
-						? find_interface_from_hash_prefix(rec.attached_iface) : Interface({Type::NONE});
-
-					Identity announce_identity(Identity::recall(destination_hash));
-					Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, destination_hash);
-
-					Packet new_packet(
-						announce_destination,
-						attached_interface,
-						Bytes(rec.data, rec.data_len),
-						Type::Packet::ANNOUNCE,
-						announce_context,
-						Type::Transport::TRANSPORT,
-						Type::Packet::HEADER_2,
-						Transport::_identity.hash(),
-						true,
-						(Type::Packet::context_flags)rec.context_flag
-					);
-
-					new_packet.hops(rec.hops);
-					// Carry the interface this announce arrived on onto the
-					// rebroadcast, so outbound()'s point-to-point echo suppression
-					// can stop it going back out that same interface. This
-					// is the reliable source signal — the interface the original
-					// packet was received on — as opposed to a path lookup that
-					// can miss after evictions or interface reconnects.
-					new_packet.receiving_interface(find_interface_from_hash_prefix(rec.recv_iface));
-					if (block_rebroadcasts) {
-						/* Serving someone else's route request — verbose, like
-						 * the rest of the path-request processing. */
-						VERBOSEF("Sent requested route for %s to transport %s (hop count %d)",
-							announce_destination.hash().toHex().c_str(),
-							attached_interface ? attached_interface.toString().c_str() : "<all>",
-							new_packet.hops());
-					}
-					else {
-						DBGF_DEMOTE("Rebroadcasting announce for %s with hop count %d", announce_destination.hash().toHex().c_str(), new_packet.hops());
-					}
-
-					outgoing.push_back(new_packet);
-
-					// This handles an edge case where a peer sends a path
-					// request for a destination just after an announce for said
-					// destination has arrived, but before it has been
-					// rebroadcast locally. In such a case the actual announce is
-					// temporarily held, and re-armed once the path request has
-					// been served to the peer.
-					AnnounceRec* held = announce_find(destination_hash, /*held=*/true);
-					if (held) {
-						memset(&rec, 0, sizeof(rec));
-						held->flags &= (uint8_t)~ANNOUNCE_F_HELD;
-						DBG_DEMOTE("Re-arming held announce");
-					}
+					outgoing.push_back(announce_rec_emit(rec));
 				}
 				}
 
@@ -1693,6 +1637,42 @@ static const Bytes& ifac_salt() {
 	return false;
 }
 
+/* Spangap deviation: on a radio, the neighbour that heard an announce weakest
+ * repeats it first.
+ *
+ * Every node that hears an announce queues a rebroadcast, and on a shared
+ * radio they all reach mostly the same ears. The one that heard it weakest is
+ * probably the furthest from its sender, so its repeat reaches the most nodes
+ * that have not heard it yet; the others hear that repeat and stand down.
+ * Weak is relative: against the running average of what announces usually
+ * arrive at on this interface, so a quiet radio and a loud one both spread
+ * their repeats across the whole window. Returns the share of the window this
+ * one waits, 0.1 for 10 dB or more below the usual level up to 1 for 10 dB or
+ * more above it, and folds the sample into the average. */
+static double announce_radio_share(Interface& interface, float snr) {
+	float typical = interface.announce_snr_typical();
+	double share = 0.5;
+	if (!Type::isNan(typical))
+		share = 0.5 + ((double)snr - (double)typical) / 20.0;
+	if (share < 0.1) share = 0.1;
+	if (share > 1.0) share = 1.0;
+	interface.announce_snr_typical(Type::isNan(typical) ? snr : typical + (snr - typical) / 8.0f);
+	return share;
+}
+
+/* The window a radio rebroadcast is placed in: four airtimes of the announce,
+ * so the first repeat is on the air and heard before most of the others fall
+ * due, never shorter than upstream's PATHFINDER_RW and never past a few
+ * seconds. */
+static double announce_radio_window(const Interface& interface, size_t data_len) {
+	double window = Type::Transport::PATHFINDER_RW;
+	if (interface.bitrate() > 0) {
+		double air = (double)((data_len + Type::Reticulum::HEADER_MAXSIZE) * 8) / (double)interface.bitrate();
+		window = std::max(window, 4.0 * air);
+	}
+	return std::min(window, 4.0);
+}
+
 /*static*/ void Transport::inbound(const Bytes& raw_in, const Interface& interface /*= {Type::NONE}*/) {
 	// Mutable working copy: the IFAC block below rewrites it in place to the
 	// de-IFAC'd packet, which the rest of this function then decodes.
@@ -2206,6 +2186,38 @@ static const Bytes& ifac_salt() {
 			auto iter = _destinations.find(packet.destination_hash());
 			if (iter == _destinations.end() && Identity::validate_announce(packet)) {
 				TRACE("Transport::inbound: Packet is announce for non-local destination, processing...");
+				/* Any announce for a destination is the answer to a question about
+				 * it; a repeat still waiting to carry that question on is moot. */
+				repeats_cancel(packet.destination_hash());
+				/* Heard on a shared radio with a signal level: how early in the
+				 * rebroadcast window this node's repeat goes. Negative when the
+				 * rebroadcast keeps upstream's short random delay. */
+				double radio_share = -1.0;
+				{
+					Interface ri = packet.receiving_interface();
+					float snr = packet.snr();
+					if (ri && !ri.point_to_point() && !Type::isNan(snr))
+						radio_share = announce_radio_share(ri, snr);
+				}
+				/* And somebody else's answer on the medium ours was going out
+				 * on makes ours a duplicate: every node holding the destination
+				 * answers the same question, and each answer is passed back by
+				 * every relay that carried the question. */
+				if (packet.context() == Type::Packet::PATH_RESPONSE && packet.receiving_interface()) {
+					AnnounceRec* mine = announce_find(packet.destination_hash(), /*held=*/false);
+					Bytes ih = packet.receiving_interface().get_hash();
+					if (mine && (mine->flags & ANNOUNCE_F_BLOCK) &&
+					    mine->retries == Type::Transport::PATHFINDER_R &&
+					    ih.size() >= Type::Reticulum::DESTINATION_LENGTH &&
+					    (!(mine->flags & ANNOUNCE_F_ATTACHED) ||
+					     memcmp(mine->attached_iface, ih.data(), Type::Reticulum::DESTINATION_LENGTH) == 0)) {
+						memset(mine, 0, sizeof(*mine));
+						AnnounceRec* held = announce_find(packet.destination_hash(), /*held=*/true);
+						if (held) held->flags &= (uint8_t)~ANNOUNCE_F_HELD;
+						DEBUGF("path %s: another node's answer heard, ours dropped",
+							packet.destination_hash().toHex().c_str());
+					}
+				}
 				if (packet.transport_id()) {
 					received_from = packet.transport_id();
 					
@@ -2216,13 +2228,37 @@ static const Bytes& ifac_salt() {
 						? announce_find(packet.destination_hash(), /*held=*/false) : nullptr;
 					if (queued) {
 						bool announce_erased = false;
+						/* The ring is not the only place a rebroadcast waits:
+						 * one the interface's announce cap deferred sits in
+						 * that interface's queue, and a repeat heard on the
+						 * medium answers it just as well. Dropped together, or
+						 * the queue would air a copy every neighbour already
+						 * has, a median minute late. */
+						auto drop_deferred = [&]() {
+							const Interface& ri = packet.receiving_interface();
+							if (!ri) return;
+							std::list<RNS::AnnounceEntry>& deferred_q = ri.announce_queue();
+							size_t before = deferred_q.size();
+							deferred_q.remove_if([&](const RNS::AnnounceEntry& a) {
+								return a._destination == packet.destination_hash();
+							});
+							if (deferred_q.size() != before) {
+								DBGF_DEMOTE("Heard repeat of announce for %s also drops it from %s's deferred queue",
+									packet.destination_hash().toHex().c_str(), ri.toString().c_str());
+							}
+						};
 						if ((packet.hops() - 1) == queued->hops) {
 							DBGF_DEMOTE("Heard a local rebroadcast of announce for %s", packet.destination_hash().toHex().c_str());
 							queued->local_rebroadcasts += 1;
-							if (queued->local_rebroadcasts >= LOCAL_REBROADCASTS_MAX) {
+							/* On a radio the neighbour that went first was the
+							 * one that heard it weakest, so it has already
+							 * carried it furthest: one repeat is enough. */
+							uint8_t enough = (queued->flags & ANNOUNCE_F_RADIO) ? 1 : LOCAL_REBROADCASTS_MAX;
+							if (queued->local_rebroadcasts >= enough) {
 								DBGF_DEMOTE("Max local rebroadcasts of announce for %s reached, dropping announce from our queue", packet.destination_hash().toHex().c_str());
 								memset(queued, 0, sizeof(*queued));
 								announce_erased = true;
+								drop_deferred();
 							}
 						}
 
@@ -2231,6 +2267,7 @@ static const Bytes& ifac_salt() {
 							if (now < queued->timestamp) {
 								DBGF_DEMOTE("Rebroadcasted announce for %s has been passed on to another node, no further tries needed", packet.destination_hash().toHex().c_str());
 								memset(queued, 0, sizeof(*queued));
+								drop_deferred();
 							}
 						}
 					}
@@ -2276,7 +2313,16 @@ static const Bytes& ifac_salt() {
 					bool requested =
 						packet.context() == Type::Packet::PATH_RESPONSE &&
 						_path_requests.find(packet.destination_hash()) != _path_requests.end();
-					bool bypass = requested && (!have_known || packet.hops() <= known.hops);
+					/* A relay that passed a question on is waiting for the
+					 * answer as much as the asker is: it must keep the route
+					 * (the asker's traffic will come through it) and pass the
+					 * answer back — even when the answer is a relay's cached
+					 * announce whose blob this node has already heard. */
+					auto relayed = _discovery_path_requests.find(packet.destination_hash());
+					bool relay_waiting =
+						packet.context() == Type::Packet::PATH_RESPONSE &&
+						relayed != _discovery_path_requests.end() && !relayed->second._answered;
+					bool bypass = (requested || relay_waiting) && (!have_known || packet.hops() <= known.hops);
 
 					fresh = random_blob.size() == Type::Identity::RANDOM_HASH_LENGTH/8 &&
 					        rdirGuardFresh(packet.destination_hash().data(), random_blob.data(),
@@ -2315,7 +2361,7 @@ static const Bytes& ifac_salt() {
 					 * members. Beyond the radius (a leak from another gateway,
 					 * the uplink's firehose) nothing is stored unrequested. */
 					retain = route_better && (fresh || !have_record) &&
-					         (requested ||
+					         (requested || relay_waiting ||
 					          packet.hops() == 1 ||
 					          (packet.receiving_interface() &&
 					           packet.hops() <= packet.receiving_interface().community_radius()) ||
@@ -2397,17 +2443,27 @@ static const Bytes& ifac_salt() {
 								relay_note = ", not relayed (no egress)";
 							}
 							else {
+								bool radio = false;
 								if (Transport::from_local_client(packet)) {
 									// If the announce is from a local client,
 									// it is announced immediately, but only one time.
 									retransmit_timeout = now;
 									retries = PATHFINDER_R;
 								}
+								else if (radio_share >= 0) {
+									/* Weakest first (announce_radio_share), with a
+									 * little randomness so equal levels do not
+									 * collide. */
+									double window = announce_radio_window(packet.receiving_interface(), packet.data().size());
+									retransmit_timeout = now + window * radio_share * (0.6 + 0.4 * Cryptography::random());
+									radio = true;
+								}
 								AnnounceRec* slot = announce_find(packet.destination_hash(), /*held=*/false);
 								if (!slot) slot = announce_alloc();
 								announce_store(slot, packet.destination_hash(), packet, now,
 								               retransmit_timeout, retries, announce_hops,
 								               block_rebroadcasts, attached_interface);
+								if (slot && radio) slot->flags |= ANNOUNCE_F_RADIO;
 								cull_announce_table();
 							}
 						}
@@ -2494,8 +2550,14 @@ static const Bytes& ifac_salt() {
 						// for this destination, we retransmit to that
 						// interface immediately
 						auto iter = _discovery_path_requests.find(packet.destination_hash());
-						if (fresh && iter != _discovery_path_requests.end()) {
+						/* An answer transmitted by the node that brought us the
+						 * question is already on the asker's side of us. */
+						bool from_asker = iter != _discovery_path_requests.end() &&
+						                  iter->second._requestor && packet.transport_id() &&
+						                  packet.transport_id() == iter->second._requestor;
+						if (fresh && iter != _discovery_path_requests.end() && !iter->second._answered && !from_asker) {
 							PathRequestEntry& pr_entry = (*iter).second;
+							pr_entry._answered = true;
 							attached_interface = pr_entry._requesting_interface;
 
 							DBGF_DEMOTE("Got matching announce, answering waiting discovery path request for %s on %s", packet.destination_hash().toHex().c_str(), attached_interface.toString().c_str());
@@ -3730,6 +3792,218 @@ will announce it.
 	}
 }
 
+/* One emission of a queued announce: the packet it becomes, and the queue
+ * bookkeeping that goes with sending it. Shared by the jobs() sweep and by
+ * timers(), which sends path responses as soon as their grace is over rather
+ * than when the sweep next runs. */
+/*static*/ Packet Transport::announce_rec_emit(AnnounceRec& rec) {
+	Bytes destination_hash(rec.dest, Type::Reticulum::DESTINATION_LENGTH);
+	TRACEF("Performing announce processing for %s...", destination_hash.toHex().c_str());
+	rec.retransmit_at = OS::time() + Type::Transport::PATHFINDER_G + Type::Transport::PATHFINDER_RW;
+	rec.retries += 1;
+
+	bool block_rebroadcasts = (rec.flags & ANNOUNCE_F_BLOCK) != 0;
+	Type::Packet::context_types announce_context =
+		block_rebroadcasts ? Type::Packet::PATH_RESPONSE : Type::Packet::CONTEXT_NONE;
+	Interface attached_interface = (rec.flags & ANNOUNCE_F_ATTACHED)
+		? find_interface_from_hash_prefix(rec.attached_iface) : Interface({Type::NONE});
+
+	Identity announce_identity(Identity::recall(destination_hash));
+	Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, destination_hash);
+
+	Packet new_packet(
+		announce_destination,
+		attached_interface,
+		Bytes(rec.data, rec.data_len),
+		Type::Packet::ANNOUNCE,
+		announce_context,
+		Type::Transport::TRANSPORT,
+		Type::Packet::HEADER_2,
+		Transport::_identity.hash(),
+		true,
+		(Type::Packet::context_flags)rec.context_flag
+	);
+
+	new_packet.hops(rec.hops);
+	// Carry the interface this announce arrived on onto the
+	// rebroadcast, so outbound()'s point-to-point echo suppression
+	// can stop it going back out that same interface. This
+	// is the reliable source signal — the interface the original
+	// packet was received on — as opposed to a path lookup that
+	// can miss after evictions or interface reconnects.
+	new_packet.receiving_interface(find_interface_from_hash_prefix(rec.recv_iface));
+	if (block_rebroadcasts) {
+		/* Serving someone else's route request — verbose, like
+		 * the rest of the path-request processing. */
+		VERBOSEF("Sent requested route for %s to transport %s (hop count %d)",
+			announce_destination.hash().toHex().c_str(),
+			attached_interface ? attached_interface.toString().c_str() : "<all>",
+			new_packet.hops());
+	}
+	else {
+		DBGF_DEMOTE("Rebroadcasting announce for %s with hop count %d", announce_destination.hash().toHex().c_str(), new_packet.hops());
+	}
+
+	// This handles an edge case where a peer sends a path
+	// request for a destination just after an announce for said
+	// destination has arrived, but before it has been
+	// rebroadcast locally. In such a case the actual announce is
+	// temporarily held, and re-armed once the path request has
+	// been served to the peer.
+	AnnounceRec* held = announce_find(destination_hash, /*held=*/true);
+	if (held) {
+		memset(&rec, 0, sizeof(rec));
+		held->flags &= (uint8_t)~ANNOUNCE_F_HELD;
+		DBG_DEMOTE("Re-arming held announce");
+	}
+	return new_packet;
+}
+
+/* An emission timers() sends at its own moment rather than at the next jobs()
+ * sweep: a path response still owed (queued, not held, not yet sent), and the
+ * first rebroadcast of an announce heard on a radio, whose delay is what
+ * decides which neighbour speaks first. Later tries stay with jobs(). */
+static inline bool announce_rec_timed(const Transport::AnnounceRec& r) {
+	if (!(r.flags & Transport::ANNOUNCE_F_USED)) return false;
+	if (r.flags & Transport::ANNOUNCE_F_HELD) return false;
+	if (r.flags & Transport::ANNOUNCE_F_BLOCK) {
+		if (r.retries > 0 && r.retries >= Type::Transport::LOCAL_REBROADCASTS_MAX) return false;
+		if (r.retries > Type::Transport::PATHFINDER_R) return false;
+		return true;
+	}
+	return (r.flags & Transport::ANNOUNCE_F_RADIO) && r.retries == 0;
+}
+
+/*static*/ double Transport::discovery_timeout() {
+	double t = 2.0 * Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP * (double)DISTANCE_NONE;
+	return std::max(t, (double)Type::Transport::PATH_REQUEST_TIMEOUT);
+}
+
+/*static*/ uint8_t Transport::own_distance() {
+	return _own_distance ? _own_distance() : DISTANCE_NONE;
+}
+
+/*static*/ uint8_t Transport::distance_of(const Bytes& transport_id) {
+	if (!_distance_of || transport_id.size() < 16) return DISTANCE_UNKNOWN;
+	return _distance_of(transport_id.data());
+}
+
+/*static*/ void Transport::repeat_schedule(const Bytes& destination_hash, const Bytes& tag,
+                                           const Interface& on_interface, double delay,
+                                           const Bytes& asker) {
+	if (destination_hash.size() != Type::Reticulum::DESTINATION_LENGTH || !on_interface) return;
+	Bytes ih = on_interface.get_hash();
+	if (ih.size() < Type::Reticulum::DESTINATION_LENGTH) return;
+	PendingRepeat* slot = nullptr;
+	PendingRepeat* latest = nullptr;
+	for (uint16_t i = 0; i < PENDING_REPEATS_MAX; i++) {
+		PendingRepeat& r = _repeats[i];
+		if (!r.used) { if (!slot) slot = &r; continue; }
+		/* One question in flight per destination is enough: a second asker is
+		 * answered by the same response on the same medium. */
+		if (memcmp(r.dest, destination_hash.data(), Type::Reticulum::DESTINATION_LENGTH) == 0)
+			return;
+		if (!latest || r.due > latest->due) latest = &r;
+	}
+	/* Full: the repeat due last is the one that has made least progress. */
+	if (!slot) slot = latest;
+	if (!slot) return;
+	memset(slot, 0, sizeof(*slot));
+	memcpy(slot->dest, destination_hash.data(), Type::Reticulum::DESTINATION_LENGTH);
+	size_t tl = std::min(tag.size(), (size_t)Type::Reticulum::DESTINATION_LENGTH);
+	if (tl) memcpy(slot->tag, tag.data(), tl);
+	slot->tag_len = (uint8_t)tl;
+	memcpy(slot->iface, ih.data(), Type::Reticulum::DESTINATION_LENGTH);
+	if (asker.size() >= Type::Reticulum::DESTINATION_LENGTH) {
+		memcpy(slot->asker, asker.data(), Type::Reticulum::DESTINATION_LENGTH);
+		slot->have_asker = true;
+	}
+	slot->due  = OS::time() + delay;
+	slot->used = true;
+}
+
+/*static*/ void Transport::repeat_heard(const Bytes& destination_hash, const Bytes& tag,
+                                        const Bytes& sender_transport_id) {
+	for (uint16_t i = 0; i < PENDING_REPEATS_MAX; i++) {
+		PendingRepeat& r = _repeats[i];
+		if (!r.used) continue;
+		if (memcmp(r.dest, destination_hash.data(), Type::Reticulum::DESTINATION_LENGTH) != 0) continue;
+		size_t tl = std::min(tag.size(), (size_t)Type::Reticulum::DESTINATION_LENGTH);
+		if (tl != r.tag_len || memcmp(r.tag, tag.data(), tl) != 0) continue;
+		/* Somebody at least as close to a gateway already carried it on: our
+		 * repeat would reach nobody new further down. A repeat from further up
+		 * (or from a node that declared nothing) says nothing about whether it
+		 * got past us. */
+		uint8_t d = distance_of(sender_transport_id);
+		if (d != DISTANCE_UNKNOWN && d <= own_distance()) {
+			DEBUGF("path request %s: repeat heard from distance %u, ours dropped",
+				destination_hash.toHex().c_str(), (unsigned)d);
+			r.used = false;
+		}
+		return;
+	}
+}
+
+/*static*/ void Transport::repeats_cancel(const Bytes& destination_hash) {
+	if (destination_hash.size() != Type::Reticulum::DESTINATION_LENGTH) return;
+	for (uint16_t i = 0; i < PENDING_REPEATS_MAX; i++) {
+		PendingRepeat& r = _repeats[i];
+		if (!r.used) continue;
+		if (memcmp(r.dest, destination_hash.data(), Type::Reticulum::DESTINATION_LENGTH) != 0) continue;
+		DEBUGF("path request %s: answer heard, repeat dropped", destination_hash.toHex().c_str());
+		r.used = false;
+	}
+}
+
+/*static*/ double Transport::next_timer() {
+	double due = 0;
+	for (uint16_t i = 0; i < PENDING_REPEATS_MAX; i++) {
+		const PendingRepeat& r = _repeats[i];
+		if (r.used && (due == 0 || r.due < due)) due = r.due;
+	}
+	for (uint16_t i = 0; i < _announce_slots; i++) {
+		const AnnounceRec& r = _announce_ring[i];
+		if (!announce_rec_timed(r)) continue;
+		if (due == 0 || r.retransmit_at < due) due = r.retransmit_at;
+	}
+	return due;
+}
+
+/*static*/ void Transport::timers() {
+	if (_jobs_running) return;
+	double now = OS::time();
+	std::vector<Packet> emissions;
+	for (uint16_t i = 0; i < _announce_slots; i++) {
+		AnnounceRec& r = _announce_ring[i];
+		if (!announce_rec_timed(r) || now <= r.retransmit_at) continue;
+		emissions.push_back(announce_rec_emit(r));
+	}
+	for (auto& p : emissions) p.send();
+
+	for (uint16_t i = 0; i < PENDING_REPEATS_MAX; i++) {
+		PendingRepeat& r = _repeats[i];
+		if (!r.used || now < r.due) continue;
+		r.used = false;
+		Bytes destination_hash(r.dest, Type::Reticulum::DESTINATION_LENGTH);
+		Bytes tag(r.tag, r.tag_len);
+		Interface on_interface = find_interface_from_hash_prefix(r.iface);
+		if (!on_interface) continue;
+		if (has_path(destination_hash)) continue;
+		/* Remember who asked, so the answer can be passed back this way. The
+		 * medium is shared, so "who asked" is the interface itself. */
+		if (_discovery_path_requests.find(destination_hash) == _discovery_path_requests.end()) {
+			auto ins = _discovery_path_requests.insert({destination_hash, {
+				destination_hash, now + discovery_timeout(), on_interface
+			}});
+			if (r.have_asker)
+				ins.first->second._requestor = Bytes(r.asker, Type::Reticulum::DESTINATION_LENGTH);
+		}
+		DEBUGF("path request %s: repeating on %s toward a gateway (distance %u)",
+			destination_hash.toHex().c_str(), on_interface.toString().c_str(), (unsigned)own_distance());
+		request_path(destination_hash, on_interface, tag);
+	}
+}
+
 /*static*/ void Transport::path_request_handler(const Bytes& data, const Packet& packet) {
 	TRACE("Transport::path_request_handler");
 	try {
@@ -3781,6 +4055,7 @@ will announce it.
 				}
 				else {
 					DBGF_DEMOTE("Ignoring duplicate path request for %s with tag %s", destination_hash.toHex().c_str(), unique_tag.toHex().c_str());
+					repeat_heard(destination_hash, tag_bytes, requesting_transport_instance);
 				}
 			}
 			else {
@@ -3831,24 +4106,28 @@ will announce it.
 
 	//local_destination = next((d for d in Transport.destinations if d.hash == destination_hash), None)
 	auto destinations_iter = _destinations.find(destination_hash);
+
+	/* A path response IS the original signed announce, so only a node still
+	 * holding those bytes can answer one. That is what the blob pool is for; a
+	 * destination whose blob has been evicted (or whose announce never fitted
+	 * a slot) is searched for like an unknown one. */
+	uint8_t blob_raw[Type::Reticulum::MTU];
+	size_t blob_n = 0;
+	if (destinations_iter == _destinations.end() && have_route &&
+	    (Reticulum::transport_enabled() || is_from_local_client)) {
+		blob_n = rdirCopyBlob(destination_hash.data(), blob_raw, sizeof(blob_raw));
+		if (blob_n == 0)
+			DBGF_DEMOTE("No retained announce for %s, searching as for an unknown path", destination_hash.toHex().c_str());
+	}
+
 	if (destinations_iter != _destinations.end()) {
 		auto& local_destination = (*destinations_iter).second;
 		local_destination.announce({Bytes::NONE}, true, attached_interface, tag);
 		INFOF("Answering path request for destination %s%s, destination is local to this system", destination_hash.toHex().c_str(), interface_str.c_str());
 	}
     //p elif (RNS.Reticulum.transport_enabled() or is_from_local_client) and (destination_hash in Transport.destination_table):
-	else if ((Reticulum::transport_enabled() || is_from_local_client) && have_route) {
+	else if ((Reticulum::transport_enabled() || is_from_local_client) && have_route && blob_n > 0) {
 		TRACEF("Transport::path_request_handler: entry found for destination %s", destination_hash.toHex().c_str());
-		/* A path response IS the original signed announce, so only a node
-		 * still holding those bytes can answer one. That is what the blob pool
-		 * is for; a destination whose blob has been evicted (or whose announce
-		 * never fitted a slot) falls through to normal discovery. */
-		uint8_t blob_raw[Type::Reticulum::MTU];
-		size_t blob_n = rdirCopyBlob(destination_hash.data(), blob_raw, sizeof(blob_raw));
-		if (blob_n == 0) {
-			DBGF_DEMOTE("No retained announce for %s, not answering path request", destination_hash.toHex().c_str());
-			return;
-		}
 		Packet announce_packet(Bytes(blob_raw, blob_n));
 		if (!announce_packet.unpack()) {
 			DBGF_DEMOTE("Retained announce for %s is unusable, not answering path request", destination_hash.toHex().c_str());
@@ -3876,19 +4155,16 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 				// convergence time. Maybe just drop it?
 				DBGF_DEMOTE("Not answering path request for destination %s%s, since next hop is the requestor", destination_hash.toHex().c_str(), interface_str.c_str());
 			}
-			// Only re-emit a path back out the *same* interface the request
-			// arrived on when we are the destination's direct neighbor on
-			// that medium (1 hop, learned on that interface). Re-emitting a
-			// multi-hop path onto a shared/broadcast medium is what
-			// propagates looped/long paths (the gateway hops=5,
-			// next-hop-unknown pollution). On point-to-point links the only
-			// "1 hop on that interface" path is the requesting peer itself,
-			// already handled above — so this also suppresses the pointless
-			// p2p echo without needing to tag interface kinds.
-			// Cross-interface answering (learned on iface A, answer on B) is
-			// legitimate transport bridging and is unaffected.
-			else if (attached_interface == receiving_interface && route.hops > 1) {
-				DBGF_DEMOTE("Not answering path request for destination %s%s back out its own interface: path is %u hops, not a direct neighbor on that medium", destination_hash.toHex().c_str(), interface_str.c_str(), (unsigned)route.hops);
+			// A point-to-point link has one peer, and a multi-hop path learned
+			// over it came from that peer — answering back out it is an echo.
+			// A shared medium is different: the asker is somebody else on the
+			// same radio, and a relay that knows the way is exactly who a
+			// question from deep inside a radio-only area needs to hear from.
+			// The asker's own next-hop test above, and ingest's rule that a
+			// longer path never displaces a shorter valid one, are what keep
+			// such answers from building loops.
+			else if (attached_interface.point_to_point() && attached_interface == receiving_interface && route.hops > 1) {
+				DBGF_DEMOTE("Not answering path request for destination %s%s back out its own point-to-point interface: path is %u hops", destination_hash.toHex().c_str(), interface_str.c_str(), (unsigned)route.hops);
 			}
 			else {
 				/* Transporting on behalf of others — verbose, like the rest
@@ -3981,7 +4257,39 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 	}
 	else if (should_search_for_unknown) {
 		TRACEF("Transport::path_request_handler: searching for unknown path to %s", destination_hash.toHex().c_str());
-		if (_discovery_path_requests.find(destination_hash) != _discovery_path_requests.end()) {
+
+		/* Downhill on the same radio. A relay that is closer to a gateway than
+		 * the asker carries the question one step further toward it; one that
+		 * is not stays quiet, so the question walks toward the nearest gateway
+		 * instead of flooding. An asker that declared nothing (a stock node)
+		 * counts as infinitely far. The wait is a second per hop of our own
+		 * distance, so the relay nearest a gateway speaks first and the others
+		 * hear it and stand down (repeat_heard). A gateway itself is not in
+		 * this branch: it asks its uplink, below.
+		 *
+		 * The other direction has no counterpart. A question arriving over an
+		 * uplink is not this node's to search for: it is answered from a route
+		 * already stored — a node within the community radius — or not at
+		 * all (path_search_possible). */
+		uint8_t own = own_distance();
+		bool shared = attached_interface && !attached_interface.point_to_point() &&
+		              attached_interface.community_radius() > 0 &&
+		              !is_local_client_interface(attached_interface);
+		if (shared && own > 0 && own < DISTANCE_NONE) {
+			uint8_t asker = distance_of(requestor_transport_id);
+			if (own < asker) {
+				double delay = (double)own + Cryptography::random() * 0.5;
+				DEBUGF("path request %s%s: asker at %s, we are %u from a gateway, repeating in %.1fs",
+					destination_hash.toHex().c_str(), interface_str.c_str(),
+					asker == DISTANCE_UNKNOWN ? "unknown distance" : (asker >= DISTANCE_NONE ? "no gateway" : "a greater distance"),
+					(unsigned)own, delay);
+				repeat_schedule(destination_hash, tag, attached_interface, delay, requestor_transport_id);
+			}
+		}
+
+		auto searching = _discovery_path_requests.find(destination_hash);
+		if (searching != _discovery_path_requests.end() &&
+		    discovery_timeout() - (searching->second._timeout - OS::time()) < DISCOVERY_RETRY_AFTER) {
 			DBGF_DEMOTE("path request %s%s: already searching", destination_hash.toHex().c_str(), interface_str.c_str());
 		}
 		else if (!path_search_possible(attached_interface)) {
@@ -3993,12 +4301,13 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 			DBGF_DEMOTE("path request %s%s: searching", destination_hash.toHex().c_str(), interface_str.c_str());
 			//p pr_entry = { "destination_hash": destination_hash, "timeout": time.time()+Transport.PATH_REQUEST_TIMEOUT, "requesting_interface": attached_interface }
 			//p _discovery_path_requests[destination_hash] = pr_entry;
-			// CBA ACCUMULATES
-			_discovery_path_requests.insert({destination_hash, {
+			_discovery_path_requests.erase(destination_hash);
+			auto ins = _discovery_path_requests.insert({destination_hash, {
 				destination_hash,
-				OS::time() + Type::Transport::PATH_REQUEST_TIMEOUT,
+				OS::time() + discovery_timeout(),
 				attached_interface
 			}});
+			ins.first->second._requestor = requestor_transport_id;
 
 			for (auto& [hash, interface] : _interfaces) {
 				// No path known here, so by the same-interface rule we must
