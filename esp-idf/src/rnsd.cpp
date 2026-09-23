@@ -5854,6 +5854,15 @@ static void onLinkRemoteIdentifiedCb(const RNS::Link& link,
         RNS::Bytes rdest = RNS::Destination::hash_from_name_and_identity(
             c->aspect.c_str(), identity);
         linkSetStr(*c, "remote_dest", rdest.toHex().c_str());
+        /* The identity is proven, so its key is known for that destination
+         * from here on — whether or not an announce ever arrives. A consumer
+         * that has to verify what the peer sends over this link (lxmf checks
+         * the LXM signature against the sender's key) would otherwise hold the
+         * message behind a path request, on a mesh where the peer's announce
+         * may never reach us. */
+        RNS::Bytes pk = identity.get_public_key();
+        if (rdest.size() == RNSD_DEST_HASH_LEN && pk.size() == RNSD_PUBKEY_LEN)
+            rnsdSeedPubkey(rdest.data(), pk.data());
         info("link[%s]: peer identified as %s (dest %s on %s)",
              c->tag, identity.hash().toHex().c_str(),
              rdest.toHex().c_str(), c->aspect.c_str());

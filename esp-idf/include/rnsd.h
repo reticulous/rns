@@ -226,12 +226,15 @@ bool rnsdRecallPubkey(const uint8_t dest_hash[RNSD_DEST_HASH_LEN],
 
 /** Seed a (dest_hash → public_key) mapping learned OFF the network.
  *
- *  Everything reachable by announce arrives on its own; this exists for the
- *  one case that cannot: a key that came in over an authenticated side
- *  channel, such as a mailbox owner's key carried in a signed authentication
- *  frame. Nothing else should call it — a key cached without a path saves no
- *  work, because acquiring a path means a path request and the path response
- *  *is* an announce carrying the key.
+ *  Everything reachable by announce arrives on its own; this exists for keys
+ *  that came in over an authenticated side channel: a mailbox owner's key
+ *  carried in a signed authentication frame, and the identity a peer proves
+ *  with LINKIDENTIFY on a link we host (rnsd seeds that one itself, under the
+ *  peer's destination on the link's aspect). Nothing else should call it — a
+ *  key cached without a path saves no work, because acquiring a path means a
+ *  path request and the path response *is* an announce carrying the key. The
+ *  link case is the exception that proves it: the peer has already reached us,
+ *  and a consumer verifying what it sent needs the key, not a path.
  *
  *  Arguments:
  *    dest_hash  the peer's RNS destination hash — RNSD_DEST_HASH_LEN (16) bytes,
