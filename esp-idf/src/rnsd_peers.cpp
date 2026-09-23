@@ -36,10 +36,13 @@
  * have shown last anyway. */
 #define RNSD_PEERS_MAX 32
 
-/* Nodes are the things at the far end, and there are fewer of them than there
- * are destinations: a node announces several. A point-to-point medium spends
- * one per interface, a multi-peer one as many as it has peers. */
-#define RNSD_NODES_MAX 16
+/* Nodes are the things at the far end. A point-to-point medium spends one per
+ * interface, a multi-peer one as many as it has peers — and on a radio a peer
+ * that cannot be attributed to a node (one that does not speak SUPE) is
+ * declared as a node per destination, so a radio with eight neighbours declares
+ * twenty-odd. Hence as many slots as the peer table. Not more than 32: the
+ * publisher tracks node slots in a 32-bit mask (s_pubNodes). */
+#define RNSD_NODES_MAX 32
 
 /* Peers age out on the same clock as a path: a neighbour that has not announced
  * in a whole path lifetime is not a neighbour any more, and the interface it

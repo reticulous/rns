@@ -700,9 +700,12 @@ place.
 **Only for an interface with a community** (`community_radius > 0`). A radius-0
 interface is an uplink: its far end is a route rather than a neighbourhood, and
 its announce load is every node in the wide network that is one hop from
-*it*. That is also what bounds the tables — 16 nodes and 32 peers, PSRAM,
+*it*. That is also what bounds the tables — 32 nodes and 32 peers, PSRAM,
 least-recently-heard evicted — since the media that have communities have
-neighbourhoods the size of a room, a LAN or a radio's range.
+neighbourhoods the size of a room, a LAN or a radio's range. The node table is
+as large as the peer table because a radio neighbour that does not speak SUPE
+cannot be merged: each of its destinations is declared as a node of its own, so
+a radio with eight neighbours declares twenty-odd nodes.
 
 **A peer is a DESTINATION; a node is the thing at the far end.** Grouping them
 takes attribution, which an interface declares one of two ways:
