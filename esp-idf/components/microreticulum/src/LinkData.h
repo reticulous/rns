@@ -88,6 +88,11 @@ namespace RNS {
 		Bytes _request_data;
 		Packet _packet = {Type::NONE};
 		double _request_time = 0.0;
+		// Responder: when the link proof last went out, how far the request
+		// travelled, and whether the proof's one repair has been spent.
+		double _proof_sent_at = 0.0;
+		uint8_t _request_hops = 0;
+		bool _proof_repaired = false;
 		float _establishment_rate = 0.0;
         float _expected_rate = 0.0;
 		Type::Link::teardown_reason _teardown_reason = Type::Link::TEARDOWN_NONE;

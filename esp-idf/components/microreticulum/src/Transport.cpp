@@ -110,6 +110,8 @@ using namespace RNS::Persistence;
 /*static*/ PathTable Transport::_path_table;
 /*static*/ std::map<Bytes, Transport::ReverseEntry> Transport::_reverse_table;
 /*static*/ std::map<Bytes, Transport::LinkEntry> Transport::_link_table;
+/*static*/ Transport::HandshakeRepair Transport::_handshake_repairs[Transport::HANDSHAKE_REPAIR_SLOTS];
+/*static*/ uint32_t Transport::_link_repairs_sent = 0;
 /*static*/ std::set<HAnnounceHandler> Transport::_announce_handlers;
 /*static*/ std::map<Bytes, Transport::TunnelEntry> Transport::_tunnels;
 /*static*/ std::map<Bytes, Transport::RateEntry> Transport::_announce_rate_table;
@@ -394,6 +396,10 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 	 * deferral as reap_links: retries send packets via Transport::outbound,
 	 * which spins on _jobs_running. */
 	std::vector<Link> watchdog_links;
+	/* Handshake repairs come due here and transmit after the clear, like the
+	 * reaped links: a responder's proof goes out through Transport::outbound. */
+	std::vector<Link> proof_repair_links;
+	std::vector<HandshakeRepair> relay_repairs;
 	int count;
 	_jobs_running = true;
 
@@ -468,10 +474,23 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 						reap_links.push_back(link);
 						_active_links.erase(link);
 					}
+					else if (link.proof_repair_due(OS::time())) {
+						proof_repair_links.push_back(link);
+					}
 				}
 
 				for (auto& link : _active_links) {
 					watchdog_links.push_back(link);
+				}
+
+				// Handshake packets kept by this relay whose answer is overdue.
+				double repair_now = OS::time();
+				for (auto& r : _handshake_repairs) {
+					if (r.kind == REPAIR_NONE || repair_now < r.due) continue;
+					if (_link_table.find(r.link_id) != _link_table.end()) {
+						relay_repairs.push_back(r);
+					}
+					r = HandshakeRepair();
 				}
 
 				_links_last_checked = OS::time();
@@ -893,6 +912,20 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 	// _jobs_running, so this MUST run after the assignment above.
 	for (auto& link : reap_links) {
 		link.teardown();
+	}
+
+	for (auto& link : proof_repair_links) {
+		link.repair_proof();
+	}
+	for (auto& r : relay_repairs) {
+		DEBUGF("Link %s: no %s passed through within %.1fs, resending the %s once on %s",
+			r.link_id.toHex().c_str(),
+			r.kind == REPAIR_LINKREQUEST ? "link proof" : "RTT packet",
+			per_hop_timeout(r.interface),
+			r.kind == REPAIR_LINKREQUEST ? "link request" : "link proof",
+			r.interface.toString().c_str());
+		transmit(r.interface, r.raw);
+		count_link_repair();
 	}
 
 	// Spangap: poll Resource retransmission watchdogs (adv retries, part
@@ -1448,8 +1481,11 @@ static const Bytes& ifac_salt() {
 			packet.packet_type() == Type::Packet::DATA &&
 			// Don't generate receipts for PLAIN destinations
 			packet.destination().type() != Type::Destination::PLAIN &&
-			// Don't generate receipts for link-related packets
-			!(packet.context() >= Type::Packet::KEEPALIVE && packet.context() <= Type::Packet::LRPROOF) &&
+			// Don't generate receipts for link-related packets, except the
+			// identify: a responder of ours proves it, and the initiator
+			// resends it once when that proof does not come
+			!(packet.context() >= Type::Packet::KEEPALIVE && packet.context() <= Type::Packet::LRPROOF &&
+			  packet.context() != Type::Packet::LINKIDENTIFY) &&
 			// Don't generate receipts for resource packets
 			!(packet.context() >= Type::Packet::RESOURCE && packet.context() <= Type::Packet::RESOURCE_RCL)) {
 
@@ -2089,6 +2125,9 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 						}
 						TRACE("Transport::outbound: Sending packet to next hop...");
 						transmit(outbound_interface, new_raw);
+						if (packet.packet_type() == Type::Packet::LINKREQUEST) {
+							keep_for_repair(REPAIR_LINKREQUEST, Link::link_id_from_lr_packet(packet), new_raw, outbound_interface);
+						}
 						/* Transiting for someone else still counts as use: it
 						 * is what makes this record worth keeping. */
 						rdirTouchUsed(packet.destination_hash().data(),
@@ -2164,6 +2203,12 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 						link_entry._timestamp = OS::time();
 						// Deferred hashlist insertion for link transport packets
 						remember_hash(packet.packet_hash());
+						/* Anything but a proof travelling over the link says
+						 * the initiator holds the link proof: the RTT packet
+						 * first, or its data when that was lost. */
+						if (packet.packet_type() != Type::Packet::PROOF) {
+							repair_answered(REPAIR_LINKPROOF, packet.destination_hash());
+						}
 					}
 					else {
 						//p pass
@@ -2324,9 +2369,13 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 						relayed != _discovery_path_requests.end() && !relayed->second._answered;
 					bool bypass = (requested || relay_waiting) && (!have_known || packet.hops() <= known.hops);
 
+					/* A new emission — not a relay's cached copy of one we had —
+					 * is the destination itself speaking, which is what its
+					 * liveness stamp records (rdirMarkAlive, below the store). */
+					bool novel = false;
 					fresh = random_blob.size() == Type::Identity::RANDOM_HASH_LENGTH/8 &&
 					        rdirGuardFresh(packet.destination_hash().data(), random_blob.data(),
-					                       (uint32_t)announce_emitted, bypass);
+					                       (uint32_t)announce_emitted, bypass, &novel);
 
 					/* A longer path never displaces a shorter one while the
 					 * shorter one is still valid. Once it expires the freshest
@@ -2624,6 +2673,7 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 							++_destinations_added;
 							cull_path_table();
 						}
+						if (novel) rdirMarkAlive(packet.destination_hash().data());
 
 						DBGF_DEMOTE("Destination %s is now %d hops away via %s on %s%s", packet.destination_hash().toHex().c_str(), announce_hops, received_from.toHex().c_str(), packet.receiving_interface().toString().c_str(), relay_note);
 						//TRACEF("Transport::inbound: Destination %s has data: %s", packet.destination_hash().toHex().c_str(), packet.data().toHex().c_str());
@@ -2880,6 +2930,11 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 									new_raw << packet.raw().mid(2);
 									link_entry._validated = true;
 									transmit(link_entry._receiving_interface, new_raw);
+									repair_answered(REPAIR_LINKREQUEST, packet.destination_hash());
+									if (!link_entry._proof_kept) {
+										link_entry._proof_kept = true;
+										keep_for_repair(REPAIR_LINKPROOF, packet.destination_hash(), new_raw, link_entry._receiving_interface);
+									}
 								}
 								else {
 									DEBUGF("Invalid link request proof in transport for link %s, dropping proof.", packet.destination_hash().toHex().c_str());
@@ -2898,27 +2953,29 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 					// Check if we can deliver it to a local
 					// pending link
 					TRACEF("Handling proof for link request %s", packet.destination_hash().toHex().c_str());
+					/* A link we initiated is pending until its proof arrives
+					 * and active after; a proof is taken for either. On an
+					 * active link it is a repeat — a relay or the responder
+					 * resending because our RTT packet did not pass them — and
+					 * Link::validate_proof answers it with the RTT packet
+					 * again. That is also why the proof never enters the
+					 * hashlist here: an identical repeat has to get through.
+					 *
+					 * The answer comes back from the distance the request went
+					 * out to, and an echo of it does not. PATHFINDER_M is "we
+					 * had no path when we asked", where there is no distance
+					 * to check against. Nothing forwards on this branch, so
+					 * the test is a cost and a correctness guard rather than a
+					 * loop guard — the loop guards are the hop tests on the two
+					 * relay paths above. */
 					// CBA Must make a copy of _pending_links before traversing since it gets modified
-					//for (auto link : _pending_links) {
-					std::set<Link> pending_links(_pending_links);
-					for (auto& link : pending_links) {
-						TRACEF("Checking for link request handling by pending link %s", link.link_id().toHex().c_str());
+					std::vector<Link> candidates(_pending_links.begin(), _pending_links.end());
+					for (auto& link : _active_links) {
+						if (link.initiator()) candidates.push_back(link);
+					}
+					for (auto& link : candidates) {
+						TRACEF("Checking for link request handling by link %s", link.link_id().toHex().c_str());
 						if (link.link_id() == packet.destination_hash()) {
-							/* The answer comes back from the distance the
-							 * request went out to, and an echo of it does not.
-							 * PATHFINDER_M is "we had no path when we asked",
-							 * where there is no distance to check against.
-							 *
-							 * This is the one node that knows the proof has
-							 * arrived, so it is also where the packet stops
-							 * being novel: an LRPROOF is held out of the
-							 * hashlist at ingress (it may arrive on the wrong
-							 * interface first), and arming it here is what
-							 * makes every further copy a duplicate rather than
-							 * another signature to verify. Nothing forwards on
-							 * this branch, so it is a cost and a correctness
-							 * guard rather than a loop guard — the loop guards
-							 * are the hop tests on the two relay paths above. */
 							if (packet.hops() != link.expected_hops() &&
 							    link.expected_hops() != PATHFINDER_M) {
 								DBGF_DEMOTE("Link proof for %s arrived %u hops away, expected %u — ignoring",
@@ -2927,9 +2984,8 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 								            (unsigned)link.expected_hops());
 								continue;
 							}
-							remember_hash(packet.packet_hash());
-							TRACE("Requesting pending link to validate proof");
-							const_cast<Link&>(link).validate_proof(packet);
+							TRACE("Requesting link to validate proof");
+							link.validate_proof(packet);
 						}
 					}
 				}
@@ -3024,8 +3080,17 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 					}
 				}
 				// CBA since modifying of collection while iterating is forbidden
+				/* A proof that validated was signed by the destination the
+				 * packet was for: on a link we opened that is the link's
+				 * destination, otherwise the receipt's own. */
 				for (auto& receipt : cull_receipts) {
 					_receipts.remove(receipt);
+					if (packet.link()) {
+						if (packet.link().initiator()) mark_alive(packet.link().destination().hash());
+					}
+					else if (receipt.destination()) {
+						mark_alive(receipt.destination().hash());
+					}
 				}
 
 				// A proof nobody was waiting for. Ordinary on a shared medium
@@ -3577,6 +3642,69 @@ Deregisters an announce handler.
 	else {
 		return 0.0;
 	}
+}
+
+/*static*/ double Transport::per_hop_timeout(const Interface& interface) {
+	double t = (double)Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP;
+	if (interface && interface.bitrate() > 0) {
+		double first_hop = RNS::Type::Reticulum::DEFAULT_PER_HOP_TIMEOUT + extra_link_proof_timeout(interface);
+		if (first_hop > t) t = first_hop;
+	}
+	return t;
+}
+
+/* Handshake repair at a relay.
+ *
+ *   I → R → … → D    LINKREQUEST   R keeps what it forwarded
+ *   I ← R ← … ← D    link PROOF    passing R drops the kept request, keeps the proof
+ *   I → R → … → D    RTT packet    passing R drops the kept proof
+ *
+ * Each handshake packet crosses every hop once, so on a radio losing a tenth
+ * of its receptions a four-hop handshake mostly fails. A relay that has
+ * forwarded one and has not seen its answer pass back within one per-hop
+ * timeout sends the same bytes again, once, on the interface it sent them on.
+ * The next hop that already had the packet drops the copy as a duplicate
+ * (a LINKREQUEST is in its hashlist; a proof fails its hop test or is
+ * re-forwarded to an initiator that answers it with another RTT packet), so a
+ * repair that was not needed costs one frame. The slots are few and fixed:
+ * when every one holds a packet, the newest handshake goes without. */
+/*static*/ void Transport::keep_for_repair(HandshakeRepairKind kind, const Bytes& link_id, const Bytes& raw, const Interface& interface) {
+	if (!interface) return;
+	for (auto& r : _handshake_repairs) {
+		if (r.kind != REPAIR_NONE) continue;
+		r.kind      = kind;
+		r.link_id   = link_id;
+		r.raw       = raw;
+		r.interface = interface;
+		r.due       = OS::time() + per_hop_timeout(interface);
+		return;
+	}
+	DBGF_DEMOTE("Link %s: every handshake repair slot is taken, no repair kept", link_id.toHex().c_str());
+}
+
+/*static*/ void Transport::repair_answered(HandshakeRepairKind kind, const Bytes& link_id) {
+	for (auto& r : _handshake_repairs) {
+		if (r.kind != kind || r.link_id != link_id) continue;
+		r = HandshakeRepair();
+	}
+}
+
+/*static*/ void Transport::count_link_repair() {
+	_link_repairs_sent++;
+}
+
+/*static*/ bool Transport::handshake_repairs_pending() {
+	for (auto& r : _handshake_repairs) {
+		if (r.kind != REPAIR_NONE) return true;
+	}
+	for (auto& link : _active_links) {
+		if (link.proof_repair_armed()) return true;
+	}
+	return false;
+}
+
+/*static*/ void Transport::mark_alive(const Bytes& destination_hash) {
+	if (destination_hash.size() == RDIR_DEST_LEN) rdirMarkAlive(destination_hash.data());
 }
 
 /*static*/ bool Transport::expire_path(const Bytes& destination_hash) {

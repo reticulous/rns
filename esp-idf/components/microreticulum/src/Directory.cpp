@@ -50,7 +50,7 @@ typedef struct {
     uint8_t  pad;
     uint32_t claim_touch;
     uint32_t claim_decay;   /* carved from the reserve; 0 = store default */
-    uint8_t  reserved[4];
+    uint32_t last_alive;    /* last packet the destination itself authored; 0 = never */
 } rdir_dir_rec_t;
 
 /* The image carries live records, not the arena: counts, not slot geometry.
@@ -97,6 +97,7 @@ static_assert(offsetof(rdir_dir_rec_t, seq)           == 144, "dir seq");
 static_assert(offsetof(rdir_dir_rec_t, prio)          == 146, "dir prio");
 static_assert(offsetof(rdir_dir_rec_t, claim_touch)   == 148, "dir claim_touch");
 static_assert(offsetof(rdir_dir_rec_t, claim_decay)   == 152, "dir claim_decay");
+static_assert(offsetof(rdir_dir_rec_t, last_alive)    == 156, "dir last_alive");
 /* seq is loaded and stored atomically, so it must be naturally aligned. That
  * holds because its offset is a multiple of 4, both preceding pools are whole
  * multiples of 4 bytes, and the arena itself comes back 4-aligned. */
@@ -471,10 +472,13 @@ static inline void runSet(rdir_guard_rec_t* g, uint8_t v) {
 }
 
 bool rdirGuardFresh(const uint8_t dest[RDIR_DEST_LEN], const uint8_t blob[RDIR_BLOB_LEN],
-                    uint32_t emitted, bool bypass)
+                    uint32_t emitted, bool bypass, bool* novel)
 {
-    /* Fail open: with no store, every announce is novel — the old behaviour. */
-    if (!s_ready || s_guard_slots == 0) return true;
+    bool novel_sink;
+    if (!novel) novel = &novel_sink;
+    *novel = false;
+    /* Fail open: with no store, every announce is novel. */
+    if (!s_ready || s_guard_slots == 0) { *novel = true; return true; }
 
     uint8_t fp[4];
     fingerprint(blob, fp);
@@ -483,6 +487,7 @@ bool rdirGuardFresh(const uint8_t dest[RDIR_DEST_LEN], const uint8_t blob[RDIR_B
 
     rdir_guard_rec_t* g = guardFind(d4);
     if (!g) {
+        *novel = true;
         g = guardAlloc(d4);
         if (!g) return true;
         g->emitted   = emitted;
@@ -492,6 +497,7 @@ bool rdirGuardFresh(const uint8_t dest[RDIR_DEST_LEN], const uint8_t blob[RDIR_B
     }
 
     bool seen = ringHas(g, fp);
+    *novel = !seen && (int32_t)(emitted - g->emitted) >= 0;
 
     if (bypass) {
         /* A requested path response is answered by a relay from its cached
@@ -613,6 +619,19 @@ void rdirTouchUsed(const uint8_t dest[RDIR_DEST_LEN], uint32_t expires) {
     writeBegin(r);
     r->last_used = nowUnix();
     if (expires > r->expires) r->expires = expires;
+    writeEnd(r);
+}
+
+void rdirMarkAlive(const uint8_t dest[RDIR_DEST_LEN]) {
+    if (!s_ready) return;
+    rdir_dir_rec_t* r = dirFind(dest);
+    if (!r) return;
+    uint32_t now = nowUnix();
+    /* Every link packet reports in here; a stamp that has not moved by the
+     * resolution anyone reads it at is not worth a generation bump. */
+    if (r->last_alive && now - r->last_alive < RDIR_ALIVE_RESOLUTION_S) return;
+    writeBegin(r);
+    r->last_alive = now;
     writeEnd(r);
 }
 
@@ -772,6 +791,7 @@ static void fillEntry(const rdir_dir_rec_t* r, rdir_entry_t* out) {
     memcpy(out->pubkey,    r->pubkey,    RDIR_PUBKEY_LEN);
     memcpy(out->name_hash, r->name_hash, RDIR_NAME_HASH_LEN);
     out->last_heard  = r->last_heard;
+    out->last_alive  = r->last_alive;
     out->claims      = r->claims;
     out->claim_touch = r->claim_touch;
     out->hops        = r->hops;

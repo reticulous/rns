@@ -194,7 +194,22 @@ namespace RNS {
 		void prove();
 		void prove_packet(const Packet& packet);
 		void validate_proof(const Packet& packet);
-		void identify(const Identity& identity);
+		/* The initiator's RTT packet, which activates the responder's side.
+		 * Sent on the first valid link proof and again on every repeat. */
+		void send_rtt();
+		/* Responder: the proof's one resend is due — no RTT packet (nor any
+		 * other packet over the link) within two per-hop timeouts per hop the
+		 * request travelled. */
+		bool proof_repair_armed() const;
+		bool proof_repair_due(double now) const;
+		void repair_proof();
+		/* Responder: activate on the first authenticated packet over the link
+		 * when its RTT packet was lost. */
+		void activate_without_rtt();
+		/* Returns the LINKIDENTIFY packet sent (NONE when the link is not an
+		 * active one we initiated), whose receipt settles when the responder
+		 * proves it. */
+		Packet identify(const Identity& identity);
 		// data_packed (spangap): when true, `data` is already a complete msgpack
 		// object and is spliced as the request envelope's 3rd element verbatim
 		// (e.g. a {field_*,var_*} map for NomadNet form submission) instead of

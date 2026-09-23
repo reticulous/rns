@@ -132,6 +132,8 @@ typedef struct {
     uint8_t  pubkey[RDIR_PUBKEY_LEN];
     uint8_t  name_hash[RDIR_NAME_HASH_LEN];
     uint32_t last_heard;
+    uint32_t last_alive;    /* Unix s of the last packet the destination itself
+                             * authored (rdirMarkAlive); 0 = never seen alive */
     uint32_t claims;
     uint32_t claim_touch;
     uint8_t  hops;
@@ -244,10 +246,15 @@ uint32_t rdirGeneration(void);
  * `bypass` skips the fingerprint check while still updating the ring and
  * `emitted`: a requested PATH_RESPONSE is answered by a relay from its cached
  * announce and therefore always carries an already-seen blob. Treating it as a
- * replay makes path discovery work exactly once and then go silent. */
+ * replay makes path discovery work exactly once and then go silent.
+ *
+ * `novel` (may be null) is set when the blob is one this guard has not heard
+ * and its emission is not older than the newest held — a new emission by the
+ * destination, as opposed to a copy of one already on record, whatever
+ * `bypass` did to the return value. */
 bool   rdirGuardFresh(const uint8_t dest[RDIR_DEST_LEN],
                       const uint8_t blob[RDIR_BLOB_LEN],
-                      uint32_t emitted, bool bypass);
+                      uint32_t emitted, bool bypass, bool* novel = nullptr);
 
 /* Store (or refresh) what we know about a destination, at the requested
  * layers. Silently degrades: a full pool means the weaker layer only. */
@@ -259,6 +266,14 @@ void   rdirIngest    (const uint8_t dest[RDIR_DEST_LEN],
  * under it just because nobody has re-announced lately — the whole point of
  * tracking use is that use is evidence the route is good. */
 void   rdirTouchUsed (const uint8_t dest[RDIR_DEST_LEN], uint32_t expires);
+/* The destination itself authored a packet we just received: a new emission
+ * of its announce, a proof it signed, a packet over a link with it. Stamps
+ * `last_alive` on a record we already hold and creates none — liveness is
+ * asked of destinations we have a path or a key for. Resolution is
+ * RDIR_ALIVE_RESOLUTION_S, so a busy link does not rewrite the record per
+ * packet. */
+#define RDIR_ALIVE_RESOLUTION_S 10
+void   rdirMarkAlive (const uint8_t dest[RDIR_DEST_LEN]);
 /* Drop the routing layer, keeping identity. This is what "forget the path"
  * means once the two tables are one record. */
 bool   rdirClearRoute(const uint8_t dest[RDIR_DEST_LEN]);

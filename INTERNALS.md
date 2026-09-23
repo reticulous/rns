@@ -30,6 +30,13 @@ Our deltas, by category:
   *inside* a `Link` (§5.6). `Link::get_channel()` is live and `Link::receive`
   routes `CONTEXT.CHANNEL` (0x0E) packets into it (`prove → decrypt →
   _receive`). This is what the [rnsh](../rnsh) shell rides on.
+- **Link handshake repair.** Upstream sends each of the three handshake packets
+  once end to end. Here every party waiting on an answer resends its own last
+  handshake packet once — relays from a small fixed store beside the link
+  table, the responder its proof, the initiator its RTT packet on any repeated
+  proof — so a frame lost at one hop costs one retransmission at that hop, not
+  the link (§5.1a). The responder also proves a `LINKIDENTIFY`, which upstream
+  does not.
 - **Link round-trip re-measurement.** Upstream takes one RTT sample at
   establishment and every retry timer above the link is a multiple of it.
   `Link::rtt_sample()` folds each delivered link proof's own round trip into a
@@ -228,11 +235,12 @@ Our deltas, by category:
     are the same, so it passes for a rebroadcast as readily as for the original.
   - the **initiator** takes the answer only from the distance it asked over
     (`Link::expected_hops()`, or anything when that is `PATHFINDER_M` — we had
-    no path when we asked, so there is no distance to check against), and arms
-    the hashlist as it does. Nothing forwards here, so this is what stops a
-    reflected copy being another signature to verify rather than what stops a
-    loop; it is also the one node that knows the proof has arrived, which is
-    what makes it the place the packet stops being novel.
+    no path when we asked, so there is no distance to check against). Nothing
+    forwards here, so this is what stops a reflected copy being another
+    signature to verify rather than what stops a loop. The proof never enters
+    the hashlist here: an identical repeat at the right distance is a relay or
+    the responder repairing a lost RTT packet (§5.1a), and the initiator — pending
+    or already active — answers every valid one with its RTT packet.
 
   Spending the link-table entry instead of testing the hop count would be
   wrong, tempting as the symmetry is: a repeated LINKREQUEST names the same
@@ -673,6 +681,18 @@ caller path-requests instead of black-holing. `rdirTouchUsed` stamps outbound
 use and slides the expiry out, because use is the evidence that a route is
 good; `rdirClearRoute` drops the routing fields and keeps the identity, which
 is what makes the next path response cheap.
+
+**Liveness is a field of the record.** `last_alive` is the local time of the
+last packet the destination itself authored that reached us: a new emission of
+its announce (the seen record reports it as `novel` — a blob it has not heard
+at an emission no older than the newest, which a relay's cached copy of an
+emission we already had is not), a proof it signed for one of our packets or
+links, any packet over a link we opened to it, and its identity proven over a
+link it opened to us. `rdirMarkAlive` stamps a record we already hold and
+creates none, at `RDIR_ALIVE_RESOLUTION_S` (10 s) resolution so a busy link
+does not rewrite the record per packet. Zero is "never seen alive". It is what
+decides whether a link establishment that got nothing back is tried again
+(§5.1).
 
 **Reader surface.** `rnsdRecallPubkey` / `rnsdRecallAppData` (the latter slices
 the retained blob, so it answers only while one is held), `rnsdClaim` /
@@ -1225,15 +1245,84 @@ link_id exists. The link is built on the rnsd task in `linkKickoff`, which:
   `"rnsh"` aspect), and fails terminally with `last_error = aspect_mismatch`
   rather than addressing the wrong destination;
 - sets the establishment timeout: a caller-supplied `link_timeout_ms` is used
-  verbatim (and pushed into µR's own watchdog); otherwise rnsd computes the
-  Python-reference outbound budget — the next hop's first-hop timeout plus 6 s
-  per hop.
+  verbatim (and pushed into µR's own watchdog); otherwise the Link's own
+  budget — the next hop's first-hop timeout plus 6 s per hop — plus another 6 s
+  per hop for a relay holding the request under a SUPE wait. It is published as
+  `rnsd.links.<tag>.estab_timeout_s`, the budget of one attempt.
+
+**Establishment attempts.** An attempt whose deadline passes is followed by a
+fresh one — new keys, a new link id, the same slot, outboxes and consumer —
+while the peer was heard from within `RNSD_ALIVE_WINDOW_S` (900 s, the
+directory's `last_alive`, §1.1.2) and fewer than `RNSD_LINK_ATTEMPTS` (3) have
+been made. A peer one hop away heard every one of our requests first-hand, so
+for it only something heard since the attempt began counts. Each attempt gets
+the full budget above, goes back through the path wait if the route went with
+the last one, and is published as `rnsd.links.<tag>.attempt` and logged
+`link[<tag>]: attempt N of 3`. When no further attempt is due the link fails
+with `last_error = establish_timeout` and `estab_budget = alive | unseen`, the
+word saying which rule ended it: a lost handshake frame is worth another try, a
+node that is off is not. µR's reaper closes the same attempt on the same
+deadline; its closed callback on an establishing slot only marks the deadline
+due, so the decision is `linkTick`'s alone and never reads as a close by the
+initiator.
+
+**Identify is proven.** `Link::identify` returns the `LINKIDENTIFY` packet, the
+only link-control packet µR gives a receipt, and our responder proves it
+(activating the link first when its RTT packet was lost, since the identify
+follows that packet at once). rnsd waits the link's traffic window —
+`TRAFFIC_TIMEOUT_FACTOR × rtt`, at least one per-hop timeout — and sends the
+identify once more when no proof came. A Python reference responder never
+proves one, so toward those peers the second copy is the cost: one packet.
 
 **Pre-active outboxes.** A `itsSend` before the link is `active` is buffered in a
 one-packet outbox and flushed on establishment (or dropped with
 `last_error = send_queue_full` if a second arrives first). The same hold applies
 to one pending Resource and one pending request, so a consumer can
 `rnsdLinkOpen()` then immediately `rnsdLinkRequest()`/`rnsdLinkSendResource()`.
+
+### 5.1a Handshake repair (`Transport.cpp`, `Link.cpp`)
+
+```
+I → R1 → R2 → D   LINKREQUEST   each relay keeps what it forwarded
+I ← R1 ← R2 ← D   link PROOF    passing it drops the kept request, keeps the proof
+I → R1 → R2 → D   RTT packet    passing it drops the kept proof
+
+R   no proof back within one per-hop timeout   → the same request again, once
+R   no RTT packet through within one            → the same proof again, once
+D   no RTT packet within 2 × per-hop × hops    → proves again, once
+I   any valid link proof, pending or active     → an RTT packet (again)
+```
+
+Sent once end to end, three packets across every hop of a four-hop path on a
+radio that loses a tenth of its receptions fail more often than not. So every
+party that is waiting on an answer sends its own last packet again, once, with
+the same link id and the same bytes, and a frame lost at one hop costs one
+retransmission at that hop rather than the link.
+
+- **Relays** keep the raw forwarded packet in `Transport::_handshake_repairs`,
+  `HANDSHAKE_REPAIR_SLOTS` (8) fixed slots beside the link table; when all are
+  taken the newest handshake goes without. A slot is freed when its answer
+  passes (a validated proof for a kept request; any non-proof packet over the
+  link for a kept proof — the RTT packet, or the initiator's data when that was
+  lost) or when its timer fires; a link-table entry keeps its proof once
+  (`_proof_kept`), so a repeat of it is forwarded and not kept again. The timer
+  is `Transport::per_hop_timeout(interface)`: `ESTABLISHMENT_TIMEOUT_PER_HOP`
+  (6 s) or the outbound interface's first-hop timeout (one MTU at its bitrate
+  on top of that) where longer. A next hop that already had the packet drops
+  the copy — a request is in its hashlist, a proof fails its hop test — so a
+  repair nobody needed costs one frame.
+- **The responder** (`Link::proof_repair_due`, checked in the jobs pass beside
+  the half-open reaper) re-proves once. A signature over the same id and keys
+  is the same bytes, so relays pass it exactly as they passed the first.
+- **The initiator** has no timer. `Link::validate_proof` on an active link we
+  initiated checks the repeat against the key it was established with and
+  answers with a fresh RTT packet — fresh ciphertext, so relays that forwarded
+  the lost one forward this one too. A responder takes only the first RTT
+  packet; later ones are spent.
+- `rnsd.stats.link.repairs_sent` (and `rnstatus`'s totals) counts every one of
+  these a node sends; each is logged at debug. A node with a repair timer
+  running keeps rnsd's tick at the floor (`handshake_repairs_pending`), as a
+  pending link does.
 
 ### 5.2 Lifetime: ITS handle == Link, no parking
 
@@ -1249,10 +1338,9 @@ A consumer that wants a Link to survive idle gaps **keeps its handle open** and
 reuses it. That is where any warm-hold / pooling policy lives — in the consumer,
 not rnsd. lxmf does this with a per-(identity, peer) link pool reaped on
 `s.lxmf.link.idle_s` (default 600 s); nomad keeps a per-session link for
-same-node page reuse. (Earlier the daemon parked detached links for an
-`orphan_ttl`; that was removed because nothing used it — consumers already hold
-their own handles — and because inbound bytes on a parked link were silently
-dropped. Don't reintroduce it.)
+same-node page reuse. rnsd does not park a detached link: consumers already
+hold their own handles, and inbound bytes on a link nobody holds would be
+silently dropped.
 
 ### 5.3 Inbound (`rnsdDestListenLinks`)
 
@@ -1667,6 +1755,12 @@ per destination.
   appear in `rnstatus`, receive inbound packets — and never transmit, because
   Transport still holds the first one. `onTransportConnect` refuses a duplicate
   name outright, and Transport warns if one reaches it anyway.
+- **A µR handle class needs its own `operator==` before it goes in a
+  `std::list`.** The handles convert to `bool`, so without one `a == b`
+  compiles through that conversion and every live handle equals every other.
+  `PacketReceipt` has it for that reason: without it `Transport::_receipts.remove()`
+  of one settled receipt empties the whole list, and every proof still on its
+  way is "matched none of 0 outstanding receipt(s)".
 - **Large tables go in PSRAM, FreeRTOS sync objects do not.** Internal
   DRAM/DMA is scarce on the T-Deck, so ITS metadata, the directory record pool, and recv
   buffers live in PSRAM. But queues/stream-buffers/mutexes placed in PSRAM trip

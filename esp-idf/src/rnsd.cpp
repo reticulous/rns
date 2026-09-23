@@ -3560,6 +3560,8 @@ static void publishStats(void)
     storageSet("rnsd.stats.packets_out", (int)(s_stats.packets_out & 0x7fffffff));
     storageSet("rnsd.stats.bytes_in",    (int)(s_stats.bytes_in    & 0x7fffffff));
     storageSet("rnsd.stats.bytes_out",   (int)(s_stats.bytes_out   & 0x7fffffff));
+    storageSet("rnsd.stats.link.repairs_sent",
+               (int)(RNS::Transport::link_repairs_sent() & 0x7fffffff));
     int activeIfaces = 0;
     for (int j = 0; j < RNSD_MAX_IFACES; j++) {
         auto& i = s_ifaces[j];
@@ -4268,6 +4270,8 @@ static void rnstatusPrintTotals(void)
     cliPrintf("Bytes        %s in / %s out\n",
               formatBytes(s_stats.bytes_in).c_str(),
               formatBytes(s_stats.bytes_out).c_str());
+    cliPrintf("Link repairs %lu sent\n",
+              (unsigned long)RNS::Transport::link_repairs_sent());
 }
 
 static void rnstatusJson(const std::string& filter)
@@ -4308,6 +4312,8 @@ static void rnstatusJson(const std::string& filter)
     cJSON_AddNumberToObject(st, "packets_out",   (double)s_stats.packets_out);
     cJSON_AddNumberToObject(st, "bytes_in",      (double)s_stats.bytes_in);
     cJSON_AddNumberToObject(st, "bytes_out",     (double)s_stats.bytes_out);
+    cJSON_AddNumberToObject(st, "link_repairs_sent",
+                            (double)RNS::Transport::link_repairs_sent());
     cJSON_AddItemToObject(root, "stats", st);
 
     char* text = cJSON_PrintUnformatted(root);
@@ -5517,6 +5523,13 @@ static void onCmdLinkOpen(const char* key, const char* val)
  * pool, nomad's per-session link); the hold/idle policy lives in those
  * consumers, not here. */
 
+/* Establishments per link open. An attempt that times out is followed by a
+ * fresh one only while the peer has been heard from within RNSD_ALIVE_WINDOW_S
+ * (linkPeerAlive): a lost handshake frame is worth another try, a node that is
+ * off is not. */
+#define RNSD_LINK_ATTEMPTS   3
+#define RNSD_ALIVE_WINDOW_S  900
+
 enum link_state_t : uint8_t {
     LST_FREE = 0, LST_AWAITING_PATH, LST_ESTABLISHING,
     LST_ACTIVE, LST_CLOSING, LST_CLOSED, LST_FAILED
@@ -5550,6 +5563,8 @@ struct link_conn_t {
     double               path_deadline; /* OS::time() a path must answer by */
     double               path_asked_at; /* OS::time() of the last path request */
     double               estab_deadline;/* OS::time() ACTIVE must arrive by */
+    uint8_t              attempts;      /* establishments kicked off (linkKickoff) */
+    double               attempt_at;    /* OS::time() the current attempt was kicked off */
     uint32_t             link_timeout_ms;/* consumer override; 0 = ref-impl budget */
     double               dead_at;       /* OS::time() entered CLOSED/FAILED; 0 = n/a */
     bool                 pend_used;     /* one-packet pre-active outbox */
@@ -5601,6 +5616,16 @@ struct link_conn_t {
      * remote knows who is asking before it answers the first one. */
     bool                 pend_identify;
     std::string          pend_identify_key;   /* "" = the link's own identity */
+
+    /* The identify sent on this link, until the responder's proof of it
+     * settles its receipt. Unproven at ident_deadline it is sent once more
+     * (ident_resent); a Python reference responder never proves one, so
+     * toward those that second copy is the cost. */
+    RNS::Packet          ident_packet{RNS::Type::NONE};
+    RNS::PacketReceipt   ident_first{RNS::Type::NONE};  /* the first copy's; a late proof of it counts */
+    double               ident_deadline;
+    double               ident_window;
+    bool                 ident_resent;
 
     /* Pre-active request deferral — held request issued on establish
      * (mirrors pend_res_*). One pending request. */
@@ -5868,10 +5893,25 @@ static void linkIdentifyNow(link_conn_t& c, const std::string& identity_key)
     try {
         /* µR guards initiator + ACTIVE internally; on an inbound link
          * this is a silent no-op, matching upstream semantics. */
-        c.link.identify(ident);
+        RNS::Packet sent = c.link.identify(ident);
         linkSetInt(c, "identified_s", (int)RNS::Utilities::OS::time());
         info("link[%s]: identified to peer as %s",
              c.tag, ident.hash().toHex().c_str());
+        if (sent) {
+            /* The responder proves it; give that proof the link's own traffic
+             * window, and never less than one hop's worth. */
+            double window = std::max(
+                (double)RNS::Type::Link::TRAFFIC_TIMEOUT_FACTOR * c.link.rtt(),
+                RNS::Transport::per_hop_timeout(c.link.attached_interface()));
+            RNS::PacketReceipt r = sent.receipt();
+            if (r) r.set_timeout((int16_t)(window + 2.0));
+            c.ident_packet   = sent;
+            c.ident_first    = RNS::PacketReceipt{RNS::Type::NONE};
+            c.ident_window   = window;
+            c.ident_deadline = RNS::Utilities::OS::time() + window;
+            c.ident_resent   = false;
+            tickSnapToFloor();
+        }
     } catch (const std::exception& e) {
         warn("link[%s]: identify threw: %s", c.tag, e.what());
     }
@@ -5983,6 +6023,16 @@ static void onLinkClosedCb(RNS::Link& link)
     link_conn_t* c = linkFindByLink(link);
     if (!c) return;   /* already culled */
     unsigned reason = (unsigned)link.teardown_reason();
+    if (c->state == LST_ESTABLISHING) {
+        /* µR's reaper closes a link whose establishment ran out, on the same
+         * deadline this slot holds. That is an establishment timeout, and
+         * linkTick decides what follows it — another attempt or a failure —
+         * on its next pass. */
+        dbg("link[%s]: establishment ended by µR (reason=%s)", c->tag, tdrName(reason));
+        c->link = RNS::Link{RNS::Type::NONE};
+        c->estab_deadline = RNS::Utilities::OS::time();
+        return;
+    }
     info("link[%s]: CLOSED reason=%s", c->tag, tdrName(reason));
     c->state   = LST_CLOSED;
     c->dead_at = RNS::Utilities::OS::time();
@@ -6025,6 +6075,7 @@ static void onLinkRemoteIdentifiedCb(const RNS::Link& link,
         RNS::Bytes pk = identity.get_public_key();
         if (rdest.size() == RNSD_DEST_HASH_LEN && pk.size() == RNSD_PUBKEY_LEN)
             rnsdSeedPubkey(rdest.data(), pk.data());
+        RNS::Transport::mark_alive(rdest);
         info("link[%s]: peer identified as %s (dest %s on %s)",
              c->tag, identity.hash().toHex().c_str(),
              rdest.toHex().c_str(), c->aspect.c_str());
@@ -6507,16 +6558,23 @@ static bool linkKickoff(link_conn_t& c)
             estab_src = "calculated";
         }
         c.link.establishment_timeout(estab);
-        c.estab_deadline = RNS::Utilities::OS::time() + estab;
+        c.attempt_at = RNS::Utilities::OS::time();
+        c.estab_deadline = c.attempt_at + estab;
+        if (c.attempts < 255) c.attempts++;
         /* Publish the budget, not just log it. A consumer waiting on this link
          * has to outlast it or it tears down an establishment that was still
          * within its own deadline — and the budget is ours to compute (it
          * scales with the next hop's speed and the hop count), so a consumer
-         * guessing at a constant is guessing wrong on every slow interface. */
+         * guessing at a constant is guessing wrong on every slow interface.
+         * It is the budget of one attempt; `attempt` says which one this is. */
         storageBegin();
         linkSetInt(c, "estab_timeout_s", (int)(estab + 0.5));
+        linkSetInt(c, "attempt", (int)c.attempts);
         linkPublishState(c);
         storageEnd();
+        if (c.attempts > 1)
+            info("link[%s]: attempt %u of %u", c.tag, (unsigned)c.attempts,
+                 (unsigned)RNSD_LINK_ATTEMPTS);
         info("link[%s]: kickoff → %s aspect=%s estab_timeout=%.1fs (%s)", c.tag,
              c.dest_hash.toHex().c_str(), c.aspect.c_str(), estab, estab_src);
     } catch (const std::exception& e) {
@@ -6580,6 +6638,13 @@ static void linkFreeSlot(link_conn_t& c)
     c.pend_req_packed = false;
     c.pend_identify = false;
     c.pend_identify_key.clear();
+    c.ident_packet = RNS::Packet{RNS::Type::NONE};
+    c.ident_first = RNS::PacketReceipt{RNS::Type::NONE};
+    c.ident_deadline = 0;
+    c.ident_window = 0;
+    c.ident_resent = false;
+    c.attempts = 0;
+    c.attempt_at = 0;
     c.state = LST_FREE;
 }
 
@@ -6590,8 +6655,88 @@ static bool linkTxReceiptsPending(void)
 {
     if (!s_link_conns) return false;
     for (int j = 0; j < RNSD_MAX_LINK_CONNS; j++)
-        if (s_link_conns[j].used && s_link_conns[j].tx_receipt) return true;
+        if (s_link_conns[j].used &&
+            (s_link_conns[j].tx_receipt || s_link_conns[j].ident_packet)) return true;
     return false;
+}
+
+/* Settle the identify's proof (linkIdentifyNow): proven, or resent once, or
+ * given up on after the second window. */
+static void linkIdentifyTick(link_conn_t& c, double now)
+{
+    if (!c.ident_packet) return;
+    RNS::PacketReceipt r = c.ident_packet.receipt();
+    bool second = r && r.status() == RNS::Type::PacketReceipt::DELIVERED && c.ident_resent;
+    bool first  = c.ident_first && c.ident_first.status() == RNS::Type::PacketReceipt::DELIVERED;
+    if (!c.ident_resent && r && r.status() == RNS::Type::PacketReceipt::DELIVERED) first = true;
+    if (first || second) {
+        info("link[%s]: identify proven by the peer%s", c.tag,
+             first ? "" : " (second copy)");
+        c.ident_packet = RNS::Packet{RNS::Type::NONE};
+        c.ident_first  = RNS::PacketReceipt{RNS::Type::NONE};
+        return;
+    }
+    if (now < c.ident_deadline) return;
+    if (!c.ident_resent && c.link && c.state == LST_ACTIVE) {
+        c.ident_resent = true;
+        c.ident_first  = r;
+        c.ident_deadline = now + c.ident_window;
+        info("link[%s]: identify not proven within %.1fs, sending it once more",
+             c.tag, c.ident_window);
+        if (c.ident_first) c.ident_first.set_timeout((int16_t)(2.0 * c.ident_window + 2.0));
+        try {
+            c.ident_packet.resend();
+            RNS::PacketReceipt r2 = c.ident_packet.receipt();
+            if (r2) r2.set_timeout((int16_t)(c.ident_window + 2.0));
+        } catch (const std::exception& e) {
+            warn("link[%s]: identify resend threw: %s", c.tag, e.what());
+            c.ident_packet = RNS::Packet{RNS::Type::NONE};
+        }
+        return;
+    }
+    info("link[%s]: identify not proven (a peer that does not prove identifies, or both copies lost)",
+         c.tag);
+    c.ident_packet = RNS::Packet{RNS::Type::NONE};
+}
+
+/* Was the peer heard from recently enough that an establishment which got
+ * nothing back is worth trying again? Its directory record carries the time of
+ * the last packet it authored (Directory's last_alive). A peer one hop away
+ * heard every one of our link requests first-hand, so for it only something
+ * heard since this attempt began counts. `age` is set to the stamp's age in
+ * seconds, -1 when there is none. */
+static bool linkPeerAlive(const link_conn_t& c, double now, int* age)
+{
+    *age = -1;
+    if (c.dest_hash.size() != RNSD_DEST_HASH_LEN) return false;
+    rdir_entry_t e;
+    if (!rdirPeekEntry(c.dest_hash.data(), &e) || e.last_alive == 0) return false;
+    *age = (int)(now - (double)e.last_alive);
+    if (RNS::Transport::hops_to(c.dest_hash) <= 1)
+        return (double)e.last_alive >= c.attempt_at;
+    return now - (double)e.last_alive <= RNSD_ALIVE_WINDOW_S;
+}
+
+/* A fresh establishment for the same consumer after one timed out: new keys, a
+ * new link id, the same outboxes. Back through the path wait when the route
+ * went with the failed attempt. */
+static void linkRetry(link_conn_t& c, double now)
+{
+    if (RNS::Transport::has_path(c.dest_hash) && RNS::Identity::recall(c.dest_hash)) {
+        c.state = LST_ESTABLISHING;
+        linkKickoff(c);
+        return;
+    }
+    c.state = LST_AWAITING_PATH;
+    c.estab_deadline = 0;
+    int path_to_s = rnsdPathBudgetS();
+    c.path_deadline = now + (path_to_s > 0 ? path_to_s : 30);
+    c.path_asked_at = now;
+    linkPublishState(c);
+    info("link[%s]: no path for %s, requesting path before the next attempt",
+         c.tag, c.dest_hash.toHex().c_str());
+    try { RNS::Transport::request_path(c.dest_hash); }
+    catch (const std::exception& e) { warn("link[%s]: request_path threw: %s", c.tag, e.what()); }
 }
 
 /* 1 Hz from the rnsd loop (tickPhase 0), beside ourDestTickPending. */
@@ -6635,6 +6780,8 @@ static void linkTick(void)
             }
         }
 
+        linkIdentifyTick(c, now);
+
         /* Request timeout backstop. µR does not drive RequestReceipt
          * timeouts (the upstream response-timeout thread isn't ported),
          * so fail the consumer here if no response arrived in time. */
@@ -6676,12 +6823,25 @@ static void linkTick(void)
 
         case LST_ESTABLISHING:
             if (c.estab_deadline != 0 && now >= c.estab_deadline) {
-                warn("link[%s]: establishment timed out", c.tag);
-                try { if (c.link) c.link.teardown(); } catch (...) {}
+                /* The wrapper leaves the slot before teardown, so the closed
+                 * callback it fires finds no slot to act on. */
+                RNS::Link old = c.link;
                 c.link = RNS::Link{RNS::Type::NONE};
+                try { if (old) old.teardown(); } catch (...) {}
+                int age = -1;
+                bool alive = linkPeerAlive(c, now, &age);
+                if (alive && c.attempts < RNSD_LINK_ATTEMPTS) {
+                    info("link[%s]: establishment timed out; peer alive %ds ago, trying a fresh link",
+                         c.tag, age);
+                    linkRetry(c, now);
+                    break;
+                }
+                warn("link[%s]: establishment timed out after %u attempt(s) (%s)",
+                     c.tag, (unsigned)c.attempts, alive ? "alive" : "unseen");
                 c.state = LST_FAILED;
                 storageBegin();
                 linkSetError(c, "establish_timeout");
+                linkSetStr(c, "estab_budget", alive ? "alive" : "unseen");
                 linkPublishState(c);
                 storageEnd();
                 c.dead_at = now;
@@ -6765,6 +6925,12 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     c->pend_req_packed = false;
     c->pend_identify = false;
     c->pend_identify_key.clear();
+    c->ident_packet = RNS::Packet{RNS::Type::NONE};
+    c->ident_first = RNS::PacketReceipt{RNS::Type::NONE};
+    c->ident_deadline = 0;
+    c->ident_resent = false;
+    c->attempts = 0;
+    c->attempt_at = 0;
 
     int path_to_s = rnsdPathBudgetS();
     if (req.path_timeout_ms != 0) path_to_s = (int)(req.path_timeout_ms / 1000);
@@ -8722,6 +8888,7 @@ static void rnsdTaskMain(void*)
             s_tickPrevPktsIn = s_stats.packets_in;
             bool tickBusy = dinTick > 0 ||
                             RNS::Transport::pending_links_count() > 0 ||
+                            RNS::Transport::handshake_repairs_pending() ||
                             ourDestReceiptsPending() ||
                             linkTxReceiptsPending();
             /* The 1 Hz block is unyieldy except for publishPathTable's

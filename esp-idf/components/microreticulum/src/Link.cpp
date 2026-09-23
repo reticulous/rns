@@ -268,6 +268,7 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 			TRACEF("Establishment timeout is %f for incoming link request %s", link.establishment_timeout(), link.link_id().toHex().c_str());
 			link.handshake();
 			link.attached_interface(packet.receiving_interface());
+			link._object->_request_hops = packet.hops();
 			link.prove();
 			link.request_time(OS::time());
 			Transport::register_link(link);
@@ -347,7 +348,36 @@ void Link::prove() {
 	Packet proof(*this, proof_data, Type::Packet::PROOF, Type::Packet::LRPROOF);
 	proof.send();
 	_object->_establishment_cost += proof.raw().size();
+	_object->_proof_sent_at = OS::time();
 	had_outbound();
+}
+
+/* The responder's side of handshake repair. Its proof is the one packet of the
+ * handshake it sends, and the RTT packet is the answer to it, so it waits two
+ * per-hop timeouts for each hop the request travelled and then proves once
+ * more. A signature over the same link id and keys is the same bytes, so a
+ * relay that already passed the first copy passes this one exactly as it did,
+ * and an initiator that did get it answers with its RTT packet again. */
+bool Link::proof_repair_armed() const {
+	assert(_object);
+	return !_object->_initiator && _object->_status == Type::Link::HANDSHAKE &&
+	       !_object->_proof_repaired && _object->_proof_sent_at > 0;
+}
+
+bool Link::proof_repair_due(double now) const {
+	if (!proof_repair_armed()) return false;
+	double window = 2.0 * Transport::per_hop_timeout(_object->_attached_interface)
+	              * std::max((uint8_t)1, _object->_request_hops);
+	return now >= _object->_proof_sent_at + window;
+}
+
+void Link::repair_proof() {
+	assert(_object);
+	_object->_proof_repaired = true;
+	DEBUGF("Link %s: no RTT packet %.1fs after the link proof, proving once more",
+		link_id().toHex().c_str(), OS::time() - _object->_proof_sent_at);
+	prove();
+	Transport::count_link_repair();
 }
 
 void Link::prove_packet(const Packet& packet) {
@@ -435,24 +465,8 @@ void Link::validate_proof(const Packet& packet) {
 						_object->_establishment_rate = _object->_establishment_cost / _object->_rtt;
 					}
 
-                    //p rtt_data = umsgpack.packb(self.rtt)
-					MsgPack::Packer packer;
-					packer.serialize(_object->_rtt);
-					Bytes rtt_data(packer.data(), packer.size());
-TRACEF("***** RTT data size: %d", rtt_data.size());
-                    //p rtt_packet = RNS.Packet(self, rtt_data, context=RNS.Packet.LRRTT)
-					Packet rtt_packet(*this, rtt_data, Type::Packet::DATA, Type::Packet::LRRTT);
-TRACEF("***** RTT packet data: %s", rtt_packet.data().toHex().c_str());
-rtt_packet.pack();
-Packet test_packet(RNS::Destination(RNS::Type::NONE), rtt_packet.raw());
-test_packet.unpack();
-TRACEF("***** RTT test packet destination hash: %s", test_packet.destination_hash().toHex().c_str());
-TRACEF("***** RTT test packet data size: %d", test_packet.data().size());
-TRACEF("***** RTT test packet data: %s", test_packet.data().toHex().c_str());
-Bytes plaintext = decrypt(test_packet.data());
-TRACEF("***** RTT test packet plaintext: %s", plaintext.toHex().c_str());
-					rtt_packet.send();
-					had_outbound();
+					Transport::mark_alive(_object->_destination.hash());
+					send_rtt();
 
 					if (_object->_callbacks._established != nullptr) {
 						VERBOSEF("Link %s is established", link_id().toHex().c_str());
@@ -470,12 +484,56 @@ TRACEF("***** RTT test packet plaintext: %s", plaintext.toHex().c_str());
 				DEBUGF("Failed initiator/size check for link proof signature received by %s. Ignoring.", toString().c_str());
 			}
 		}
+		else if (_object->_initiator &&
+		         (_object->_status == Type::Link::ACTIVE || _object->_status == Type::Link::STALE)) {
+			/* A repeat of the proof that activated this link: a relay or
+			 * the responder resent it because our RTT packet never passed
+			 * them. It is answered with the RTT packet again, which is the
+			 * whole of the initiator's part in handshake repair — it needs
+			 * no timer of its own. The repeat must be the same proof: same
+			 * ephemeral key, and a signature by the destination over it. */
+			Bytes packet_data(packet.data());
+			Bytes signalling_bytes;
+			if (packet_data.size() == Type::Identity::SIGLENGTH/8+ECPUBSIZE/2+RNS::Type::Link::LINK_MTU_SIZE) {
+				signalling_bytes = Link::signalling_bytes(Link::mtu_from_lp_packet(packet), mode_from_lp_packet(packet));
+				packet_data = packet_data.left(RNS::Type::Identity::SIGLENGTH/8+ECPUBSIZE/2);
+			}
+			if (packet_data.size() != Type::Identity::SIGLENGTH/8+ECPUBSIZE/2 || !_object->_destination.identity()) {
+				return;
+			}
+			if (packet_data.mid(Type::Identity::SIGLENGTH/8, ECPUBSIZE/2) != _object->_peer_pub_bytes) {
+				DEBUGF("Link proof for %s carries a different key than the one it was established with. Ignoring.", toString().c_str());
+				return;
+			}
+			Bytes signed_data = _object->_link_id + _object->_peer_pub_bytes + _object->_peer_sig_pub_bytes + signalling_bytes;
+			if (_object->_destination.identity().validate(packet_data.left(Type::Identity::SIGLENGTH/8), signed_data)) {
+				Transport::mark_alive(_object->_destination.hash());
+				DEBUGF("Link %s: link proof repeated, answering with the RTT packet again", link_id().toHex().c_str());
+				send_rtt();
+				Transport::count_link_repair();
+			}
+			else {
+				DEBUGF("Invalid repeated link proof signature received by %s. Ignoring.", toString().c_str());
+			}
+		}
 	}
 	catch (const std::exception& e) {
 		_object->_status = Type::Link::CLOSED;
 		ERRORF("An error ocurred while validating link request proof on %s.", toString().c_str());
 		ERRORF("The contained exception was: %s", e.what());
 	}
+}
+
+void Link::send_rtt() {
+	assert(_object);
+	//p rtt_data = umsgpack.packb(self.rtt)
+	MsgPack::Packer packer;
+	packer.serialize(_object->_rtt);
+	Bytes rtt_data(packer.data(), packer.size());
+	//p rtt_packet = RNS.Packet(self, rtt_data, context=RNS.Packet.LRRTT)
+	Packet rtt_packet(*this, rtt_data, Type::Packet::DATA, Type::Packet::LRRTT);
+	rtt_packet.send();
+	had_outbound();
 }
 
 
@@ -487,7 +545,7 @@ thus preserved. This method can be used for authentication.
 
 :param identity: An RNS.Identity instance to identify as.
 */
-void Link::identify(const Identity& identity) {
+Packet Link::identify(const Identity& identity) {
 	assert(_object);
 	DEBUGF("Link %s requesting identity", link_id().toHex().c_str());
 	if (_object->_initiator && _object->_status == Type::Link::ACTIVE) {
@@ -498,7 +556,9 @@ void Link::identify(const Identity& identity) {
 		Packet proof(*this, proof_data, Type::Packet::DATA, Type::Packet::LINKIDENTIFY);
 		proof.send();
 		had_outbound();
+		return proof;
 	}
+	return {Type::NONE};
 }
 
 /*
@@ -624,6 +684,32 @@ void Link::rtt_packet(const Packet& packet) {
 	catch (const std::exception& e) {
 		ERRORF("Error occurred while processing RTT packet, tearing down link. The contained exception was: %s", e.what());
 		teardown();
+	}
+}
+
+/* The RTT packet carries only the initiator's measured round trip, nothing
+ * the link needs in order to work, so the first packet over the link that
+ * decrypts under the handshake key stands in for it: it proves the peer holds
+ * the key, and so cannot be spoofed into activating a link. The round trip is
+ * then our own estimate. */
+void Link::activate_without_rtt() {
+	assert(_object);
+	DEBUGF("Link %s: no LRRTT seen; activating recipient link on its first packet (status=%d)",
+		toString().c_str(), (int)_object->_status);
+	_object->_rtt = OS::time() - _object->_request_time;
+	_object->_status = Type::Link::ACTIVE;
+	_object->_activated_at = OS::time();
+	update_keepalive();
+	if (_object->_rtt > 0 && _object->_establishment_cost > 0) {
+		_object->_establishment_rate = _object->_establishment_cost / _object->_rtt;
+	}
+	try {
+		if (_object->_owner.callbacks()._link_established != nullptr) {
+			_object->_owner.callbacks()._link_established(*this);
+		}
+	}
+	catch (const std::exception& e) {
+		ERRORF("Error in link establishment callback while activating %s on its first packet: %s", toString().c_str(), e.what());
 	}
 }
 
@@ -1293,6 +1379,11 @@ void Link::receive(const Packet& packet) {
 		}
 		{
 			_object->_last_inbound = OS::time();
+			/* Our link's destination is the peer; on a link we accepted it is
+			 * our own, and the peer has no address until it identifies. */
+			if (_object->_initiator) {
+				Transport::mark_alive(_object->_destination.hash());
+			}
 			if (packet.context() != Type::Packet::KEEPALIVE) {
 				_object->_last_data = _object->_last_inbound;
 			}
@@ -1351,22 +1442,7 @@ void Link::receive(const Packet& packet) {
 							 * from our peer, so this cannot be spoofed into activating a link. */
 							if (!_object->_initiator && _object->_status != Type::Link::CLOSED
 							    && !_object->_callbacks._packet) {
-								DEBUGF("Link %s: no LRRTT seen; activating recipient link on first inbound DATA (status=%d)",
-									toString().c_str(), (int)_object->_status);
-								_object->_rtt = OS::time() - _object->_request_time;
-								_object->_status = Type::Link::ACTIVE;
-								_object->_activated_at = OS::time();
-								if (_object->_rtt > 0 && _object->_establishment_cost > 0) {
-									_object->_establishment_rate = _object->_establishment_cost / _object->_rtt;
-								}
-								try {
-									if (_object->_owner.callbacks()._link_established != nullptr) {
-										_object->_owner.callbacks()._link_established(*this);
-									}
-								}
-								catch (const std::exception& e) {
-									ERRORF("Error in link establishment callback while activating %s on inbound DATA: %s", toString().c_str(), e.what());
-								}
+								activate_without_rtt();
 							}
 							/* If establishment wired a callback (and did not tear us down),
 							 * deliver this first packet rather than losing it. */
@@ -1417,6 +1493,17 @@ void Link::receive(const Packet& packet) {
 							identity.load_public_key(public_key);
 
 							if (identity.validate(signature, signed_data)) {
+								/* The identify follows the RTT packet at once,
+								 * so when that was lost this is the first
+								 * packet over the link: activate first, or the
+								 * identity lands on a link nobody is listening
+								 * to yet. */
+								if (_object->_status == Type::Link::HANDSHAKE) {
+									activate_without_rtt();
+								}
+								/* Proved, so the initiator knows the identity
+								 * arrived and does not send it again. */
+								const_cast<Packet&>(packet).prove();
 								_object->__remote_identity = identity;
 								if (_object->_callbacks._remote_identified) {
 									try {
@@ -1485,10 +1572,14 @@ void Link::receive(const Packet& packet) {
 				}
 				case Type::Packet::LRRTT:
 				{
+					/* Only the first RTT packet activates. The initiator sends
+					 * another for every repeat of the link proof it hears, and
+					 * one of those arriving on an active link is spent. */
+					bool activates = !_object->_initiator && _object->_status == Type::Link::HANDSHAKE;
 					DEBUGF("Link %s: LRRTT packet received (initiator=%d, status=%d) — %s",
 						toString().c_str(), (int)_object->_initiator, (int)_object->_status,
-						_object->_initiator ? "ignored (we are initiator)" : "activating recipient link");
-					if (!_object->_initiator) {
+						activates ? "activating recipient link" : "ignored");
+					if (activates) {
 						rtt_packet(packet);
 					}
 					break;

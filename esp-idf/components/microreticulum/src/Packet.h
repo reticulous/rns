@@ -77,6 +77,17 @@ namespace RNS {
 		inline bool operator < (const PacketReceipt& packet_receipt) const {
 			return _object.get() < packet_receipt._object.get();
 		}
+		/* Identity, as operator< orders by. Without it `a == b` compiles
+		 * through the bool conversion — every live receipt equals every
+		 * other — and std::list::remove() of one settled receipt empties
+		 * Transport's whole receipt list, so every proof still on its way
+		 * arrives to "matched none". */
+		inline bool operator == (const PacketReceipt& packet_receipt) const {
+			return _object.get() == packet_receipt._object.get();
+		}
+		inline bool operator != (const PacketReceipt& packet_receipt) const {
+			return _object.get() != packet_receipt._object.get();
+		}
 
 	public:
 		bool validate_proof_packet(const Packet& proof_packet);
@@ -118,6 +129,7 @@ namespace RNS {
 		inline Type::PacketReceipt::Status status() const { assert(_object); return _object->_status; }
 		inline bool proved() const { assert(_object); return _object->_proved; }
 		inline double concluded_at() const { assert(_object); return _object->_concluded_at; }
+		inline const Destination& destination() const { assert(_object); return _object->_destination; }
 		// Radio signal + hops of the proof packet that concluded this receipt
 		// (valid once proved(); NaN rssi/snr = the proof arrived on a non-radio
 		// interface). hops is the raw RNS count (1 = directly received).
