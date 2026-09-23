@@ -4095,8 +4095,10 @@ static bool ifaceMatchesFilter(const iface_t& i, const std::string& filter)
 static void rnstatusHeader(void)
 {
     bool tx_en = storageGetInt("s.rnsd.transport_enabled", 0) != 0;
-    if (s_identity) cliPrintf("Reticulum transport instance %s\n", s_identity->hexhash().c_str());
-    else            cliPrintf("Reticulum (no identity)\n");
+    const RNS::Identity& tid = RNS::Transport::identity();
+    if (tid)        cliPrintf("Reticulum transport instance %s\n", tid.hexhash().c_str());
+    if (s_identity) cliPrintf("Node identity %s\n", s_identity->hexhash().c_str());
+    if (!tid && !s_identity) cliPrintf("Reticulum (no identity)\n");
     cliPrintf("Transport    %s\n", tx_en ? "enabled" : "disabled");
     cliPrintf("Interfaces   %d up\n", countActiveIfaces());
 }

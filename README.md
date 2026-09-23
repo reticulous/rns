@@ -407,7 +407,8 @@ asking (`rnstatus -R <hash>` / `rnpath -R <hash>`, and the netgraph crawl):
 ```
 
 The address is the stock one — `rnstransport.remote.management` on this node's
-transport identity — so `rnstatus -R <our identity hash>` from an unmodified
+identity (the one that hosts destinations, not the transport identity it relays
+under) — so `rnstatus -R <our identity hash>` from an unmodified
 `pip install rns` works with nothing on the other side but that hash in a config
 file. `/path` answers upstream's list of `{hash, timestamp, via, hops, expires,
 interface}` and `/status` its `[stats-dict, link-count]`.
