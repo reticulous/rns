@@ -3562,6 +3562,8 @@ static void publishStats(void)
     storageSet("rnsd.stats.bytes_out",   (int)(s_stats.bytes_out   & 0x7fffffff));
     storageSet("rnsd.stats.link.repairs_sent",
                (int)(RNS::Transport::link_repairs_sent() & 0x7fffffff));
+    storageSet("rnsd.stats.link.repairs_helped",
+               (int)(RNS::Transport::link_repairs_helped() & 0x7fffffff));
     int activeIfaces = 0;
     for (int j = 0; j < RNSD_MAX_IFACES; j++) {
         auto& i = s_ifaces[j];
@@ -4270,8 +4272,9 @@ static void rnstatusPrintTotals(void)
     cliPrintf("Bytes        %s in / %s out\n",
               formatBytes(s_stats.bytes_in).c_str(),
               formatBytes(s_stats.bytes_out).c_str());
-    cliPrintf("Link repairs %lu sent\n",
-              (unsigned long)RNS::Transport::link_repairs_sent());
+    cliPrintf("Link repairs %lu sent, %lu helped\n",
+              (unsigned long)RNS::Transport::link_repairs_sent(),
+              (unsigned long)RNS::Transport::link_repairs_helped());
 }
 
 static void rnstatusJson(const std::string& filter)
@@ -4314,6 +4317,8 @@ static void rnstatusJson(const std::string& filter)
     cJSON_AddNumberToObject(st, "bytes_out",     (double)s_stats.bytes_out);
     cJSON_AddNumberToObject(st, "link_repairs_sent",
                             (double)RNS::Transport::link_repairs_sent());
+    cJSON_AddNumberToObject(st, "link_repairs_helped",
+                            (double)RNS::Transport::link_repairs_helped());
     cJSON_AddItemToObject(root, "stats", st);
 
     char* text = cJSON_PrintUnformatted(root);
@@ -5528,7 +5533,7 @@ static void onCmdLinkOpen(const char* key, const char* val)
  * (linkPeerAlive): a lost handshake frame is worth another try, a node that is
  * off is not. */
 #define RNSD_LINK_ATTEMPTS   3
-#define RNSD_ALIVE_WINDOW_S  900
+#define RNSD_ALIVE_WINDOW_S  1800
 
 enum link_state_t : uint8_t {
     LST_FREE = 0, LST_AWAITING_PATH, LST_ESTABLISHING,
@@ -6701,10 +6706,9 @@ static void linkIdentifyTick(link_conn_t& c, double now)
 
 /* Was the peer heard from recently enough that an establishment which got
  * nothing back is worth trying again? Its directory record carries the time of
- * the last packet it authored (Directory's last_alive). A peer one hop away
- * heard every one of our link requests first-hand, so for it only something
- * heard since this attempt began counts. `age` is set to the stamp's age in
- * seconds, -1 when there is none. */
+ * the last packet it authored (Directory's last_alive), and any stamp within
+ * RNSD_ALIVE_WINDOW_S counts, at every distance. `age` is set to the stamp's
+ * age in seconds, -1 when there is none. */
 static bool linkPeerAlive(const link_conn_t& c, double now, int* age)
 {
     *age = -1;
@@ -6712,8 +6716,6 @@ static bool linkPeerAlive(const link_conn_t& c, double now, int* age)
     rdir_entry_t e;
     if (!rdirPeekEntry(c.dest_hash.data(), &e) || e.last_alive == 0) return false;
     *age = (int)(now - (double)e.last_alive);
-    if (RNS::Transport::hops_to(c.dest_hash) <= 1)
-        return (double)e.last_alive >= c.attempt_at;
     return now - (double)e.last_alive <= RNSD_ALIVE_WINDOW_S;
 }
 

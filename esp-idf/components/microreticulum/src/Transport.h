@@ -236,15 +236,19 @@ namespace RNS {
 
 		/* One handshake packet a relay forwarded, kept for a single resend on
 		 * the same interface if its answer does not pass back through here
-		 * within one per-hop timeout: a LINKREQUEST waits for its link proof,
-		 * a link proof for the initiator's first packet over the link. */
+		 * within the round trip it needs (handshake_repair_wait): a
+		 * LINKREQUEST waits for its link proof, a link proof for the
+		 * initiator's first packet over the link. After the resend the slot
+		 * stays for one more wait, so an answer inside it counts as helped. */
 		enum HandshakeRepairKind : uint8_t { REPAIR_NONE = 0, REPAIR_LINKREQUEST, REPAIR_LINKPROOF };
 		struct HandshakeRepair {
 			HandshakeRepairKind kind = REPAIR_NONE;
 			Bytes link_id;
 			Bytes raw;
 			Interface interface = {Type::NONE};
+			double wait = 0;
 			double due = 0;
+			bool resent = false;
 		};
 		static constexpr size_t HANDSHAKE_REPAIR_SLOTS = 8;
 
@@ -416,14 +420,22 @@ namespace RNS {
 		 * ESTABLISHMENT_TIMEOUT_PER_HOP, or the interface's first-hop timeout
 		 * (one MTU at its bitrate on top of that) where that is longer. */
 		static double per_hop_timeout(const Interface& interface);
+		/* How long a handshake repair waits for its answer: the round trip
+		 * over `hops` hops, 2 x ESTABLISHMENT_TIMEOUT_PER_HOP x max(1, hops),
+		 * and never less than per_hop_timeout(interface). */
+		static double handshake_repair_wait(uint8_t hops, const Interface& interface);
 		/* Handshake repair: a relay keeps what it forwarded (one slot each, at
 		 * most HANDSHAKE_REPAIR_SLOTS; none when full), drops it when the answer
-		 * passes, and resends it once when the timer fires first. */
-		static void keep_for_repair(HandshakeRepairKind kind, const Bytes& link_id, const Bytes& raw, const Interface& interface);
+		 * passes, and resends it once when `wait` runs out first. */
+		static void keep_for_repair(HandshakeRepairKind kind, const Bytes& link_id, const Bytes& raw, const Interface& interface, double wait);
 		static void repair_answered(HandshakeRepairKind kind, const Bytes& link_id);
 		/* Handshake packets sent a second time on this node: a relay's kept
 		 * request or proof, a responder's proof, an initiator's RTT packet. */
 		static void count_link_repair();
+		/* The answer a relay's or responder's repair waited for arrived within
+		 * one wait after the repair went out. */
+		static void count_link_repair_helped();
+		static inline uint32_t link_repairs_helped() { return _link_repairs_helped; }
 		/* A repair timer is running: a kept packet at a relay, or a link we
 		 * accepted still waiting for its RTT packet. Whoever drives jobs()
 		 * keeps it at the per-second cadence the timers are checked at. */
@@ -647,6 +659,7 @@ namespace RNS {
 		static LinkTable _link_table;			// A lookup table containing hops for links
 		static HandshakeRepair _handshake_repairs[HANDSHAKE_REPAIR_SLOTS];
 		static uint32_t _link_repairs_sent;
+		static uint32_t _link_repairs_helped;
 		static TunnelTable _tunnels;			// A table storing tunnels to other transport instances
 		static RateTable _announce_rate_table;	// A table for keeping track of announce rates
 		static std::set<HAnnounceHandler> _announce_handlers;	// A table storing externally registered announce handlers

@@ -353,11 +353,13 @@ void Link::prove() {
 }
 
 /* The responder's side of handshake repair. Its proof is the one packet of the
- * handshake it sends, and the RTT packet is the answer to it, so it waits two
- * per-hop timeouts for each hop the request travelled and then proves once
- * more. A signature over the same link id and keys is the same bytes, so a
- * relay that already passed the first copy passes this one exactly as it did,
- * and an initiator that did get it answers with its RTT packet again. */
+ * handshake it sends, and the RTT packet is the answer to it, so it waits the
+ * round trip over the hops the request travelled
+ * (Transport::handshake_repair_wait) and then proves once more. A signature
+ * over the same link id and keys is the same bytes, so a relay that already
+ * passed the first copy passes this one exactly as it did, and an initiator
+ * that did get it answers with its RTT packet again. An RTT packet arriving
+ * within one more wait after that proof counts as a repair that helped. */
 bool Link::proof_repair_armed() const {
 	assert(_object);
 	return !_object->_initiator && _object->_status == Type::Link::HANDSHAKE &&
@@ -366,9 +368,8 @@ bool Link::proof_repair_armed() const {
 
 bool Link::proof_repair_due(double now) const {
 	if (!proof_repair_armed()) return false;
-	double window = 2.0 * Transport::per_hop_timeout(_object->_attached_interface)
-	              * std::max((uint8_t)1, _object->_request_hops);
-	return now >= _object->_proof_sent_at + window;
+	return now >= _object->_proof_sent_at
+	              + Transport::handshake_repair_wait(_object->_request_hops, _object->_attached_interface);
 }
 
 void Link::repair_proof() {
@@ -661,6 +662,11 @@ void Link::rtt_packet(const Packet& packet) {
 			unpacker.feed(plaintext.data(), plaintext.size());
 			double rtt = 0.0;
 			unpacker.deserialize(rtt);
+			if (!_object->_initiator && _object->_status == Type::Link::HANDSHAKE && _object->_proof_repaired &&
+			    OS::time() <= _object->_proof_sent_at
+			                  + Transport::handshake_repair_wait(_object->_request_hops, _object->_attached_interface)) {
+				Transport::count_link_repair_helped();
+			}
 			_object->_rtt = std::max(measured_rtt, rtt);
 			_object->_status = Type::Link::ACTIVE;
 			_object->_activated_at = OS::time();

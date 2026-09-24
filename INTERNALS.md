@@ -688,7 +688,10 @@ its announce (the seen record reports it as `novel` — a blob it has not heard
 at an emission no older than the newest, which a relay's cached copy of an
 emission we already had is not), a proof it signed for one of our packets or
 links, any packet over a link we opened to it, and its identity proven over a
-link it opened to us. `rdirMarkAlive` stamps a record we already hold and
+link it opened to us. A rebroadcast announce also stamps the record named by its
+transport id, the node that sent it on the last hop, however stale the announce
+itself (on any other header-2 packet the transport id is the addressee and
+stamps nothing). `rdirMarkAlive` stamps a record we already hold and
 creates none, at `RDIR_ALIVE_RESOLUTION_S` (10 s) resolution so a busy link
 does not rewrite the record per packet. Zero is "never seen alive". It is what
 decides whether a link establishment that got nothing back is tried again
@@ -1252,10 +1255,12 @@ link_id exists. The link is built on the rnsd task in `linkKickoff`, which:
 
 **Establishment attempts.** An attempt whose deadline passes is followed by a
 fresh one — new keys, a new link id, the same slot, outboxes and consumer —
-while the peer was heard from within `RNSD_ALIVE_WINDOW_S` (900 s, the
+while the peer was heard from within `RNSD_ALIVE_WINDOW_S` (1800 s, the
 directory's `last_alive`, §1.1.2) and fewer than `RNSD_LINK_ATTEMPTS` (3) have
-been made. A peer one hop away heard every one of our requests first-hand, so
-for it only something heard since the attempt began counts. Each attempt gets
+been made. The window is the same at every distance, one hop included: a
+neighbour's answer can sit behind its own channel access (a SUPE wait) for
+longer than an attempt, and the frames it sends meanwhile are not Reticulum
+packets and stamp nothing. Each attempt gets
 the full budget above, goes back through the path wait if the route went with
 the last one, and is published as `rnsd.links.<tag>.attempt` and logged
 `link[<tag>]: attempt N of 3`. When no further attempt is due the link fails
@@ -1287,40 +1292,52 @@ I → R1 → R2 → D   LINKREQUEST   each relay keeps what it forwarded
 I ← R1 ← R2 ← D   link PROOF    passing it drops the kept request, keeps the proof
 I → R1 → R2 → D   RTT packet    passing it drops the kept proof
 
-R   no proof back within one per-hop timeout   → the same request again, once
-R   no RTT packet through within one            → the same proof again, once
-D   no RTT packet within 2 × per-hop × hops    → proves again, once
-I   any valid link proof, pending or active     → an RTT packet (again)
+R   no proof back within 2 × per-hop × hops to D          → the same request again, once
+R   no RTT packet through within 2 × per-hop × hops from I → the same proof again, once
+D   no RTT packet within 2 × per-hop × hops from I         → proves again, once
+I   any valid link proof, pending or active                → an RTT packet (again)
 ```
+
+per-hop is `ESTABLISHMENT_TIMEOUT_PER_HOP` (6 s), hops is at least 1, and every
+wait is at least `Transport::per_hop_timeout(interface)` — 6 s or the
+interface's first-hop timeout (one MTU at its bitrate on top of that) where
+longer (`Transport::handshake_repair_wait`).
 
 Sent once end to end, three packets across every hop of a four-hop path on a
 radio that loses a tenth of its receptions fail more often than not. So every
 party that is waiting on an answer sends its own last packet again, once, with
 the same link id and the same bytes, and a frame lost at one hop costs one
-retransmission at that hop rather than the link.
+retransmission at that hop rather than the link. Each party waits for the round
+trip its answer actually needs — out to the far end and back — so a repair goes
+out only once the answer could have arrived and did not.
 
 - **Relays** keep the raw forwarded packet in `Transport::_handshake_repairs`,
   `HANDSHAKE_REPAIR_SLOTS` (8) fixed slots beside the link table; when all are
   taken the newest handshake goes without. A slot is freed when its answer
   passes (a validated proof for a kept request; any non-proof packet over the
   link for a kept proof — the RTT packet, or the initiator's data when that was
-  lost) or when its timer fires; a link-table entry keeps its proof once
-  (`_proof_kept`), so a repeat of it is forwarded and not kept again. The timer
-  is `Transport::per_hop_timeout(interface)`: `ESTABLISHMENT_TIMEOUT_PER_HOP`
-  (6 s) or the outbound interface's first-hop timeout (one MTU at its bitrate
-  on top of that) where longer. A next hop that already had the packet drops
-  the copy — a request is in its hashlist, a proof fails its hop test — so a
-  repair nobody needed costs one frame.
+  lost), or one wait after its resend; a link-table entry keeps its proof once
+  (`_proof_kept`), so a repeat of it is forwarded and not kept again. A kept
+  request waits for the hops to the destination in this relay's path table,
+  on the interface it went out on; a kept proof for the hops the request had
+  travelled when it arrived here (the link-table entry's `_hops`), on the
+  interface it goes back on. A next hop that already had the packet drops the
+  copy — a request is in its hashlist, a proof fails its hop test — so a repair
+  nobody needed costs one frame.
 - **The responder** (`Link::proof_repair_due`, checked in the jobs pass beside
-  the half-open reaper) re-proves once. A signature over the same id and keys
-  is the same bytes, so relays pass it exactly as they passed the first.
+  the half-open reaper) re-proves once, waiting for the hops the request
+  carried. A signature over the same id and keys is the same bytes, so relays
+  pass it exactly as they passed the first.
 - **The initiator** has no timer. `Link::validate_proof` on an active link we
   initiated checks the repeat against the key it was established with and
   answers with a fresh RTT packet — fresh ciphertext, so relays that forwarded
   the lost one forward this one too. A responder takes only the first RTT
   packet; later ones are spent.
 - `rnsd.stats.link.repairs_sent` (and `rnstatus`'s totals) counts every one of
-  these a node sends; each is logged at debug. A node with a repair timer
+  these a node sends; each is logged at debug. `rnsd.stats.link.repairs_helped`
+  counts the relay and responder repairs whose answer then arrived within one
+  wait of the resend: a kept request's proof or a kept proof's next packet
+  passing the relay, the responder's RTT packet. A node with a repair timer
   running keeps rnsd's tick at the floor (`handshake_repairs_pending`), as a
   pending link does.
 

@@ -112,6 +112,7 @@ using namespace RNS::Persistence;
 /*static*/ std::map<Bytes, Transport::LinkEntry> Transport::_link_table;
 /*static*/ Transport::HandshakeRepair Transport::_handshake_repairs[Transport::HANDSHAKE_REPAIR_SLOTS];
 /*static*/ uint32_t Transport::_link_repairs_sent = 0;
+/*static*/ uint32_t Transport::_link_repairs_helped = 0;
 /*static*/ std::set<HAnnounceHandler> Transport::_announce_handlers;
 /*static*/ std::map<Bytes, Transport::TunnelEntry> Transport::_tunnels;
 /*static*/ std::map<Bytes, Transport::RateEntry> Transport::_announce_rate_table;
@@ -487,10 +488,14 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 				double repair_now = OS::time();
 				for (auto& r : _handshake_repairs) {
 					if (r.kind == REPAIR_NONE || repair_now < r.due) continue;
-					if (_link_table.find(r.link_id) != _link_table.end()) {
-						relay_repairs.push_back(r);
+					if (r.resent || _link_table.find(r.link_id) == _link_table.end()) {
+						r = HandshakeRepair();
+						continue;
 					}
-					r = HandshakeRepair();
+					relay_repairs.push_back(r);
+					r.resent = true;
+					r.raw    = Bytes();
+					r.due    = repair_now + r.wait;
 				}
 
 				_links_last_checked = OS::time();
@@ -921,7 +926,7 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 		DEBUGF("Link %s: no %s passed through within %.1fs, resending the %s once on %s",
 			r.link_id.toHex().c_str(),
 			r.kind == REPAIR_LINKREQUEST ? "link proof" : "RTT packet",
-			per_hop_timeout(r.interface),
+			r.wait,
 			r.kind == REPAIR_LINKREQUEST ? "link request" : "link proof",
 			r.interface.toString().c_str());
 		transmit(r.interface, r.raw);
@@ -1851,6 +1856,14 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 	packet.receiving_interface(interface);
 	packet.hops(packet.hops() + 1);
 
+	/* A rebroadcast announce carries the transport id of the node that sent
+	 * it on its last hop, which is alive and in earshot however stale the
+	 * announce itself is. (On any other header-2 packet the transport id
+	 * names the addressee, not the sender.) */
+	if (interface && packet.transport_id() && packet.packet_type() == Type::Packet::ANNOUNCE) {
+		mark_alive(packet.transport_id());
+	}
+
 	// Attach the receiving interface's last-packet radio signal (set by the
 	// driver just before handle_incoming). Consumers read packet.rssi()/snr();
 	// Link.cpp copies them onto the Link so they survive to link callbacks. The
@@ -2126,7 +2139,8 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 						TRACE("Transport::outbound: Sending packet to next hop...");
 						transmit(outbound_interface, new_raw);
 						if (packet.packet_type() == Type::Packet::LINKREQUEST) {
-							keep_for_repair(REPAIR_LINKREQUEST, Link::link_id_from_lr_packet(packet), new_raw, outbound_interface);
+							keep_for_repair(REPAIR_LINKREQUEST, Link::link_id_from_lr_packet(packet), new_raw, outbound_interface,
+							                handshake_repair_wait(remaining_hops, outbound_interface));
 						}
 						/* Transiting for someone else still counts as use: it
 						 * is what makes this record worth keeping. */
@@ -2938,7 +2952,8 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 									repair_answered(REPAIR_LINKREQUEST, packet.destination_hash());
 									if (!link_entry._proof_kept) {
 										link_entry._proof_kept = true;
-										keep_for_repair(REPAIR_LINKPROOF, packet.destination_hash(), new_raw, link_entry._receiving_interface);
+										keep_for_repair(REPAIR_LINKPROOF, packet.destination_hash(), new_raw, link_entry._receiving_interface,
+										                handshake_repair_wait(link_entry._hops, link_entry._receiving_interface));
 									}
 								}
 								else {
@@ -3666,14 +3681,24 @@ Deregisters an announce handler.
  *
  * Each handshake packet crosses every hop once, so on a radio losing a tenth
  * of its receptions a four-hop handshake mostly fails. A relay that has
- * forwarded one and has not seen its answer pass back within one per-hop
- * timeout sends the same bytes again, once, on the interface it sent them on.
- * The next hop that already had the packet drops the copy as a duplicate
- * (a LINKREQUEST is in its hashlist; a proof fails its hop test or is
- * re-forwarded to an initiator that answers it with another RTT packet), so a
- * repair that was not needed costs one frame. The slots are few and fixed:
- * when every one holds a packet, the newest handshake goes without. */
-/*static*/ void Transport::keep_for_repair(HandshakeRepairKind kind, const Bytes& link_id, const Bytes& raw, const Interface& interface) {
+ * forwarded one and has not seen its answer pass back within the round trip
+ * that answer needs sends the same bytes again, once, on the interface it sent
+ * them on. The round trip counts the hops on the far side of this relay: for
+ * a LINKREQUEST the hops to the destination in this relay's path table, for a
+ * link proof the hops the request had travelled when it arrived here
+ * (handshake_repair_wait). The next hop that already had the packet drops the
+ * copy as a duplicate (a LINKREQUEST is in its hashlist; a proof fails its hop
+ * test or is re-forwarded to an initiator that answers it with another RTT
+ * packet), so a repair that was not needed costs one frame. The slot outlives
+ * the resend by one more wait, and an answer passing inside it counts in
+ * rnsd.stats.link.repairs_helped. The slots are few and fixed: when every one
+ * is taken, the newest handshake goes without. */
+/*static*/ double Transport::handshake_repair_wait(uint8_t hops, const Interface& interface) {
+	double wait = 2.0 * (double)Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP * (double)std::max((uint8_t)1, hops);
+	return std::max(wait, per_hop_timeout(interface));
+}
+
+/*static*/ void Transport::keep_for_repair(HandshakeRepairKind kind, const Bytes& link_id, const Bytes& raw, const Interface& interface, double wait) {
 	if (!interface) return;
 	for (auto& r : _handshake_repairs) {
 		if (r.kind != REPAIR_NONE) continue;
@@ -3681,7 +3706,9 @@ Deregisters an announce handler.
 		r.link_id   = link_id;
 		r.raw       = raw;
 		r.interface = interface;
-		r.due       = OS::time() + per_hop_timeout(interface);
+		r.wait      = wait;
+		r.due       = OS::time() + wait;
+		r.resent    = false;
 		return;
 	}
 	DBGF_DEMOTE("Link %s: every handshake repair slot is taken, no repair kept", link_id.toHex().c_str());
@@ -3690,12 +3717,17 @@ Deregisters an announce handler.
 /*static*/ void Transport::repair_answered(HandshakeRepairKind kind, const Bytes& link_id) {
 	for (auto& r : _handshake_repairs) {
 		if (r.kind != kind || r.link_id != link_id) continue;
+		if (r.resent && OS::time() <= r.due) count_link_repair_helped();
 		r = HandshakeRepair();
 	}
 }
 
 /*static*/ void Transport::count_link_repair() {
 	_link_repairs_sent++;
+}
+
+/*static*/ void Transport::count_link_repair_helped() {
+	_link_repairs_helped++;
 }
 
 /*static*/ bool Transport::handshake_repairs_pending() {
