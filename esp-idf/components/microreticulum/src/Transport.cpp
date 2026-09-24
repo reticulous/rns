@@ -2265,7 +2265,33 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 				}
 				if (packet.transport_id()) {
 					received_from = packet.transport_id();
-					
+
+					/* A rebroadcast heard on an interface answers the copy of
+					 * that announce the interface's announce cap is holding in
+					 * its queue: the neighbours it was for have it now. The
+					 * queue is checked on its own, not through the ring record
+					 * below, which is erased seconds after the first rebroadcast
+					 * while the deferred copy can wait a minute for the cap.
+					 * Only a repeat of the same or a newer emission that has
+					 * travelled at least as far as ours would counts. */
+					if (Reticulum::transport_enabled()) {
+						const Interface& ri = packet.receiving_interface();
+						if (ri) {
+							std::list<RNS::AnnounceEntry>& deferred_q = ri.announce_queue();
+							uint64_t heard_emitted = announce_emitted(packet);
+							size_t before = deferred_q.size();
+							deferred_q.remove_if([&](const RNS::AnnounceEntry& a) {
+								return a._destination == packet.destination_hash()
+								    && (double)heard_emitted >= a._emitted
+								    && packet.hops() >= (uint8_t)(a._hops + 1);
+							});
+							if (deferred_q.size() != before) {
+								DBGF_DEMOTE("Heard repeat of announce for %s drops it from %s's deferred queue",
+									packet.destination_hash().toHex().c_str(), ri.toString().c_str());
+							}
+						}
+					}
+
 					// Check if this is a next retransmission from
 					// another node. If it is, we're removing the
 					// announce in question from our pending table
@@ -2273,25 +2299,6 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 						? announce_find(packet.destination_hash(), /*held=*/false) : nullptr;
 					if (queued) {
 						bool announce_erased = false;
-						/* The ring is not the only place a rebroadcast waits:
-						 * one the interface's announce cap deferred sits in
-						 * that interface's queue, and a repeat heard on the
-						 * medium answers it just as well. Dropped together, or
-						 * the queue would air a copy every neighbour already
-						 * has, a median minute late. */
-						auto drop_deferred = [&]() {
-							const Interface& ri = packet.receiving_interface();
-							if (!ri) return;
-							std::list<RNS::AnnounceEntry>& deferred_q = ri.announce_queue();
-							size_t before = deferred_q.size();
-							deferred_q.remove_if([&](const RNS::AnnounceEntry& a) {
-								return a._destination == packet.destination_hash();
-							});
-							if (deferred_q.size() != before) {
-								DBGF_DEMOTE("Heard repeat of announce for %s also drops it from %s's deferred queue",
-									packet.destination_hash().toHex().c_str(), ri.toString().c_str());
-							}
-						};
 						if ((packet.hops() - 1) == queued->hops) {
 							DBGF_DEMOTE("Heard a local rebroadcast of announce for %s", packet.destination_hash().toHex().c_str());
 							queued->local_rebroadcasts += 1;
@@ -2303,7 +2310,6 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 								DBGF_DEMOTE("Max local rebroadcasts of announce for %s reached, dropping announce from our queue", packet.destination_hash().toHex().c_str());
 								memset(queued, 0, sizeof(*queued));
 								announce_erased = true;
-								drop_deferred();
 							}
 						}
 
@@ -2312,7 +2318,6 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 							if (now < queued->timestamp) {
 								DBGF_DEMOTE("Rebroadcasted announce for %s has been passed on to another node, no further tries needed", packet.destination_hash().toHex().c_str());
 								memset(queued, 0, sizeof(*queued));
-								drop_deferred();
 							}
 						}
 					}
