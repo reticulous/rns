@@ -141,6 +141,10 @@ if(IDF_TARGET STREQUAL "linux")
         -Wno-error=class-memaccess
     )
 endif()
+# The ESP32-P4's heap headers give that stats struct a constructor as well.
+if(IDF_TARGET STREQUAL "esp32p4")
+    target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=class-memaccess)
+endif()
 
 # ed25519-donna's reference impl raises noisy warnings on modern GCC that
 # aren't real bugs (unused functions in the table headers, casts in the
