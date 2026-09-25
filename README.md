@@ -620,8 +620,11 @@ every packet aimed down it goes nowhere. So an interface going down drops the
 routes learned over it, and a peer detaching on a connection-oriented medium
 (`auto`, `ble`) drops the routes *to* the destinations it hosted and *through*
 it: a detach is a certain, immediate fact arriving on time, and it is strictly
-better evidence than any horizon. LoRa gets nothing from this — it is
-connectionless, there is no detach to hear, and time is the only evidence there.
+better evidence than any horizon. A connectionless medium such as LoRa has no
+detach to hear; an interface there that keeps its own neighbour table can
+still withdraw a neighbour it judges gone (`up = 0` on its peer declaration),
+and that withdrawal drops the same routes. Otherwise time is the only evidence
+there.
 A boot is the same argument over a longer gap, which is `s.rnsd.dir.persist_routes`
 above. Keys are kept throughout: a destination's key is true wherever it is, and
 only the way there has gone.
