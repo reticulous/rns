@@ -3238,10 +3238,13 @@ static void publishPathTable(void)
 /* A share of free PSRAM at bring-up, clamped. The floor keeps a small board
  * from ending up with a directory too small to hold its own mesh; the ceiling
  * keeps a big one from spending memory on slots a node will never fill (and
- * from lengthening rdirPeekRoute's linear scan for nothing). */
+ * from lengthening rdirPeekRoute's linear scan for nothing). The ceiling is
+ * never below what `s.rnsd.path.max` routes need, since a cap the pool cannot
+ * hold is no cap: one budget unit carries four directory records. */
 #define RNSD_DIR_PSRAM_SHARE   10
 #define RNSD_DIR_BUDGET_MIN_KB 40
 #define RNSD_DIR_BUDGET_MAX_KB 96
+#define RNSD_PATH_MAX_DEF      500
 
 static uint32_t  s_dirPersistedGen  = 0;
 static TickType_t s_dirPersistDueTick = 0;
@@ -3252,8 +3255,9 @@ static bool      s_dirImgCapWarned  = false;
  *
  * The arena budget is derived from PSRAM, and PSRAM says nothing about the
  * flash the image lands in: a board with 2 MB of PSRAM and a 256 KB state
- * partition sized itself a 96 KB arena and then could never write it, because
- * the atomic rewrite needs the new copy and the old one resident at once.
+ * partition sizes itself an arena whose full image it could never write,
+ * because the atomic rewrite needs the new copy and the old one resident at
+ * once.
  * So the image gets its own budget, from the partition it is stored on — an
  * eighth of it, which leaves room for the copy and for everything else that
  * lives there. rdirSnapshot treats a short buffer as a budget and keeps the
@@ -3445,9 +3449,13 @@ static void rnsdDirUp(void)
         budget = (size_t)kb * 1024;
     } else {
         size_t freeps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        int    routes = storageGetInt("s.rnsd.path.max", RNSD_PATH_MAX_DEF);
+        size_t ceiling = (size_t)RNSD_DIR_BUDGET_MAX_KB * 1024;
+        size_t forRoutes = (size_t)((routes + RDIR_UNIT_DIRS - 1) / RDIR_UNIT_DIRS) * RDIR_BUDGET_UNIT;
+        if (forRoutes > ceiling) ceiling = forRoutes;
         budget = freeps / RNSD_DIR_PSRAM_SHARE;
         if (budget < RNSD_DIR_BUDGET_MIN_KB * 1024) budget = RNSD_DIR_BUDGET_MIN_KB * 1024;
-        if (budget > RNSD_DIR_BUDGET_MAX_KB * 1024) budget = RNSD_DIR_BUDGET_MAX_KB * 1024;
+        if (budget > ceiling) budget = ceiling;
     }
 
     rdir_platform_t plat = {};
@@ -3474,7 +3482,7 @@ static void rnsdDirUp(void)
      * Dropping them costs one path request, or the next announce, per
      * destination actually used — while keeping every key, which is the
      * expensive half to relearn. A transport node serving path requests for
-     * others is the one case with a real appetite for the old behaviour, so it
+     * others is the one case with a real appetite for restored routes, so it
      * is a setting rather than a rule; the default is fresh. */
     if (storageGetInt("s.rnsd.dir.persist_routes", 0) == 0) {
         size_t cleared = rdirClearAllRoutes();
@@ -8663,7 +8671,7 @@ static void rnsdTaskMain(void*)
      * announce first), then least-recently-used — NOT by the store's own
      * set_max_recs, whose eviction is by key order and use-blind. */
     NOW_AND_ON_CHANGE("s.rnsd.path.max", {
-        RNS::Transport::path_table_maxsize(storageGetInt(key, 100));
+        RNS::Transport::path_table_maxsize(storageGetInt(key, RNSD_PATH_MAX_DEF));
     });
     NOW_AND_ON_CHANGE("s.rnsd.announce.table_max", {
         RNS::Transport::announce_table_maxsize(storageGetInt(key, 100));
@@ -9055,10 +9063,8 @@ void RnsdService::onInit()
         storageBegin();
         storageDefault("s.rnsd.respond_to_probes", 1);      /* host rnstransport.probe (PROVE_ALL) */
         storageDefault("s.rnsd.link.path_timeout_s", 30);   /* LR retry budget */
-        /* `s.rnsd.path.max` / `s.rnsd.path.ttl` removed: mR's path table is
-         * unbounded (BasicHeapStore), pruned only by PATHFINDER_E (24 h).
-         * Re-add when we implement post-process pruning or interface-mode
-         * intake control. */
+        /* `s.rnsd.path.max` and `s.rnsd.path.ttl` are not seeded: their
+         * readers carry the defaults (RNSD_PATH_MAX_DEF routes, 86400 s). */
         /* v1→v2: rnstransport.remote.management was never implemented
          * (announced an endpoint that dropped every packet), so it's
          * gone. Drop its orphaned gate, and promote the probe responder

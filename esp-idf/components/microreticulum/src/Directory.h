@@ -42,9 +42,14 @@
 #define RDIR_DIR_SLOT_SZ    160
 #define RDIR_BLOB_SLOT_DEF  320   /* default; tunable, carried in the image */
 
-/* Slot counts are derived from a byte budget in fixed proportion 8:4:1
+/* Slot counts are derived from a byte budget in fixed proportion 8:4:2
  * (guard : directory : blob). One "unit" of that proportion costs: */
-#define RDIR_BUDGET_UNIT    (8 * RDIR_GUARD_SLOT_SZ + 4 * RDIR_DIR_SLOT_SZ + RDIR_BLOB_SLOT_DEF)
+#define RDIR_UNIT_GUARDS     8
+#define RDIR_UNIT_DIRS       4
+#define RDIR_UNIT_BLOBS      2
+#define RDIR_BUDGET_UNIT    (RDIR_UNIT_GUARDS * RDIR_GUARD_SLOT_SZ + \
+                             RDIR_UNIT_DIRS * RDIR_DIR_SLOT_SZ + \
+                             RDIR_UNIT_BLOBS * RDIR_BLOB_SLOT_DEF)
 
 /* ── record flags (directory) ──────────────────────────────────────────── */
 

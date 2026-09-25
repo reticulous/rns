@@ -597,8 +597,9 @@ reader and a raw persisted image.
 | blob | "I can answer a path request for this" — the raw signed announce | 320 B (`s.rnsd.dir.blob_slot`) |
 
 Slot counts come from a byte budget (`s.rnsd.dir.budget_kb`, or a share of free
-PSRAM at boot) split 8 : 4 : 1 seen : directory : blob — 664 : 332 : 83 at the
-96 KiB ceiling. Nothing allocates after `rdirInit`, so no arrival path can fail
+PSRAM at boot) split 8 : 4 : 2 seen : directory : blob, one budget unit
+(`RDIR_BUDGET_UNIT`) being 1504 B — 1000 : 500 : 250 in the 188 000 B that the
+default `s.rnsd.path.max` of 500 routes needs. Nothing allocates after `rdirInit`, so no arrival path can fail
 for memory: a full pool evicts, and an ingest that cannot get its deeper layer
 silently keeps the weaker one. Lookup is a linear scan of the pool, which is
 what having no index to keep coherent with a raw image costs, and at these slot
@@ -1726,8 +1727,8 @@ that.
 Three rules hold it there, and each exists because breaking it broke a board:
 
 - **Only live records are written**, packed, counts in the header. Writing the
-  record pool verbatim (holes included) made the file the size of the *budget*, so a
-  node that knew twelve destinations still wrote 96 KB.
+  record pool verbatim (holes included) would make the file the size of the
+  *budget*, so a node that knew twelve destinations would write the whole pool.
 - **Records go out in eviction order**, most valuable first (`dirCategory` /
   `dirOrder` — the same judgement that decides what to drop under memory
   pressure), so `rdirSnapshot`'s `cap` is a byte budget rather than a failure
@@ -1736,15 +1737,15 @@ Three rules hold it there, and each exists because breaking it broke a board:
 - **The cap comes from `/state`**, an eighth of it by default
   (`s.rnsd.dir.img_max_kb`). The record pool budget derives from free PSRAM, and
   PSRAM says nothing about the flash the image lands in: a T3-S3 has 2 MB of
-  PSRAM and a 256 KB state partition, sized itself a 96 KB record pool, and could
-  then never write it — `atomicWriteFile` needs the new copy and the old one
-  resident at once, which is 192 KB of a 64-block filesystem. Every write
-  failed with `No more free space`, forever.
+  PSRAM and a 256 KB state partition, and sizes itself a record pool whose full
+  image it could never write — `atomicWriteFile` needs the new copy and the old
+  one resident at once, twice the image in a 64-block filesystem. Without the
+  cap every write fails with `No more free space`, forever.
 
 The seen-only depth is **never** persisted, and this is a trade, not a free win.
 Its replay check is the fingerprint ring plus `emitted` — both absolute, so a
 reloaded seen-record pool *would* suppress announces we forwarded before the reboot.
-What it would not do is matter: the pool is 664 slots at the 96 KiB budget, and
+What it would not do is matter: the pool is 1000 slots at the 500-route budget, and
 a node bridged to a large network hears orders of magnitude more distinct
 destinations than that, so it evicts continuously and suppression tends to zero
 whether or not it survives a boot. Against that, only its eviction ordering is
