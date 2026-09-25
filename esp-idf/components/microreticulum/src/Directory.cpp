@@ -889,7 +889,9 @@ static inline bool rankLess(const rdir_rank_t& a, const rdir_rank_t& b) {
 }
 
 /* The greatest used record ranking strictly below `hi`, or false when none is
- * left. Passing the previous winner walks the pool in descending rank. */
+ * left. Passing the previous winner walks the pool in descending rank. `hi`
+ * and `out` must be distinct: the scan rewrites `out` as it goes while still
+ * comparing every record against `hi`. */
 static bool dirNextBelow(const rdir_rank_t* hi, uint32_t now, rdir_rank_t* out) {
     bool found = false;
     for (uint16_t i = 0; i < s_dir_slots; i++) {
@@ -934,7 +936,9 @@ size_t rdirSnapshot(void* buf, size_t cap) {
         memcpy(out + at, &s_dir[k.slot], RDIR_DIR_SLOT_SZ);
         at += RDIR_DIR_SLOT_SZ;
         n_dir++;
-        have = dirNextBelow(&k, now, &k);
+        rdir_rank_t below;
+        have = dirNextBelow(&k, now, &below);
+        k = below;
     }
 
     /* Pass 2: the blob for each record written, in the same order. A blob
@@ -1044,16 +1048,17 @@ bool rdirInit(const rdir_platform_t* platform, size_t byte_budget) {
 
     /* Slot counts come from a byte budget, never from constants: constants
      * tuned on an 8 MB board and inherited by a 2 MB one are the defect this
-     * design exists to prevent. The split is a fixed 8:4:1 proportion of slot
-     * counts (guard : directory : blob). */
-    size_t unit_bytes = 8 * RDIR_GUARD_SLOT_SZ + 4 * RDIR_DIR_SLOT_SZ + s_blob_slot_sz;
+     * design exists to prevent. The split is a fixed 8:4:2 proportion of slot
+     * counts (guard : directory : blob), the one RDIR_BUDGET_UNIT prices. */
+    size_t unit_bytes = RDIR_UNIT_GUARDS * RDIR_GUARD_SLOT_SZ + RDIR_UNIT_DIRS * RDIR_DIR_SLOT_SZ
+                      + RDIR_UNIT_BLOBS * (size_t)s_blob_slot_sz;
     size_t units = byte_budget / unit_bytes;
     if (units < 4) units = 4;
     if (units > 2048) units = 2048;
 
-    s_guard_slots = (uint16_t)(units * 8);
-    s_dir_slots   = (uint16_t)(units * 4);
-    s_blob_slots  = (uint16_t)units;
+    s_guard_slots = (uint16_t)(units * RDIR_UNIT_GUARDS);
+    s_dir_slots   = (uint16_t)(units * RDIR_UNIT_DIRS);
+    s_blob_slots  = (uint16_t)(units * RDIR_UNIT_BLOBS);
 
     /* One extra header's worth of slack: the image is read into the arena and
      * then slid to the back, and an image whose pools exactly match ours is
