@@ -218,8 +218,8 @@ void Resource::_init_outbound(const Bytes& plaintext, bool advertise,
 	std::memcpy(d._resource_hash, rhf.data(), 32);
 	std::memcpy(d._original_hash, d._resource_hash, 32);
 	d._hash = Bytes(d._resource_hash, 32);
-	// expected_proof = full_hash(on_wire || resource_hash)
-	d._expected_proof = rns_full_hash2(on_wire, d._resource_hash, 32);
+	// expected_proof = full_hash(plaintext || resource_hash)  (UNCOMPRESSED domain)
+	d._expected_proof = rns_full_hash2(plaintext, d._resource_hash, 32);
 
 	const size_t sdu = Type::Resource::SDU;
 	const size_t num = (encrypted.size() + sdu - 1) / sdu;
