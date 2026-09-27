@@ -2396,11 +2396,13 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 					        rdirGuardFresh(packet.destination_hash().data(), random_blob.data(),
 					                       (uint32_t)announce_emitted, bypass, &novel);
 
-					/* A longer path never displaces a shorter one while the
-					 * shorter one is still valid. Once it expires the freshest
-					 * announce wins, whatever its hop count — that is how a
-					 * destination that moved gets rediscovered. */
-					bool route_better = !have_known || packet.hops() <= known.hops ||
+					/* A longer path displaces a shorter one only as a new
+					 * emission (`novel`: a blob not heard before, emitted no
+					 * earlier than the newest we hold) or once the shorter one
+					 * has expired — as upstream, that is how a destination that
+					 * moved is followed. A looped or relayed copy of an emission
+					 * we already had never lengthens the route. */
+					bool route_better = !have_known || packet.hops() <= known.hops || novel ||
 					                    (known.expires != 0 && (uint32_t)OS::time() >= known.expires);
 
 					/* `requested` is the "resolved on demand" arm, and it is what
@@ -4326,8 +4328,8 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 			// same radio, and a relay that knows the way is exactly who a
 			// question from deep inside a radio-only area needs to hear from.
 			// The asker's own next-hop test above, and ingest's rule that a
-			// longer path never displaces a shorter valid one, are what keep
-			// such answers from building loops.
+			// copy of an emission already heard never displaces a shorter
+			// valid path, are what keep such answers from building loops.
 			else if (attached_interface.point_to_point() && attached_interface == receiving_interface && route.hops > 1) {
 				DBGF_DEMOTE("Not answering path request for destination %s%s back out its own point-to-point interface: path is %u hops", destination_hash.toHex().c_str(), interface_str.c_str(), (unsigned)route.hops);
 			}

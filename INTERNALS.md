@@ -357,8 +357,8 @@ Our deltas, by category:
   the storage decision, true when the announce was resolved on demand (an
   outstanding path request), originated within the ingress interface's
   service radius, was originated by the direct peer, is claimed, or is in
-  active use. A longer path never
-  displaces a shorter one while the shorter one is still valid, and an announce
+  active use. A longer path displaces a shorter valid one only as a new
+  emission, and an announce
   we have already seen and already hold is not re-stored — on a mesh where
   several neighbours rebroadcast the same announce, that is most of the traffic.
 - `Interface.{h}` — **`community_radius`**, set at registration the way `mode`
@@ -634,14 +634,14 @@ once and then goes silent.
 
 **Ingest splits forwarding from storage.** In `Transport::inbound`, `fresh` is
 the forwarding input (the seen records, over every announce ever validated) and
-`retain` is the storage decision, true when a strictly-better-or-equal route
-arrives *and* one of: the announce was resolved on demand (an outstanding path
+`retain` is the storage decision, true when a route no longer than the held one,
+a new emission or a route replacing an expired one arrives *and* one of: the announce was resolved on demand (an outstanding path
 request — the arm that keeps a radius-0 interface usable at all, or a node
 with only a cheap link would discard the path response it just asked for), its
 origin is within the ingress interface's service radius, it was originated
 by the direct peer (hops 1 on the wire), the destination is claimed, or
-its route is in active use. A longer path never displaces a shorter valid one;
-an announce already seen and already held is not re-stored, which on a mesh
+its route is in active use. A longer path displaces a shorter valid one only as a
+new emission, as upstream, so a destination that moved is followed; an announce already seen and already held is not re-stored, which on a mesh
 where several neighbours rebroadcast the same announce is most of the traffic.
 The *policy* — how far each interface's community reaches — stays outside µR,
 in each interface straddle's `community_radius` setting, carried in at
