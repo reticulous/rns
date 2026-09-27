@@ -42,14 +42,12 @@
 #define RDIR_DIR_SLOT_SZ    160
 #define RDIR_BLOB_SLOT_DEF  320   /* default; tunable, carried in the image */
 
-/* Slot counts are derived from a byte budget in fixed proportion 8:4:2
- * (guard : directory : blob). One "unit" of that proportion costs: */
+/* Slot counts are derived from a byte budget in proportion 8:4:2
+ * (guard : directory : blob); the blob share is rdirSetBlobUnits', 2 unless
+ * set. rdirBudgetUnit() prices one unit of the proportion in force. */
 #define RDIR_UNIT_GUARDS     8
 #define RDIR_UNIT_DIRS       4
 #define RDIR_UNIT_BLOBS      2
-#define RDIR_BUDGET_UNIT    (RDIR_UNIT_GUARDS * RDIR_GUARD_SLOT_SZ + \
-                             RDIR_UNIT_DIRS * RDIR_DIR_SLOT_SZ + \
-                             RDIR_UNIT_BLOBS * RDIR_BLOB_SLOT_DEF)
 
 /* ── record flags (directory) ──────────────────────────────────────────── */
 
@@ -210,6 +208,11 @@ bool   rdirReady(void);
 /* Blob slot size, in bytes. Must be set before rdirInit; changing it discards
  * a loaded image (it is a structural property, carried in the header). */
 void   rdirSetBlobSlotSize(size_t bytes);
+/* Blob slots per unit of the split, 1 to RDIR_UNIT_DIRS. Set before rdirInit;
+ * an image loads whatever share it was written under, as far as it fits. */
+void   rdirSetBlobUnits(uint8_t units);
+/* Bytes one unit of the split costs at the blob slot size and share set. */
+size_t rdirBudgetUnit(void);
 
 /* ── readers — any task ────────────────────────────────────────────────── */
 

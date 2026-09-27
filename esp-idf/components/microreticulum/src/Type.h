@@ -26,7 +26,7 @@
 #endif
 
 #ifndef RNS_RECEIPTS_MAX
-#define RNS_RECEIPTS_MAX 20
+#define RNS_RECEIPTS_MAX 64
 #endif
 
 #ifndef RNS_ANNOUNCE_RATE_TABLE_MAX

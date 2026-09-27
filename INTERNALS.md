@@ -598,8 +598,9 @@ reader and a raw persisted image.
 
 Slot counts come from a byte budget (`s.rnsd.dir.budget_kb`, or a share of free
 PSRAM at boot) split 8 : 4 : 2 seen : directory : blob, one budget unit
-(`RDIR_BUDGET_UNIT`) being 1504 B — 1000 : 500 : 250 in the 188 000 B that the
-default `s.rnsd.path.max` of 500 routes needs. Nothing allocates after `rdirInit`, so no arrival path can fail
+(`rdirBudgetUnit()`) being 1504 B — 216 : 108 : 54 in the 40 KiB floor. Where a
+share of free PSRAM holds the default `s.rnsd.path.max` of 500 routes at 8 : 4 : 4
+(2144 B a unit), that is the split: 1000 : 500 : 500 in 268 000 B. Nothing allocates after `rdirInit`, so no arrival path can fail
 for memory: a full pool evicts, and an ingest that cannot get its deeper layer
 silently keeps the weaker one. Lookup is a linear scan of the pool, which is
 what having no index to keep coherent with a raw image costs, and at these slot

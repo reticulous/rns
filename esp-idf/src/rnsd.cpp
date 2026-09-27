@@ -3460,7 +3460,14 @@ static void rnsdDirUp(void)
         size_t freeps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         int    routes = storageGetInt("s.rnsd.path.max", RNSD_PATH_MAX_DEF);
         size_t ceiling = (size_t)RNSD_DIR_BUDGET_MAX_KB * 1024;
-        size_t forRoutes = (size_t)((routes + RDIR_UNIT_DIRS - 1) / RDIR_UNIT_DIRS) * RDIR_BUDGET_UNIT;
+        size_t routeUnits = (size_t)((routes + RDIR_UNIT_DIRS - 1) / RDIR_UNIT_DIRS);
+        /* Blob slots are what answer path requests: one per directory slot
+         * where PSRAM holds the whole route count that way, else the 8:4:2
+         * split, so the directory itself never shrinks for them. */
+        rdirSetBlobUnits(RDIR_UNIT_DIRS);
+        if (freeps / RNSD_DIR_PSRAM_SHARE < routeUnits * rdirBudgetUnit())
+            rdirSetBlobUnits(RDIR_UNIT_BLOBS);
+        size_t forRoutes = routeUnits * rdirBudgetUnit();
         if (forRoutes > ceiling) ceiling = forRoutes;
         budget = freeps / RNSD_DIR_PSRAM_SHARE;
         if (budget < RNSD_DIR_BUDGET_MIN_KB * 1024) budget = RNSD_DIR_BUDGET_MIN_KB * 1024;
@@ -8697,10 +8704,13 @@ static void rnsdTaskMain(void*)
         RNS::Transport::announce_table_maxsize(storageGetInt(key, 100));
     });
     NOW_AND_ON_CHANGE("s.rnsd.hashlist_max", {
-        RNS::Transport::hashlist_maxsize(storageGetInt(key, 100));
+        /* ~150 B an entry, always full: ten times the entries where the
+         * heap they land on is PSRAM. */
+        int def = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0 ? 1000 : 100;
+        RNS::Transport::hashlist_maxsize(storageGetInt(key, def));
     });
     NOW_AND_ON_CHANGE("s.rnsd.path.request_tags_max", {
-        RNS::Transport::max_pr_tags(storageGetInt(key, 32));
+        RNS::Transport::max_pr_tags(storageGetInt(key, 256));
     });
     /* Path-entry TTLs, seconds. */
     NOW_AND_ON_CHANGE("s.rnsd.path.ttl", {

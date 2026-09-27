@@ -149,6 +149,7 @@ static uint16_t s_guard_slots = 0;
 static uint16_t s_dir_slots   = 0;
 static uint16_t s_blob_slots  = 0;
 static uint16_t s_blob_slot_sz = RDIR_BLOB_SLOT_DEF;
+static uint8_t  s_blob_units   = RDIR_UNIT_BLOBS;
 
 static rdir_stats_t s_stats;
 static uint32_t s_generation = 0;
@@ -1040,6 +1041,18 @@ void rdirSetBlobSlotSize(size_t bytes) {
     s_blob_slot_sz = (uint16_t)((bytes + 3) & ~(size_t)3);
 }
 
+void rdirSetBlobUnits(uint8_t units) {
+    if (s_ready) return;
+    if (units < 1) units = 1;
+    if (units > RDIR_UNIT_DIRS) units = RDIR_UNIT_DIRS;
+    s_blob_units = units;
+}
+
+size_t rdirBudgetUnit(void) {
+    return RDIR_UNIT_GUARDS * RDIR_GUARD_SLOT_SZ + RDIR_UNIT_DIRS * RDIR_DIR_SLOT_SZ
+         + (size_t)s_blob_units * s_blob_slot_sz;
+}
+
 bool rdirInit(const rdir_platform_t* platform, size_t byte_budget) {
     if (s_ready) return true;
     if (!platform || !platform->arena_alloc) return false;
@@ -1048,17 +1061,16 @@ bool rdirInit(const rdir_platform_t* platform, size_t byte_budget) {
 
     /* Slot counts come from a byte budget, never from constants: constants
      * tuned on an 8 MB board and inherited by a 2 MB one are the defect this
-     * design exists to prevent. The split is a fixed 8:4:2 proportion of slot
-     * counts (guard : directory : blob), the one RDIR_BUDGET_UNIT prices. */
-    size_t unit_bytes = RDIR_UNIT_GUARDS * RDIR_GUARD_SLOT_SZ + RDIR_UNIT_DIRS * RDIR_DIR_SLOT_SZ
-                      + RDIR_UNIT_BLOBS * (size_t)s_blob_slot_sz;
-    size_t units = byte_budget / unit_bytes;
+     * design exists to prevent. The split is a fixed proportion of slot
+     * counts (guard : directory : blob, 8:4:2 unless rdirSetBlobUnits), the
+     * one rdirBudgetUnit() prices. */
+    size_t units = byte_budget / rdirBudgetUnit();
     if (units < 4) units = 4;
     if (units > 2048) units = 2048;
 
     s_guard_slots = (uint16_t)(units * RDIR_UNIT_GUARDS);
     s_dir_slots   = (uint16_t)(units * RDIR_UNIT_DIRS);
-    s_blob_slots  = (uint16_t)(units * RDIR_UNIT_BLOBS);
+    s_blob_slots  = (uint16_t)(units * s_blob_units);
 
     /* One extra header's worth of slack: the image is read into the arena and
      * then slid to the back, and an image whose pools exactly match ours is
