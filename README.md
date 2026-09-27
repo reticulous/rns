@@ -104,7 +104,10 @@ deregisters the interface.
 
 Each `RNSD_PORT_IFACE` connection is a bounded ITS packet link: an interface's
 `itsSend` into rnsd (and rnsd's back out) blocks only up to 100 ms, then drops
-the packet and logs `ITS send dropped`. Two things cause the inbox to back up
+the packet and logs `ITS send dropped`. Out of rnsd, an interface that refused a
+send is treated as still full for the next second: sends to it in that window
+drop at once instead of each waiting its 100 ms, so a burst toward a full radio
+cannot park the rnsd task. Two things cause the inbox to back up
 past that window under load, and each has a knob:
 
 - **The rnsd task is single-threaded** and runs `Transport::jobs()` — an

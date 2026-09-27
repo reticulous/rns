@@ -138,6 +138,7 @@ protected:
     void send_outgoing(const RNS::Bytes& data) override;
 private:
     int _handle;
+    uint32_t _fullUntilMs = 0;   /* a send just timed out: don't wait again until */
 };
 
 struct iface_t {
@@ -537,11 +538,19 @@ static void logWire(const char* iface, const char* dir, const uint8_t* p, size_t
 void TaskInterface::send_outgoing(const RNS::Bytes& data)
 {
     if (_handle < 0) return;
-    size_t s = itsSend(_handle, data.data(), data.size(), pdMS_TO_TICKS(100));
+    /* An interface that refused a send within the last second is still full:
+     * a burst toward it drops at once rather than parking this task 100 ms a
+     * packet — through an announce burst that would hold rnsd for a second
+     * and overflow its own inbound. */
+    uint32_t now = millis();
+    bool full = (int32_t)(_fullUntilMs - now) > 0;
+    size_t s = itsSend(_handle, data.data(), data.size(), full ? 0 : pdMS_TO_TICKS(100));
     if (s == 0) {
+        if (!full) _fullUntilMs = now + 1000;
         warn("iface %s: ITS send dropped (%zu B)", _name.c_str(), data.size());
         return;
     }
+    _fullUntilMs = 0;
     logWire(_name.c_str(), "tx", data.data(), data.size());
     _txb += data.size();
     if (iface_t* i = ifaceFindByHandle(_handle)) {
