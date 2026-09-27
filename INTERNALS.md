@@ -749,9 +749,13 @@ sits.
 - **Suppression.** `repeat_heard` is called from the path-request handler's
   duplicate-tag branch: a repeat from a node whose distance is no greater than
   ours cancels ours. `repeats_cancel` runs on every validated announce, since
-  any announce for the destination answers the question, and a path response
-  heard on the medium ours was queued for drops ours while it is still inside
-  its grace — every holder of the destination answers the same question.
+  any announce for the destination answers the question, and on every other
+  accepted packet addressed to the destination — a link request or a data
+  packet to it means a route exists on the asker's side, and when the answer
+  came by a relay hidden from this node, the asker's first packet is the only
+  sign of it this node gets. A path response heard on the medium ours was
+  queued for drops ours while it is still inside its grace — every holder of
+  the destination answers the same question.
 - **A relay keeps the answer it is waiting for.** An unanswered discovery entry
   makes an arriving path response bypass the replay guard (a relay answering
   from its store sends a blob this node may already have heard) and count for

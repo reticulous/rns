@@ -365,9 +365,10 @@ request names as its transport address — the node identity, which is why a
 node has one identity rather than two — and an asker that declared nothing (a
 stock node) counts as infinitely far. The relay waits a second per hop of its
 own distance plus a little, and drops its repeat if in that time it hears the
-answer or a repeat of the same question from a node no further out than
-itself; so the relay nearest a gateway speaks first and the question takes one
-path downhill. A gateway does what it always did with a question from its
+answer, a repeat of the same question from a node no further out than itself,
+or anybody already talking to the destination (the answer came by a relay this
+one cannot hear, and the asker's first packet is the only sign of it); so the
+relay nearest a gateway speaks first and the question takes one path downhill. A gateway does what it always did with a question from its
 community: it asks its uplink.
 
 **Inbound: a gateway answers for what it stores.** A question arriving over an

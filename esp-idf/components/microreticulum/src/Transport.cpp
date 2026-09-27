@@ -1932,6 +1932,12 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 		bool for_local_client = false;
 		bool for_local_client_link = false;
 		if (packet.packet_type() != Type::Packet::ANNOUNCE) {
+			/* Somebody in earshot is already talking to this destination, so
+			 * a route to it exists on the asker's side of us. The answer that
+			 * produced it may have come from a relay hidden from us, in which
+			 * case this is the only sign of it we will get; a repeat still
+			 * waiting to carry the question on is moot. */
+			repeats_cancel(packet.destination_hash(), "traffic for it heard");
 			rdir_route_t route;
 			if (rdirPeekRoute(packet.destination_hash().data(), &route) && route.hops == 0) {
 				// Destined for a local destination
@@ -2247,7 +2253,7 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 				TRACE("Transport::inbound: Packet is announce for non-local destination, processing...");
 				/* Any announce for a destination is the answer to a question about
 				 * it; a repeat still waiting to carry that question on is moot. */
-				repeats_cancel(packet.destination_hash());
+				repeats_cancel(packet.destination_hash(), "answer heard");
 				/* Heard on a shared radio with a signal level: how early in the
 				 * rebroadcast window this node's repeat goes. Negative when the
 				 * rebroadcast keeps upstream's short random delay. */
@@ -3870,7 +3876,9 @@ will announce it.
 	}
 
 	packet.send();
-	_path_requests[destination_hash] = OS::time();
+	/* Only a question this node asked (it made the tag) marks the answer as
+	 * requested; one carried on for somebody else is the discovery table's. */
+	if (!tag) _path_requests[destination_hash] = OS::time();
 }
 
 /* Spangap deviation: cheapest-first discovery, with escalation.
@@ -4111,13 +4119,13 @@ static inline bool announce_rec_timed(const Transport::AnnounceRec& r) {
 	}
 }
 
-/*static*/ void Transport::repeats_cancel(const Bytes& destination_hash) {
+/*static*/ void Transport::repeats_cancel(const Bytes& destination_hash, const char* why) {
 	if (destination_hash.size() != Type::Reticulum::DESTINATION_LENGTH) return;
 	for (uint16_t i = 0; i < PENDING_REPEATS_MAX; i++) {
 		PendingRepeat& r = _repeats[i];
 		if (!r.used) continue;
 		if (memcmp(r.dest, destination_hash.data(), Type::Reticulum::DESTINATION_LENGTH) != 0) continue;
-		DEBUGF("path request %s: answer heard, repeat dropped", destination_hash.toHex().c_str());
+		DEBUGF("path request %s: %s, repeat dropped", destination_hash.toHex().c_str(), why);
 		r.used = false;
 	}
 }

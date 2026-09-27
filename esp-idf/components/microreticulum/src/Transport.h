@@ -484,7 +484,7 @@ namespace RNS {
 		                            const Bytes& asker);
 		static void repeat_heard(const Bytes& destination_hash, const Bytes& tag,
 		                         const Bytes& sender_transport_id);
-		static void repeats_cancel(const Bytes& destination_hash);
+		static void repeats_cancel(const Bytes& destination_hash, const char* why);
 
 		/* Deadline work that cannot wait for jobs(): due path responses, due
 		 * first rebroadcasts of announces heard on a radio, and due repeats.
