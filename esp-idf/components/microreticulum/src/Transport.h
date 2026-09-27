@@ -332,20 +332,15 @@ namespace RNS {
 		};
 		using TunnelTable = std::map<Bytes, TunnelEntry>;
 
-		class RateEntry {
-		public:
-			RateEntry(double now) :
-				_last(now)
-			{
-				_timestamps.push_back(now);
-			}
-		public:
-			double _last = 0.0;
-			double _rate_violations = 0.0;
-			double _blocked_until = 0.0;
-			std::vector<double> _timestamps;
+		/* Per-destination announce rate (upstream announce_rate_table), one
+		 * fixed slot each in a table allocated once at start(). */
+		struct AnnounceRateRec {
+			uint8_t  dest[Type::Reticulum::DESTINATION_LENGTH];
+			uint32_t last;            /* last announce let through, OS::time() s */
+			uint32_t blocked_until;
+			uint16_t violations;
+			bool     used;
 		};
-		using RateTable = std::map<Bytes, RateEntry>;
 
 	public:
 		static void start(const Reticulum& reticulum_instance);
@@ -441,6 +436,12 @@ namespace RNS {
 		 * keeps it at the per-second cadence the timers are checked at. */
 		static bool handshake_repairs_pending();
 		static inline uint32_t link_repairs_sent() { return _link_repairs_sent; }
+		/* Rebroadcasts withheld because the destination announces faster than
+		 * the receiving interface's rate target allows. */
+		static inline uint32_t announce_rate_blocks() { return _announce_rate_blocks; }
+		/* Forwarded announces dropped because an interface's cap queue was full. */
+		static inline uint32_t announce_queue_drops() { return _announce_queue_drops; }
+		static bool announce_rate_blocked(const Bytes& destination_hash, const Interface& interface, double now);
 		/* The destination itself authored a packet we just took in; stamps
 		 * its directory record (rdirMarkAlive). */
 		static void mark_alive(const Bytes& destination_hash);
@@ -604,7 +605,6 @@ namespace RNS {
 		static inline void identity(Identity& identity) { _identity = identity; }
 
 		inline static const PathTable& get_path_table() { return _path_table; }
-		inline static const RateTable& get_announce_rate_table() { return _announce_rate_table; }
 		inline static const LinkTable& get_link_table() { return _link_table; }
 
 		// Spangap: size getters for the Link-state tables, used by rnsd's
@@ -672,7 +672,9 @@ namespace RNS {
 		static uint32_t _link_repairs_sent;
 		static uint32_t _link_repairs_helped;
 		static TunnelTable _tunnels;			// A table storing tunnels to other transport instances
-		static RateTable _announce_rate_table;	// A table for keeping track of announce rates
+		static AnnounceRateRec* _announce_rates;	// Announce rate per destination, ANNOUNCE_RATE_TABLE_MAX slots
+		static uint32_t _announce_rate_blocks;
+		static uint32_t _announce_queue_drops;
 		static std::set<HAnnounceHandler> _announce_handlers;	// A table storing externally registered announce handlers
 		static std::map<Bytes, double> _path_requests;	// A table for storing path request timestamps
 

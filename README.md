@@ -701,6 +701,8 @@ telemetry are published under `rnsd.*` and `rns.ready` for anything to observe.
 | `rnsd.stats.{packets_in,packets_out,bytes_in,bytes_out,ifaces_up}` | Traffic counters. |
 | `rnsd.stats.dir.{entries,blobs,guards}` | Directory pool occupancy. |
 | `rnsd.stats.dir.{guard_drops,evictions,recall_miss,seq_retries}` | Announces suppressed as replays, records evicted, public keys asked for and not held, and reader/writer races on a record. |
+| `rnsd.stats.announce.rate_blocked` | Announce rebroadcasts withheld by the per-destination rate limit: a destination announcing faster than its interface's rate target, past the grace, is stored but not relayed. |
+| `rnsd.stats.announce.queue_drops` | Announces dropped because an interface's announce queue was full. |
 | `rnsd.dir.{slots,bytes}` | Directory pool capacity and record pool size, published once at boot. |
 | `rnsd.gw.{rssi,snr,timestamp}` | Gateway/infrastructure signal — the received quality (rssi dBm, snr dB) of the transport node that last relayed a packet to us: the last packet addressed to one of our destinations/links that arrived on a signal-capable interface with more than one hop. `timestamp` is device unix-seconds of that sample (UIs fade the indicator out over ~30 min from it). Kept as the last qualifying sample; not cleared on a direct packet. |
 | `rnsd.links.<tag>.{state,direction,aspect,remote_hash,opened_s,last_error,…}` | Per-link state tree, keyed by the caller's `tag` — observable before the link_id exists. |

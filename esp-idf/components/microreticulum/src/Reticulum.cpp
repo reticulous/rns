@@ -459,24 +459,6 @@ const PathTable& Reticulum::get_path_table() const {
 	return Transport::get_path_table();
 }
 
-const std::map<Bytes, Transport::RateEntry>& Reticulum::get_rate_table() const {
-/*
-	rate_table = []
-	for dst_hash in Transport::announce_rate_table:
-		entry = {
-			"hash": dst_hash,
-			"last": Transport::announce_rate_table[dst_hash]["last"],
-			"rate_violations": Transport::announce_rate_table[dst_hash]["rate_violations"],
-			"blocked_until": Transport::announce_rate_table[dst_hash]["blocked_until"],
-			"timestamps": Transport::announce_rate_table[dst_hash]["timestamps"],
-		}
-		rate_table.append(entry)
-
-	return rate_table
-*/
-	return Transport::get_announce_rate_table();
-}
-
 bool Reticulum::drop_path(const Bytes& destination) {
 	return Transport::expire_path(destination);
 }

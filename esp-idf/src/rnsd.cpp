@@ -3581,6 +3581,10 @@ static void publishStats(void)
                (int)(RNS::Transport::link_repairs_sent() & 0x7fffffff));
     storageSet("rnsd.stats.link.repairs_helped",
                (int)(RNS::Transport::link_repairs_helped() & 0x7fffffff));
+    storageSet("rnsd.stats.announce.rate_blocked",
+               (int)(RNS::Transport::announce_rate_blocks() & 0x7fffffff));
+    storageSet("rnsd.stats.announce.queue_drops",
+               (int)(RNS::Transport::announce_queue_drops() & 0x7fffffff));
     int activeIfaces = 0;
     for (int j = 0; j < RNSD_MAX_IFACES; j++) {
         auto& i = s_ifaces[j];
@@ -4292,6 +4296,9 @@ static void rnstatusPrintTotals(void)
     cliPrintf("Link repairs %lu sent, %lu helped\n",
               (unsigned long)RNS::Transport::link_repairs_sent(),
               (unsigned long)RNS::Transport::link_repairs_helped());
+    cliPrintf("Announces    %lu relays withheld by rate, %lu dropped from full queues\n",
+              (unsigned long)RNS::Transport::announce_rate_blocks(),
+              (unsigned long)RNS::Transport::announce_queue_drops());
 }
 
 static void rnstatusJson(const std::string& filter)
@@ -4336,6 +4343,10 @@ static void rnstatusJson(const std::string& filter)
                             (double)RNS::Transport::link_repairs_sent());
     cJSON_AddNumberToObject(st, "link_repairs_helped",
                             (double)RNS::Transport::link_repairs_helped());
+    cJSON_AddNumberToObject(st, "announce_rate_blocked",
+                            (double)RNS::Transport::announce_rate_blocks());
+    cJSON_AddNumberToObject(st, "announce_queue_drops",
+                            (double)RNS::Transport::announce_queue_drops());
     cJSON_AddItemToObject(root, "stats", st);
 
     char* text = cJSON_PrintUnformatted(root);

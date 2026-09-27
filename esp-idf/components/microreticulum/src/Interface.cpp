@@ -132,7 +132,7 @@ void Interface::process_announce_queue() {
 
 		DEBUGF("Emitting held announce on %s, %lu still queued",
 			toString().c_str(), (unsigned long)_impl->_announce_queue.size());
-		send_outgoing(raw);
+		Transport::transmit(*this, raw);
 	}
 	catch (const std::exception& e) {
 		_impl->_announce_queue.clear();

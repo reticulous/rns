@@ -115,7 +115,9 @@ using namespace RNS::Persistence;
 /*static*/ uint32_t Transport::_link_repairs_helped = 0;
 /*static*/ std::set<HAnnounceHandler> Transport::_announce_handlers;
 /*static*/ std::map<Bytes, Transport::TunnelEntry> Transport::_tunnels;
-/*static*/ std::map<Bytes, Transport::RateEntry> Transport::_announce_rate_table;
+/*static*/ Transport::AnnounceRateRec* Transport::_announce_rates = nullptr;
+/*static*/ uint32_t Transport::_announce_rate_blocks = 0;
+/*static*/ uint32_t Transport::_announce_queue_drops = 0;
 /*static*/ std::map<Bytes, double> Transport::_path_requests;
 
 /*static*/ std::map<Bytes, Transport::PathRequestEntry> Transport::_discovery_path_requests;
@@ -290,6 +292,13 @@ AnnounceHandler::AnnounceHandler(const char* aspect_filter /*= nullptr*/) {
 			memset(_announce_ring, 0, (size_t)_announce_slots * sizeof(AnnounceRec));
 			VERBOSEF("Announce queue: %u slots x %u B", (unsigned)_announce_slots, (unsigned)sizeof(AnnounceRec));
 		}
+	}
+	if (!_announce_rates) {
+		_announce_rates = new (std::nothrow) AnnounceRateRec[Type::Transport::ANNOUNCE_RATE_TABLE_MAX];
+		if (_announce_rates)
+			memset(_announce_rates, 0, sizeof(AnnounceRateRec) * Type::Transport::ANNOUNCE_RATE_TABLE_MAX);
+		else
+			ERRORF("Could not allocate the %u-slot announce rate table", (unsigned)Type::Transport::ANNOUNCE_RATE_TABLE_MAX);
 	}
 
 	// Create transport-specific destination for path request
@@ -1440,7 +1449,8 @@ static const Bytes& ifac_salt() {
 										}
 									}
 									else {
-										//p pass
+										++_announce_queue_drops;
+										DBGF_DEMOTE("Announce queue on %s full, announce for %s dropped", interface.toString().c_str(), packet.destination_hash().toHex().c_str());
 									}
 								}
 							}
@@ -2447,43 +2457,12 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 					if (fresh || retain) {
 						double now = OS::time();
 
-						bool rate_blocked = false;
-
-// TODO
-/*p
-						if packet.context != RNS.Packet.PATH_RESPONSE and packet.receiving_interface.announce_rate_target != None:
-							if not packet.destination_hash in Transport.announce_rate_table:
-								rate_entry = { "last": now, "rate_violations": 0, "blocked_until": 0, "timestamps": [now]}
-								Transport.announce_rate_table[packet.destination_hash] = rate_entry
-
-							else:
-								rate_entry = Transport.announce_rate_table[packet.destination_hash]
-								rate_entry["timestamps"].append(now)
-
-								while len(rate_entry["timestamps"]) > Transport.MAX_RATE_TIMESTAMPS:
-									rate_entry["timestamps"].pop(0)
-
-								current_rate = now - rate_entry["last"]
-
-								if now > rate_entry["blocked_until"]:
-
-									if current_rate < packet.receiving_interface.announce_rate_target:
-										rate_entry["rate_violations"] += 1
-
-									else:
-										rate_entry["rate_violations"] = std::max(0, rate_entry["rate_violations"]-1)
-
-									if rate_entry["rate_violations"] > packet.receiving_interface.announce_rate_grace:
-										rate_target = packet.receiving_interface.announce_rate_target
-										rate_penalty = packet.receiving_interface.announce_rate_penalty
-										rate_entry["blocked_until"] = rate_entry["last"] + rate_target + rate_penalty
-										rate_blocked = True
-									else:
-										rate_entry["last"] = now
-
-								else:
-									rate_blocked = True
-*/
+						/* Counted per new emission: a copy of one already heard
+						 * is not the destination announcing again. */
+						bool rate_blocked = fresh &&
+						                    packet.context() != Type::Packet::PATH_RESPONSE &&
+						                    announce_rate_blocked(packet.destination_hash(),
+						                                          packet.receiving_interface(), now);
 
 						uint8_t retries = 0;
 						uint8_t announce_hops = packet.hops();
@@ -2506,6 +2485,7 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 							// Insert announce into announce table for retransmission
 
 							if (rate_blocked) {
+								++_announce_rate_blocks;
 								DBGF_DEMOTE("Blocking rebroadcast of announce from %s due to excessive announce rate", packet.destination_hash().toHex().c_str());
 							}
 							/* Nothing could carry a re-broadcast — don't take a
@@ -4128,6 +4108,50 @@ static inline bool announce_rec_timed(const Transport::AnnounceRec& r) {
 		DEBUGF("path request %s: %s, repeat dropped", destination_hash.toHex().c_str(), why);
 		r.used = false;
 	}
+}
+
+/* Upstream's announce rate rule, over a fixed table. A full table gives up the
+ * slot of a destination in good standing, the one heard longest ago, before
+ * that of one with violations on record. */
+/*static*/ bool Transport::announce_rate_blocked(const Bytes& destination_hash, const Interface& interface, double now_s) {
+	if (!_announce_rates || !interface || interface.announce_rate_target() == 0) return false;
+	if (destination_hash.size() != Type::Reticulum::DESTINATION_LENGTH) return false;
+	const uint32_t now = (uint32_t)now_s;
+	AnnounceRateRec* rec = nullptr;
+	AnnounceRateRec* victim = nullptr;
+	for (uint16_t i = 0; i < Type::Transport::ANNOUNCE_RATE_TABLE_MAX; i++) {
+		AnnounceRateRec& r = _announce_rates[i];
+		if (r.used && memcmp(r.dest, destination_hash.data(), Type::Reticulum::DESTINATION_LENGTH) == 0) {
+			rec = &r;
+			break;
+		}
+		if (!r.used) {
+			if (!victim || victim->used) victim = &r;
+			continue;
+		}
+		if (!victim) { victim = &r; continue; }
+		if (!victim->used) continue;
+		bool r_bad = r.violations > 0 || r.blocked_until > now;
+		bool v_bad = victim->violations > 0 || victim->blocked_until > now;
+		if ((v_bad && !r_bad) || (v_bad == r_bad && r.last < victim->last)) victim = &r;
+	}
+	if (!rec) {
+		if (!victim) return false;
+		memset(victim, 0, sizeof(*victim));
+		memcpy(victim->dest, destination_hash.data(), Type::Reticulum::DESTINATION_LENGTH);
+		victim->last = now;
+		victim->used = true;
+		return false;
+	}
+	if (now <= rec->blocked_until) return true;
+	if (now - rec->last < interface.announce_rate_target()) rec->violations++;
+	else if (rec->violations > 0) rec->violations--;
+	if (rec->violations > interface.announce_rate_grace()) {
+		rec->blocked_until = rec->last + interface.announce_rate_target() + interface.announce_rate_penalty();
+		return true;
+	}
+	rec->last = now;
+	return false;
 }
 
 /*static*/ double Transport::next_timer() {

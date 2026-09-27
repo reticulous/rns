@@ -118,6 +118,10 @@ namespace RNS {
 		bool _FIXED_MTU = false;
 		double _announce_allowed_at = 0;
 		float _announce_cap = 0.0;
+		// Announce rate limit for destinations heard here (0 target = none).
+		uint32_t _announce_rate_target  = Type::Transport::ANNOUNCE_RATE_TARGET;
+		uint8_t  _announce_rate_grace   = Type::Transport::ANNOUNCE_RATE_GRACE;
+		uint32_t _announce_rate_penalty = Type::Transport::ANNOUNCE_RATE_PENALTY;
 		// True for links with no hidden-node problem — a single peer (TCP) or a
 		// fully-connected medium (switched LAN) where every peer hears every
 		// other. Forwarded announces are then not echoed back
@@ -259,6 +263,9 @@ namespace RNS {
 		inline bool FIXED_MTU() const { assert(_impl); return _impl->_FIXED_MTU; }
 		inline double announce_allowed_at() const { assert(_impl); return _impl->_announce_allowed_at; }
 		inline float announce_cap() const { assert(_impl); return _impl->_announce_cap; }
+		inline uint32_t announce_rate_target() const { assert(_impl); return _impl->_announce_rate_target; }
+		inline uint8_t announce_rate_grace() const { assert(_impl); return _impl->_announce_rate_grace; }
+		inline uint32_t announce_rate_penalty() const { assert(_impl); return _impl->_announce_rate_penalty; }
 		inline bool point_to_point() const { assert(_impl); return _impl->_point_to_point; }
 		inline size_t rxb() const { assert(_impl); return _impl->_rxb; }
 		inline size_t txb() const { assert(_impl); return _impl->_txb; }

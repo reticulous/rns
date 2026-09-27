@@ -29,8 +29,8 @@
 #define RNS_RECEIPTS_MAX 20
 #endif
 
-#ifndef RNS_RATE_TIMESTAMPS_MAX
-#define RNS_RATE_TIMESTAMPS_MAX 16
+#ifndef RNS_ANNOUNCE_RATE_TABLE_MAX
+#define RNS_ANNOUNCE_RATE_TABLE_MAX 128
 #endif
 
 #ifndef RNS_RANDOM_BLOBS_PERSIST_MAX
@@ -117,7 +117,7 @@ namespace RNS { namespace Type {
 		static const bool LINK_MTU_DISCOVERY   = false;
 
 		static const uint16_t MAX_QUEUED_ANNOUNCES = RNS_QUEUED_ANNOUNCES_MAX;
-		static const uint32_t QUEUED_ANNOUNCE_LIFE = 60*60*24;
+		static const uint32_t QUEUED_ANNOUNCE_LIFE = 60*60*3;
 
 		static const uint8_t ANNOUNCE_CAP = 2;
 		/*
@@ -509,7 +509,16 @@ namespace RNS { namespace Type {
 		static const uint16_t REVERSE_TIMEOUT      = 8*60;        // Reverse table entries are removed after 8 minutes
 		// CBA MCU
 		static const uint16_t MAX_RECEIPTS         = RNS_RECEIPTS_MAX; // Maximum number of receipts to keep track of
-		static const uint8_t MAX_RATE_TIMESTAMPS   = RNS_RATE_TIMESTAMPS_MAX; // Maximum number of announce timestamps to keep per destination
+		// Per-destination announce rate limit (upstream announce_rate_target /
+		// _grace / _penalty), the default on every interface. A destination
+		// announcing faster than once per target for more than grace announces
+		// running has its rebroadcasts withheld until target + penalty after the
+		// last one let through; storage is unaffected. The target sits under the
+		// 30-minute LoRa announce interval so a node on its tick is never held.
+		static const uint32_t ANNOUNCE_RATE_TARGET    = 15*60;
+		static const uint8_t  ANNOUNCE_RATE_GRACE     = 5;
+		static const uint32_t ANNOUNCE_RATE_PENALTY   = 0;
+		static const uint16_t ANNOUNCE_RATE_TABLE_MAX = RNS_ANNOUNCE_RATE_TABLE_MAX; // destinations tracked
 		static const uint8_t PERSIST_RANDOM_BLOBS  = RNS_RANDOM_BLOBS_PERSIST_MAX; // Maximum number of random blobs per destination to persist to disk
 		static const uint8_t MAX_RANDOM_BLOBS      = RNS_RANDOM_BLOBS_MAX; // Maximum number of random blobs per destination to keep in memory
 
