@@ -970,8 +970,8 @@ void Link::start_watchdog() {
 // enforced by Transport::jobs' half-open reap, so this covers only the
 // steady-state phases:
 //
-//   - The initiator sends a keepalive (0xFF) once no inbound traffic has
-//     been seen for KEEPALIVE seconds; the responder answers with 0xFE
+//   - The initiator sends a keepalive (0xFF) once nothing has been received,
+//     or nothing sent, for KEEPALIVE seconds; the responder answers with 0xFE
 //     (Link::receive), refreshing the initiator's _last_inbound. The
 //     responder never originates keepalives — it only watches for silence.
 //   - Either side that sees no inbound for STALE_TIME marks the link STALE
@@ -986,7 +986,8 @@ void Link::link_watchdog() {
 		double last_inbound = std::max(std::max(_object->_last_inbound, _object->_last_proof),
 		                               _object->_activated_at);
 
-		if (now >= last_inbound + _object->_keepalive) {
+		if (now >= last_inbound + _object->_keepalive ||
+		    now >= _object->_last_outbound + _object->_keepalive) {
 			// A silent peer never advances _last_inbound and an outbound
 			// keepalive does not refresh our own inbound clock, so gate on
 			// _last_keepalive to emit at most one keepalive per interval.
@@ -2170,6 +2171,11 @@ uint16_t Link::mtu() const {
 Type::Link::status Link::status() const {
 	assert(_object);
 	return _object->_status;
+}
+
+uint16_t Link::keepalive() const {
+	assert(_object);
+	return _object->_keepalive;
 }
 
 double Link::establishment_timeout() const {

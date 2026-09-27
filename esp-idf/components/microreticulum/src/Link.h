@@ -286,6 +286,7 @@ namespace RNS {
 		const Bytes& hash() const;
 		uint16_t mtu() const;
 		Type::Link::status status() const;
+		uint16_t keepalive() const;
 		double establishment_timeout() const;
 		uint16_t establishment_cost() const;
 		/* How far away the destination was when this link was requested. The

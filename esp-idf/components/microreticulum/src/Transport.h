@@ -614,6 +614,17 @@ namespace RNS {
 		// leak-detection use case.
 		inline static size_t pending_links_count() { return _pending_links.size(); }
 		inline static size_t active_links_count()  { return _active_links.size(); }
+		/* Shortest keepalive among established links, 0 with none: jobs(),
+		 * which sends the keepalives, has to run well inside it. */
+		inline static uint16_t min_active_keepalive() {
+			uint16_t ka = 0;
+			for (const Link& link : _active_links) {
+				Type::Link::status st = link.status();
+				if (st != Type::Link::ACTIVE && st != Type::Link::STALE) continue;
+				if (ka == 0 || link.keepalive() < ka) ka = link.keepalive();
+			}
+			return ka;
+		}
 
 		// Spangap: table-size + stat getters for the `rnsd memory` breakdown.
 		inline static size_t path_table_size()     { return rdirCount(); }

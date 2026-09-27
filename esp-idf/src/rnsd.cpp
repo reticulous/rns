@@ -8886,12 +8886,14 @@ static void rnsdTaskMain(void*)
             /* Did anything happen this tick that needs the fast floor? Real
              * packet flow (dinTick) or a link still establishing (pending) —
              * both want prompt jobs() servicing. An *established, idle* link does
-             * NOT: link keepalive is RTT-derived and clamped to 120–360 s
-             * (Type::Link::KEEPALIVE_MIN/MAX), and stale/timeout detection is
-             * likewise minute-scale, so a 60 s housekeeping tick oversamples them
-             * by 2–6×. Pinning the floor on mere link *existence* meant a single
-             * open link — an idle rnsh session, a telemetry subscriber — held the
-             * whole device at 1 Hz for nothing. Resource transfers stay fast
+             * NOT: link keepalive is RTT-derived and clamped to 5–360 s
+             * (Type::Link::KEEPALIVE_MIN/MAX), so the backed-off cadence is
+             * capped at a quarter of the shortest live keepalive (below) —
+             * jobs() runs every other block, so a keepalive goes out within
+             * half an interval of falling due — rather than pinned to the floor.
+             * Pinning the floor on mere link *existence* would hold the whole
+             * device at 1 Hz for an idle rnsh session over a slow radio whose
+             * keepalive is minutes. Resource transfers stay fast
              * without the pin: their parts are packets, so dinTick keeps the tick
              * at the floor while data moves, and every inbound part snaps it back
              * via wakeForPkt above.
@@ -8977,6 +8979,9 @@ static void rnsdTaskMain(void*)
                 uint32_t next = s_tickPeriodMs * 2;
                 s_tickPeriodMs = next > s_tickMaxMs ? s_tickMaxMs : next;
             }
+            uint32_t kaCapMs = (uint32_t)RNS::Transport::min_active_keepalive() * 250;
+            if (kaCapMs != 0 && s_tickPeriodMs > kaCapMs)
+                s_tickPeriodMs = kaCapMs < s_tickMinMs ? s_tickMinMs : kaCapMs;
         }
     }
 }
