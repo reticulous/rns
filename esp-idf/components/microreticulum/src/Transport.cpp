@@ -2283,6 +2283,7 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 					Bytes ih = packet.receiving_interface().get_hash();
 					if (mine && (mine->flags & ANNOUNCE_F_BLOCK) &&
 					    mine->retries == Type::Transport::PATHFINDER_R &&
+					    packet.hops() <= mine->hops + 1 &&
 					    ih.size() >= Type::Reticulum::DESTINATION_LENGTH &&
 					    (!(mine->flags & ANNOUNCE_F_ATTACHED) ||
 					     memcmp(mine->attached_iface, ih.data(), Type::Reticulum::DESTINATION_LENGTH) == 0)) {
@@ -2402,7 +2403,18 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 					bool relay_waiting =
 						packet.context() == Type::Packet::PATH_RESPONSE &&
 						relayed != _discovery_path_requests.end() && !relayed->second._answered;
-					bool bypass = (requested || relay_waiting) && (!have_known || packet.hops() <= known.hops);
+					bool shorter = have_known && packet.hops() < known.hops;
+					if (shorter) {
+						uint8_t held_raw[Type::Reticulum::MTU];
+						size_t held_n = rdirCopyBlob(packet.destination_hash().data(), held_raw, sizeof(held_raw));
+						if (held_n > 0) {
+							Packet held(Bytes(held_raw, held_n));
+							if (held.unpack() && announce_emitted < Transport::announce_emitted(held))
+								shorter = false;
+						}
+					}
+					bool bypass = (shorter && packet.context() == Type::Packet::PATH_RESPONSE) ||
+						((requested || relay_waiting) && (!have_known || packet.hops() <= known.hops));
 
 					/* A new emission — not a relay's cached copy of one we had —
 					 * is the destination itself speaking, which is what its
@@ -2446,8 +2458,8 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 					 * custody is what lets it answer path requests for the
 					 * members. Beyond the radius (a leak from another gateway,
 					 * the uplink's firehose) nothing is stored unrequested. */
-					retain = route_better && (fresh || !have_record) &&
-					         (requested || relay_waiting ||
+					retain = route_better && (fresh || !have_record || shorter) &&
+					         (requested || relay_waiting || shorter ||
 					          packet.hops() == 1 ||
 					          (packet.receiving_interface() &&
 					           packet.hops() <= packet.receiving_interface().community_radius()) ||
@@ -4381,9 +4393,13 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 				if (is_from_local_client) {
 					retransmit_timeout = now;
 				}
+				else if (attached_interface && !attached_interface.point_to_point()) {
+					double tier = announce_radio_window(attached_interface, announce_packet.data().size()) / 2.0;
+					double rank = (route.hops > 0 ? (double)(route.hops - 1) : 0.0) + Cryptography::random();
+					retransmit_timeout = now + Type::Transport::PATH_REQUEST_GRACE + tier * rank;
+				}
 				else {
-					// TODO: Look at this timing
-					retransmit_timeout = now + Type::Transport::PATH_REQUEST_GRACE /*+ (RNS.rand() * Transport.PATHFINDER_RW)*/;
+					retransmit_timeout = now + Type::Transport::PATH_REQUEST_GRACE;
 				}
 
 				// This handles an edge case where a peer sends a path request

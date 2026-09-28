@@ -1768,6 +1768,13 @@ per destination.
 
 ## 8. Maintainer pitfalls
 
+- **The neighbourhood holds 32 nodes.** `RNSD_NODES_MAX` is 32 because the
+  publisher tracks node slots in the 32-bit mask `s_pubNodes`. On plain LoRa a
+  neighbour takes two rows, and the LoRa neighbour table declares up to 128
+  rows, so a station hearing more than 16 neighbours logs `peers: node table
+  full (32)` and leaves the rest out of its neighbourhood, and one of those
+  leaving drops no routes. Lifting it takes a wider mask and table, or folding
+  a node's two identities into one row without a SUPE announcement.
 - **Run Transport-touching code on the rnsd task.** `request_path`, link
   construction, destination registration off-task silently no-op (the outbound
   packet is dropped). Defer via ITS or a `rnsd.cmd.*` command key.

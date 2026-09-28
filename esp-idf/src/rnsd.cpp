@@ -8491,7 +8491,9 @@ static void rnsdTaskMain(void*)
      * in itsPoll rather than spinning; the write that sets the password wakes us,
      * and we re-check. Dependent ifaces/clients wait on rns.ready with their own
      * ~120 s budget, so a password set during setup brings the whole stack up
-     * without a reboot; set later, a reboot is needed. */
+     * without a reboot; set later, a reboot is needed. A build with no
+     * credentials (CONFIG_SPANGAP_AUTH_OPEN) has no realm unset, and starts at
+     * once. */
     if (authRealmUnset("admin")) {
         warn("[%s] no device password set — Reticulum held until one is set "
              "(auth passwd admin <pw>)", TAG);
