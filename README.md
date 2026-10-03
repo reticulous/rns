@@ -387,9 +387,15 @@ keeping the route itself, since the asker's traffic will come through it — but
 not an answer it heard from the node that brought it the question, which is
 already on the asker's side. Every node holding the destination answers, so a
 node that hears another's answer on its own medium before its own has gone out
-drops its own. A path response is sent after upstream's short grace without
-waiting for the announce queue, and is not held back by the service radius: it
-is an answer to somebody who asked, not an announce spreading.
+drops its own. On a shared medium the answers are ordered so that this happens:
+each holder waits upstream's short grace, then half an announce's radio window
+for every hop of its route beyond the first, so holders nearer the destination
+go first, then a random moment within sixteen airtimes of the answer (at most
+half the asker's 15 s), so that among holders at the same distance the first
+answer is heard before most of the others fall due. A point-to-point interface
+answers after the grace alone, a local client at once. A path response does not
+wait for the announce queue and is not held back by the service radius: it is
+an answer to somebody who asked, not an announce spreading.
 
 **Budgets.** A relay remembers a question for a round trip at 6 s a hop across
 the widest gateway distance there is (8 hops, 96 s), and a link or channel

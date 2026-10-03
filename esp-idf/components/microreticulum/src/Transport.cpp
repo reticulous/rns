@@ -1724,6 +1724,20 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
 	return std::min(window, 4.0);
 }
 
+/* Where a path answer on a shared medium falls inside its hop rank: sixteen
+ * airtimes of the answer, never shorter than upstream's PATHFINDER_RW and never
+ * past half an asker's PATH_REQUEST_TIMEOUT. Every holder in earshot heard the
+ * question at one moment; a draw this wide lets the first answer be on the air
+ * and heard before most of the others fall due, so they drop theirs. */
+static double path_answer_window(const Interface& interface, size_t data_len) {
+	double window = Type::Transport::PATHFINDER_RW;
+	if (interface.bitrate() > 0) {
+		double air = (double)((data_len + Type::Reticulum::HEADER_MAXSIZE) * 8) / (double)interface.bitrate();
+		window = std::max(window, 16.0 * air);
+	}
+	return std::min(window, Type::Transport::PATH_REQUEST_TIMEOUT / 2.0);
+}
+
 /*static*/ void Transport::inbound(const Bytes& raw_in, const Interface& interface /*= {Type::NONE}*/) {
 	// Mutable working copy: the IFAC block below rewrites it in place to the
 	// de-IFAC'd packet, which the rest of this function then decodes.
@@ -4395,8 +4409,10 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 				}
 				else if (attached_interface && !attached_interface.point_to_point()) {
 					double tier = announce_radio_window(attached_interface, announce_packet.data().size()) / 2.0;
-					double rank = (route.hops > 0 ? (double)(route.hops - 1) : 0.0) + Cryptography::random();
-					retransmit_timeout = now + Type::Transport::PATH_REQUEST_GRACE + tier * rank;
+					double rank = route.hops > 0 ? (double)(route.hops - 1) : 0.0;
+					double spread = path_answer_window(attached_interface, announce_packet.data().size());
+					retransmit_timeout = now + Type::Transport::PATH_REQUEST_GRACE + tier * rank +
+					                     Cryptography::random() * spread;
 				}
 				else {
 					retransmit_timeout = now + Type::Transport::PATH_REQUEST_GRACE;
