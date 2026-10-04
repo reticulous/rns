@@ -3770,6 +3770,12 @@ static void cliRnsdMemory(void)
                   (unsigned)d.guard_drop_fp, (unsigned)d.guard_drop_emitted,
                   (unsigned)d.guard_bypass, (unsigned)d.guard_resets,
                   (unsigned)ev, (unsigned)d.recall_miss, (unsigned)d.seq_retries);
+        cliPrintf("     evicted by category: unclaimed %u, lapsed %u, ephemeral %u, edge %u,\n"
+                  "     persist %u, in use %u; guards %u, blobs %u\n",
+                  (unsigned)d.evict_dir[RDIR_CAT_UNCLAIMED], (unsigned)d.evict_dir[RDIR_CAT_EPH_LAPSED],
+                  (unsigned)d.evict_dir[RDIR_CAT_EPH_LIVE], (unsigned)d.evict_dir[RDIR_CAT_EDGE],
+                  (unsigned)d.evict_dir[RDIR_CAT_PERSIST], (unsigned)d.evict_dir[RDIR_CAT_IN_USE],
+                  (unsigned)d.evict_guard, (unsigned)d.evict_blob);
     }
     cliPrintf("announces: %u queued, %u held\n", an_n, he_n);
     cliPrintf("stats: pkts in %u out %u, dests added %u\n",
