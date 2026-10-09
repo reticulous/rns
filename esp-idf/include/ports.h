@@ -349,6 +349,11 @@ typedef struct {
                                rather than a silence. "" = nothing to show. */
     char     ifac_netname[32]; /* IFAC network_name; "" => no IFAC */
     char     ifac_netkey[64];  /* IFAC passphrase; "" => no IFAC */
+    uint16_t announce_cap_permille; /* Experiment: the announce cap in tenths of
+                               a percent, finer than `announce_cap`; 0 => use
+                               `announce_cap`. A duty-limited band needs a cap
+                               under its budget, which whole percents cannot
+                               say at 1 %. */
 } rnsd_iface_t;
 static_assert(sizeof(rnsd_iface_t) <= ITS_MAX_MSG_DATA,
               "rnsd_iface_t must fit ITS_MAX_MSG_DATA");
