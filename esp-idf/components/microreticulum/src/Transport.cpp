@@ -1728,12 +1728,15 @@ static double announce_radio_window(const Interface& interface, size_t data_len)
  * airtimes of the answer, never shorter than upstream's PATHFINDER_RW and never
  * past half an asker's PATH_REQUEST_TIMEOUT. Every holder in earshot heard the
  * question at one moment; a draw this wide lets the first answer be on the air
- * and heard before most of the others fall due, so they drop theirs. */
+ * and heard before most of the others fall due, so they drop theirs. An
+ * interface that asks for its own spread (rnsd_iface_t.path_answer_spread)
+ * draws over that many airtimes instead of the fixed sixteen. */
 static double path_answer_window(const Interface& interface, size_t data_len) {
+	double airtimes = (interface && interface.path_answer_spread() > 0) ? interface.path_answer_spread() : 16.0;
 	double window = Type::Transport::PATHFINDER_RW;
 	if (interface.bitrate() > 0) {
 		double air = (double)((data_len + Type::Reticulum::HEADER_MAXSIZE) * 8) / (double)interface.bitrate();
-		window = std::max(window, 16.0 * air);
+		window = std::max(window, airtimes * air);
 	}
 	return std::min(window, Type::Transport::PATH_REQUEST_TIMEOUT / 2.0);
 }

@@ -354,6 +354,14 @@ typedef struct {
                                `announce_cap`. A duty-limited band needs a cap
                                under its budget, which whole percents cannot
                                say at 1 %. */
+    uint8_t  path_answer_spread; /* Experiment: on a shared medium, a path
+                               response waits upstream's grace plus a random
+                               share of this many of its own airtimes, so that
+                               a holder of the destination that hears another's
+                               answer first can drop its own. 0 => upstream's
+                               grace alone, when every holder in earshot heard
+                               the question at one moment and answers at the
+                               next. Ignored on a point-to-point interface. */
 } rnsd_iface_t;
 static_assert(sizeof(rnsd_iface_t) <= ITS_MAX_MSG_DATA,
               "rnsd_iface_t must fit ITS_MAX_MSG_DATA");

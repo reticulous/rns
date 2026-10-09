@@ -135,6 +135,7 @@ public:
                             : (float)cap_pct / 100.0f;
         _point_to_point = info.point_to_point != 0;
         _community_radius = info.community_radius;
+        _path_answer_spread = info.path_answer_spread;
     }
 protected:
     void send_outgoing(const RNS::Bytes& data) override;
