@@ -128,6 +128,10 @@ namespace RNS {
 		// out the interface they were learned on. Radio interfaces (LoRa,
 		// ESP-NOW) leave this false so re-broadcasts still reach hidden nodes.
 		bool _point_to_point = false;
+		// Airtimes of its own that a path response answered on this interface
+		// may wait past the grace, at random (rnsd_iface_t.path_answer_spread).
+		// 0 = upstream's grace alone. Read only where the medium is shared.
+		uint8_t _path_answer_spread = 0;
 		std::list<AnnounceEntry> _announce_queue;
 		bool _is_connected_to_shared_instance = false;
 		bool _is_local_shared_instance = false;
@@ -267,6 +271,7 @@ namespace RNS {
 		inline uint8_t announce_rate_grace() const { assert(_impl); return _impl->_announce_rate_grace; }
 		inline uint32_t announce_rate_penalty() const { assert(_impl); return _impl->_announce_rate_penalty; }
 		inline bool point_to_point() const { assert(_impl); return _impl->_point_to_point; }
+		inline uint8_t path_answer_spread() const { assert(_impl); return _impl->_path_answer_spread; }
 		inline size_t rxb() const { assert(_impl); return _impl->_rxb; }
 		inline size_t txb() const { assert(_impl); return _impl->_txb; }
 		// Per-packet radio signal (see InterfaceImpl). Setter used by the driver
