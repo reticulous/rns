@@ -4229,6 +4229,68 @@ static inline bool announce_rec_timed(const Transport::AnnounceRec& r) {
 	}
 }
 
+/* ── Short path requests ───────────────────────────────────────────────────
+ *
+ * A LoRa interface that carries path requests in short form (iface-lora's
+ * `s.lora.<n>.short_pr`, frame type 0xCA) rebuilds each into an ordinary path
+ * request with the bytes it cut set to zero:
+ * - the destination keeps its first four bytes, its LABEL, and the rest is
+ *   zero;
+ * - a transport id keeps its first byte, a HINT, and the rest is zero.
+ * The request is then handled as any other. A label is answered with the
+ * whole announce of a destination bearing it, and the asker checks the full
+ * hash of what comes back. Nothing is trusted on the strength of a label, and
+ * a request that names a full hash is untouched. The format is the reticulum
+ * project's (`reticulum_packet::short_pr`), and the two must agree byte for
+ * byte. */
+static const size_t SHORT_PR_LABEL_LEN = 4;
+static const size_t SHORT_PR_HINT_LEN  = 1;
+
+/* Whether a destination as a path request carries it is a label. A real hash
+ * ends in twelve zero bytes once in 2^96. */
+static bool short_pr_is_label(const Bytes& h) {
+	if (h.size() != Type::Identity::TRUNCATED_HASHLENGTH/8) return false;
+	for (size_t i = SHORT_PR_LABEL_LEN; i < h.size(); i++)
+		if (h.data()[i] != 0) return false;
+	return true;
+}
+
+/* Whether a path request's transport id names the node `id`: the same id, or
+ * a short request's hint that `id` begins with. A zero hint names nobody. */
+static bool short_pr_names_node(const Bytes& id, const Bytes& tid) {
+	if (tid.size() != id.size() || tid.size() < SHORT_PR_HINT_LEN) return id == tid;
+	bool hint = true;
+	for (size_t i = SHORT_PR_HINT_LEN; i < tid.size(); i++)
+		if (tid.data()[i] != 0) { hint = false; break; }
+	if (!hint) return id == tid;
+	return tid.data()[0] != 0 && memcmp(id.data(), tid.data(), SHORT_PR_HINT_LEN) == 0;
+}
+
+struct ShortPrFind { const uint8_t* label; uint8_t found[RDIR_DEST_LEN]; bool hit; };
+
+static void short_pr_find_cb(const rdir_entry_t* e, void* ctx) {
+	ShortPrFind* f = (ShortPrFind*)ctx;
+	if (f->hit || !e->has_route) return;
+	if (memcmp(e->dest, f->label, SHORT_PR_LABEL_LEN) == 0) {
+		memcpy(f->found, e->dest, RDIR_DEST_LEN);
+		f->hit = true;
+	}
+}
+
+/* The destination a label stands for: one of this system's own, else one the
+ * directory holds a route to. Empty when none bears it, and the label is then
+ * what is asked for, as an unknown destination is. */
+static Bytes short_pr_resolve(const Bytes& label, const std::map<Bytes, Destination>& own) {
+	for (const auto& kv : own) {
+		const Bytes& d = kv.first;
+		if (d.size() == label.size() && memcmp(d.data(), label.data(), SHORT_PR_LABEL_LEN) == 0)
+			return d;
+	}
+	ShortPrFind f = {label.data(), {0}, false};
+	rdirForEach(short_pr_find_cb, &f);
+	return f.hit ? Bytes(f.found, RDIR_DEST_LEN) : Bytes();
+}
+
 /*static*/ void Transport::path_request_handler(const Bytes& data, const Packet& packet) {
 	TRACE("Transport::path_request_handler");
 	try {
@@ -4270,8 +4332,18 @@ static inline bool announce_rec_timed(const Transport::AnnounceRec& r) {
 					_discovery_pr_tags.insert(unique_tag);
 					_discovery_pr_tags_order.push_back(unique_tag);
 
+					// Deduplicated by what was asked, the label included; then
+					// a label resolves to the destination bearing it, if any.
+					Bytes asked = destination_hash;
+					if (short_pr_is_label(destination_hash)) {
+						Bytes full = short_pr_resolve(destination_hash, _destinations);
+						if (full) {
+							DBGF_DEMOTE("Short path request for label %s is for %s", destination_hash.left(SHORT_PR_LABEL_LEN).toHex().c_str(), full.toHex().c_str());
+							asked = full;
+						}
+					}
 					path_request(
-						destination_hash,
+						asked,
 						from_local_client(packet),
 						packet.receiving_interface(),
 						requesting_transport_instance,
@@ -4371,7 +4443,8 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 			DBG_DEMOTE("Not answering path request on roaming-mode interface, since next hop is on same roaming-mode interface");
 		}
 		else {
-			if (requestor_transport_id && next_hop == requestor_transport_id) {
+			// A short request's transport id is a hint, its first byte.
+			if (requestor_transport_id && short_pr_names_node(next_hop, requestor_transport_id)) {
 				// TODO: Find a bandwidth efficient way to invalidate our
 				// known path on this signal. The obvious way of signing
 				// path requests with transport instance keys is quite
