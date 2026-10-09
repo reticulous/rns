@@ -130,7 +130,9 @@ public:
         // mR's throttle wants it as a fraction of bandwidth.
         uint8_t cap_pct = info.announce_cap ? info.announce_cap
                                             : RNS::Type::Reticulum::ANNOUNCE_CAP;
-        _announce_cap = (float)cap_pct / 100.0f;
+        _announce_cap = info.announce_cap_permille
+                            ? (float)info.announce_cap_permille / 1000.0f
+                            : (float)cap_pct / 100.0f;
         _point_to_point = info.point_to_point != 0;
         _community_radius = info.community_radius;
     }
