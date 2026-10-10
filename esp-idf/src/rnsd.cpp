@@ -8434,10 +8434,13 @@ static void rnsBootWindow(void) {
     uint32_t min_ms = (uint32_t)storageGetInt("s.rns.boot_min_s", 10) * 1000;
     uint32_t max_ms = (uint32_t)storageGetInt("s.rns.boot_max_s", 300) * 1000;
     if (max_ms < min_ms) max_ms = min_ms;
-    /* Minimum: always served. */
+    /* Minimum: always served. delay() takes milliseconds and sleeps whole
+     * ticks, so the wait asks for at least one: a remainder shorter than a
+     * tick, rounded down to none, would yield in a loop until it ran out. */
     while (millis() < min_ms) {
         uint32_t rem = min_ms - millis();
-        delay(pdMS_TO_TICKS(rem > 1000 ? 1000 : rem));
+        if (rem > 1000) rem = 1000;
+        delay(rem < portTICK_PERIOD_MS ? portTICK_PERIOD_MS : rem);
     }
     /* Maximum: the wild-mesh hold, released early by a human. */
     uint32_t now = millis();
