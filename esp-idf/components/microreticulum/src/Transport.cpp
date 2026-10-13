@@ -1741,6 +1741,40 @@ static double path_answer_window(const Interface& interface, size_t data_len) {
 	return std::min(window, Type::Transport::PATH_REQUEST_TIMEOUT / 2.0);
 }
 
+/* A route trailer: what a relay that chooses paths by link quality (R2, R3
+ * of reticulum's full-routes design, experiments) says about the path beyond
+ * it, appended to its copy of an announce. The context byte says so: 0xC1 in
+ * place of none, 0xC2 in place of PATH_RESPONSE. The trailer's last byte is
+ * the count of its bytes before it, so it is found from the end and never by
+ * scanning. It lies outside the packet hash and the announce signature, so
+ * with it taken off and the context put back the announce is exactly the one
+ * that was signed, and is read as if it had come without one. Takes it off
+ * `raw` in place and returns it; empty, with `raw` as it was, for a frame
+ * without one: anything but such an announce (an IFAC frame included), or a
+ * count that would leave no whole announce in front of it. */
+static const uint8_t ROUTE_CONTEXT       = 0xC1;
+static const uint8_t ROUTE_CONTEXT_REPLY = 0xC2;
+static Bytes route_trailer_strip(Bytes& raw) {
+	const size_t n = raw.size();
+	if (n < 2 || (raw[0] & 0x80) || (raw[0] & 0x03) != Type::Packet::ANNOUNCE) return {};
+	const size_t at = (raw[0] & 0x40) ? 34 : 18;   /* the context byte */
+	if (n <= at) return {};
+	uint8_t own;
+	if (raw[at] == ROUTE_CONTEXT)            own = Type::Packet::CONTEXT_NONE;
+	else if (raw[at] == ROUTE_CONTEXT_REPLY) own = Type::Packet::PATH_RESPONSE;
+	else return {};
+	/* Key, name hash, random hash and signature: the least an announce holds. */
+	const size_t least = Type::Identity::KEYSIZE/8 + Type::Identity::NAME_HASH_LENGTH/8 +
+	                     Type::Identity::RANDOM_HASH_LENGTH/8 + Type::Identity::SIGLENGTH/8;
+	const size_t tail = (size_t)raw[n - 1] + 1;
+	if (tail < 2 || n < at + 1 + least + tail) return {};
+	Bytes trailer = raw.right(tail);
+	Bytes plain = raw.left(n - tail);
+	plain.writable(n - tail)[at] = own;
+	raw = plain;
+	return trailer;
+}
+
 /*static*/ void Transport::inbound(const Bytes& raw_in, const Interface& interface /*= {Type::NONE}*/) {
 	// Mutable working copy: the IFAC block below rewrites it in place to the
 	// de-IFAC'd packet, which the rest of this function then decodes.
@@ -1839,6 +1873,9 @@ static double path_answer_window(const Interface& interface, size_t data_len) {
 	struct JobsLockGuard { ~JobsLockGuard() { _jobs_locked = false; } };
 	_jobs_locked = true;
 	JobsLockGuard _jl;
+
+	/* Before anything reads the frame: hashing, dedup, the signature check. */
+	route_trailer_strip(raw);
 
 	Packet packet(RNS::Destination(RNS::Type::NONE), raw);
 	if (!packet.unpack()) {
