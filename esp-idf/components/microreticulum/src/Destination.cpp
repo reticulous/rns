@@ -622,6 +622,15 @@ Encrypts information for ``RNS.Destination.SINGLE`` or ``RNS.Destination.GROUP``
 		return _object->_identity.encrypt(data, Identity::get_ratchet(_object->_hash));
 	}
 
+	/* A GROUP destination's symmetric key is not implemented here, so its
+	 * packets cannot be encrypted. Refuse, as canon refuses a GROUP
+	 * destination without its key, rather than fall through to the
+	 * plaintext returned below: rnsd lets a host ask for a GROUP
+	 * destination, and its packets went on the air in the clear. */
+	if (_object->_type == GROUP) {
+		throw std::invalid_argument("GROUP destinations cannot be encrypted by this stack: refusing to send plaintext");
+	}
+
 // TODO
 /*
 	if (_object->_type == GROUP {
