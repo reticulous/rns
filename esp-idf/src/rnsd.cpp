@@ -892,7 +892,7 @@ static int onTransportConnect(int handle, const void* data, size_t len)
         try {
             RNS::Transport::derive_ifac(slot->mr_iface, slot->info.ifac_netname,
                                         slot->info.ifac_netkey,
-                                        slot->info.ifac_size ? slot->info.ifac_size : RNSD_DEFAULT_IFAC_SIZE);
+                                        slot->info.ifac_size ? slot->info.ifac_size : RNS_IFAC_SIZE_PACKET);
         } catch (const std::exception& e) {
             err("Transport::derive_ifac threw: %s", e.what());
         }

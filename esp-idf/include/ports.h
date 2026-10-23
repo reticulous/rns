@@ -254,10 +254,17 @@ enum rns_iface_mode : uint8_t {
  * with announce_cap == 0. Mirrors RNS Reticulum.ANNOUNCE_CAP. */
 #define RNS_IFACE_ANNOUNCE_CAP_DEFAULT 2
 
-/** IFAC access-code length used when an interface leaves `ifac_size` at 0.
- *  Upstream Reticulum's Interface.DEFAULT_IFAC_SIZE: two nodes only share an
- *  access-coded network if both ends use the same length. */
-#define RNSD_DEFAULT_IFAC_SIZE 16
+/* IFAC access-code length, in bytes, for an interface whose config leaves it
+ * unset. Upstream Reticulum has no global default: each interface class carries
+ * its own DEFAULT_IFAC_SIZE, and the length is part of the wire format, so an
+ * interface must use the one its upstream counterpart uses to share an
+ * access-coded network with stock nodes. Packet media (TCPInterface,
+ * UDPInterface, AutoInterface, BackboneInterface, ble-reticulum's BLEInterface)
+ * use 16; serial and radio media (RNodeInterface, SerialInterface,
+ * KISSInterface) use 8. Each interface resolves its own and sends it in
+ * `ifac_size`; rnsd applies RNS_IFAC_SIZE_PACKET only to one that sends 0. */
+#define RNS_IFAC_SIZE_PACKET 16
+#define RNS_IFAC_SIZE_SERIAL 8
 
 /** Connect payload for RNSD_PORT_IFACE. Sent by interface tasks when
  *  registering with rnsd. Fixed-size struct to keep the connect path cheap
@@ -281,8 +288,8 @@ typedef struct {
     uint8_t  mode;          /* rns_iface_mode */
     uint8_t  in;            /* 1 if iface accepts inbound packets */
     uint8_t  out;           /* 1 if iface sends outbound packets */
-    uint8_t  ifac_size;     /* IFAC access-code length in bytes; 0 => default
-                               (RNSD_DEFAULT_IFAC_SIZE = 16, as upstream Reticulum) */
+    uint8_t  ifac_size;     /* IFAC access-code length in bytes, resolved by the
+                               interface (RNS_IFAC_SIZE_*); 0 => RNS_IFAC_SIZE_PACKET */
     uint8_t  announce_cap;  /* max % of interface bandwidth spent propagating
                                announces; 0 => rnsd applies the RNS default (2) */
     uint8_t  point_to_point; /* 1 => no hidden-node problem (single peer, e.g.
