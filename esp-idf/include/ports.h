@@ -254,6 +254,11 @@ enum rns_iface_mode : uint8_t {
  * with announce_cap == 0. Mirrors RNS Reticulum.ANNOUNCE_CAP. */
 #define RNS_IFACE_ANNOUNCE_CAP_DEFAULT 2
 
+/** IFAC access-code length used when an interface leaves `ifac_size` at 0.
+ *  Upstream Reticulum's Interface.DEFAULT_IFAC_SIZE: two nodes only share an
+ *  access-coded network if both ends use the same length. */
+#define RNSD_DEFAULT_IFAC_SIZE 16
+
 /** Connect payload for RNSD_PORT_IFACE. Sent by interface tasks when
  *  registering with rnsd. Fixed-size struct to keep the connect path cheap
  *  (fits in ITS_MAX_MSG_DATA).
@@ -276,7 +281,8 @@ typedef struct {
     uint8_t  mode;          /* rns_iface_mode */
     uint8_t  in;            /* 1 if iface accepts inbound packets */
     uint8_t  out;           /* 1 if iface sends outbound packets */
-    uint8_t  ifac_size;     /* IFAC access-code length in bytes; 0 => default (1) */
+    uint8_t  ifac_size;     /* IFAC access-code length in bytes; 0 => default
+                               (RNSD_DEFAULT_IFAC_SIZE = 16, as upstream Reticulum) */
     uint8_t  announce_cap;  /* max % of interface bandwidth spent propagating
                                announces; 0 => rnsd applies the RNS default (2) */
     uint8_t  point_to_point; /* 1 => no hidden-node problem (single peer, e.g.
