@@ -62,6 +62,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include <cctype>
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -4026,6 +4027,58 @@ static std::string rnpathNextToken(const std::string& a, size_t* i)
     return a.substr(s, *i - s);
 }
 
+static bool isHexWord(const std::string& s)
+{
+    if (s.empty()) return false;
+    for (char c : s) if (!isxdigit((unsigned char)c)) return false;
+    return true;
+}
+
+/** A hash argument from *i: hex tokens joined while short of `want`
+ *  characters, so a hash pasted in groups reads as one, and on to twice that
+ *  when they make exactly a full-length hash, of which the leading `want`
+ *  characters are returned. */
+static std::string rnpathNextHex(const std::string& a, size_t* i, size_t want)
+{
+    std::string h = rnpathNextToken(a, i);
+    if (!isHexWord(h)) return h;
+    size_t j = *i;
+    while (h.size() < want) {
+        std::string t = rnpathNextToken(a, &j);
+        if (!isHexWord(t)) break;
+        h += t;
+        *i = j;
+    }
+    if (h.size() >= want && h.size() < 2 * want) {
+        std::string more = h;
+        j = *i;
+        while (more.size() < 2 * want) {
+            std::string t = rnpathNextToken(a, &j);
+            if (!isHexWord(t)) break;
+            more += t;
+        }
+        if (more.size() == 2 * want) { h = more; *i = j; }
+    }
+    if (h.size() == 2 * want) h.resize(want);
+    return h;
+}
+
+/** A 32-byte hash in hex cut to the 16-byte one it truncates to. */
+static void truncFullHash(std::string& h, size_t want)
+{
+    if (h.size() == 2 * want && isHexWord(h)) h.resize(want);
+}
+
+/** "<hash> <rest>" split the same way, the hash possibly in groups. */
+static std::string takeHexHead(const std::string& cmd, std::string& rest, size_t want)
+{
+    size_t i = 0;
+    std::string h = rnpathNextHex(cmd, &i, want);
+    while (i < cmd.size() && (cmd[i] == ' ' || cmd[i] == '\t')) i++;
+    rest = cmd.substr(i);
+    return h;
+}
+
 static void cliRnpath(const char* args)
 {
     std::string filter_dest;
@@ -4062,8 +4115,8 @@ static void cliRnpath(const char* args)
             else if (t == "-n" || t == "--limit")       limit    = atoi(rnpathNextToken(a, &i).c_str());
             /* Stock switch, stock argument: a transport identity hash, exactly
              * as upstream's rnpath takes it, so the muscle memory transfers. */
-            else if (t == "-R" || t == "--remote")      { cliRemoteAsk(rnpathNextToken(a, &i)); return; }
-            else if (!t.empty() && t[0] != '-')         filter_dest = t;
+            else if (t == "-R" || t == "--remote")      { cliRemoteAsk(rnpathNextHex(a, &i, RNSD_IDENT_HASH_LEN * 2)); return; }
+            else if (!t.empty() && t[0] != '-')         filter_dest += t;   /* a grouped paste arrives as several */
             else {
                 cliPrintf("unknown option: %s\n", t.c_str());
                 cliPrintf("usage: rnpath [destination] [-i iface] [-m hops] [-n N] [-R hash] [-a] [-s] [-d] [-j] [-r]\n");
@@ -4071,6 +4124,7 @@ static void cliRnpath(const char* args)
             }
         }
     }
+    truncFullHash(filter_dest, RNSD_DEST_HASH_LEN * 2);
 
     if (show_help) {
         cliPrintf("%-*s routing paths\n", CLI_HELP_COL, "rnpath [destination]");
@@ -4398,10 +4452,7 @@ static void cliRnstatus(const char* args)
             else if (t == "-g" || t == "--gateway") { rnsdGatewayPrint(); return; }
             else if (t == "-R" || t == "--remote") {
                 /* Stock switch, stock argument: a transport identity hash. */
-                while (i < a.size() && (a[i] == ' ' || a[i] == '\t')) i++;
-                size_t s2 = i;
-                while (i < a.size() && a[i] != ' ' && a[i] != '\t') i++;
-                cliRemoteAsk(a.substr(s2, i - s2));
+                cliRemoteAsk(rnpathNextHex(a, &i, RNSD_IDENT_HASH_LEN * 2));
                 return;
             }
             else if (!t.empty() && t[0] != '-')    filter = t;
@@ -4475,8 +4526,10 @@ static void cliRnprobe(const char* args)
             else if (t == "-t" || t == "--timeout")  timeout = atoi(rnpathNextToken(a, &i).c_str());
             else if (t == "-w" || t == "--wait")     wait    = atoi(rnpathNextToken(a, &i).c_str());
             else if (!t.empty() && t[0] != '-') {
-                if      (positional == 0) aspect   = t;
-                else if (positional == 1) hash_hex = t;
+                /* An aspect first if it is one; every hex word after joins
+                 * the hash, so a grouped paste reads as one. */
+                if (positional == 0 && !isHexWord(t)) aspect = t;
+                else                                  hash_hex += t;
                 positional++;
             } else {
                 cliPrintf("unknown option: %s\n", t.c_str());
@@ -4486,22 +4539,11 @@ static void cliRnprobe(const char* args)
         }
     }
     (void)wait;
+    truncFullHash(hash_hex, RNSD_DEST_HASH_LEN * 2);
 
-    /* Single-positional shortcut: a 32-char all-hex string is the hash;
-     * default aspect to the conventional probe endpoint (rnstransport.probe,
+    /* No aspect given: the conventional probe endpoint (rnstransport.probe,
      * which any node with `respond_to_probes = yes` hosts with PROVE_ALL). */
-    auto isHexHash = [](const std::string& s) {
-        if (s.size() != (size_t)RNS::Type::Reticulum::DESTINATION_LENGTH * 2) return false;
-        for (char c : s) {
-            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
-                return false;
-        }
-        return true;
-    };
-    if (hash_hex.empty() && isHexHash(aspect)) {
-        hash_hex = aspect;
-        aspect   = "rnstransport.probe";
-    }
+    if (aspect.empty() && !hash_hex.empty()) aspect = "rnstransport.probe";
 
     if (show_help || aspect.empty() || hash_hex.empty()) {
         cliPrintf("%-*s probe destination, measure RTT\n", CLI_HELP_COL, "rnprobe [aspect] <hash>");
@@ -5482,15 +5524,9 @@ static void onCmdLinkOpen(const char* key, const char* val)
     }
 
     /* Parse: "<32-hex> [<aspect>]" */
-    std::string hash_hex, aspect = "rnstransport.probe";
-    size_t sp = cmd.find(' ');
-    if (sp == std::string::npos) {
-        hash_hex = cmd;
-    } else {
-        hash_hex = cmd.substr(0, sp);
-        aspect   = cmd.substr(sp + 1);
-        while (!aspect.empty() && aspect[0] == ' ') aspect.erase(0, 1);
-    }
+    std::string aspect;
+    std::string hash_hex = takeHexHead(cmd, aspect, RNSD_DEST_HASH_LEN * 2);
+    if (aspect.empty()) aspect = "rnstransport.probe";
 
     if (hash_hex.size() != RNSD_DEST_HASH_LEN * 2) {
         warn("rnsd link: bad hash length (got %zu, need %u)",
@@ -8231,14 +8267,12 @@ static void onCmdCreq(const char* key, const char* val)
     storageUnset(key);                    /* single-shot */
 
     /* "<hash> <path> [aspect]" */
-    size_t sp1 = cmd.find(' ');
-    if (sp1 == std::string::npos) {
+    std::string tail;
+    std::string hash_hex = takeHexHead(cmd, tail, RNSD_DEST_HASH_LEN * 2);
+    if (tail.empty()) {
         warn("creq: usage <dest_hash> <path> [aspect]");
         return;
     }
-    std::string hash_hex = cmd.substr(0, sp1);
-    std::string tail     = cmd.substr(sp1 + 1);
-    while (!tail.empty() && tail[0] == ' ') tail.erase(0, 1);
     std::string path = tail, aspect = "nomadnetwork.node";
     size_t sp2 = tail.find(' ');
     if (sp2 != std::string::npos) {
@@ -8316,13 +8350,9 @@ static void onCmdClink(const char* key, const char* val)
     }
 
     /* "<32-hex> [aspect]" */
-    std::string hash_hex = cmd, aspect = "lxmf.delivery";
-    size_t sp = cmd.find(' ');
-    if (sp != std::string::npos) {
-        hash_hex = cmd.substr(0, sp);
-        aspect   = cmd.substr(sp + 1);
-        while (!aspect.empty() && aspect[0] == ' ') aspect.erase(0, 1);
-    }
+    std::string aspect;
+    std::string hash_hex = takeHexHead(cmd, aspect, RNSD_DEST_HASH_LEN * 2);
+    if (aspect.empty()) aspect = "lxmf.delivery";
     if (hash_hex.size() != RNSD_DEST_HASH_LEN * 2) {
         warn("clink: bad hash length %zu", hash_hex.size());
         return;

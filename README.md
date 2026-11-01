@@ -811,6 +811,11 @@ rnpath -R <identity hash>         ask that node instead (answer goes to the log)
 rnpath -d <dest>                   DROP a path (destructive; requires the hash)
 ```
 
+A hash argument (`-R`, `-d`, `rnpath`'s dest, `rnprobe`, `rnsd link`/`creq`/`clink`)
+may be typed in space-separated groups and in full (64 hex, whose leading 32 are
+the hash): hex words are joined up to 32, and on to 64 only if hex words alone
+make exactly 64, so a following aspect or label is left alone.
+
 `-R` takes a transport identity hash exactly as upstream's `rnstatus`/`rnpath`
 do, so the muscle memory transfers; the verb queues the visit and returns, and
 the answer lands in the log rather than in the session that asked. `-r` puts a
