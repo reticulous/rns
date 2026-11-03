@@ -130,7 +130,20 @@ enum : uint8_t {
                                          * the identity the link was opened
                                          * with (rnsdLinkOpen identity_key).
                                          * Sent via rnsdLinkIdentify(). */
+    RNSD_LINK_AUX_PROOFS       = 0x05,  /* payload: rnsd_link_proofs_t —
+                                         * whether the peer proves our
+                                         * packets. Sent via
+                                         * rnsdLinkExpectProofs(). */
 };
+
+/** Proof expectation (RNSD_PORT_LINK aux). Sent by rnsdLinkExpectProofs(). */
+typedef struct {
+    uint8_t  op;            /* RNSD_LINK_AUX_PROOFS */
+    char     tag[24];       /* link tag (rnsdLinkOpen) */
+    uint8_t  expect;        /* 0 = the peer proves nothing: don't track */
+} rnsd_link_proofs_t;
+static_assert(sizeof(rnsd_link_proofs_t) <= ITS_MAX_MSG_DATA,
+              "rnsd_link_proofs_t must fit ITS_MAX_MSG_DATA");
 
 /** Link-identify request (RNSD_PORT_LINK aux). Sent by rnsdLinkIdentify().
  *  Initiator-only (µR Link::identify is a no-op on inbound links); the

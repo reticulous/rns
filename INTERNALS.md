@@ -1428,7 +1428,10 @@ both at send time and watch for increments. `tx_rtt_ms` rides the same
 transaction as a `tx_proven` increment and carries µR's own measurement of that
 packet's round trip, so a consumer that sees the counter move reads the
 measurement instead of timing the poll that noticed — `linkTick` runs at 1 Hz,
-which would round a 200 ms round trip up to a second. Resource transfers don't use packet
+which would round a 200 ms round trip up to a second. A consumer whose peer
+proves nothing (an RRC hub) says so with `rnsdLinkExpectProofs(tag, false)`;
+that link then tracks no receipts, its counters stay still, and an unproven
+LINKIDENTIFY is not sent a second time. Resource transfers don't use packet
 receipts — the Resource ACK (`RNSD_LINK_RESOURCE_OUTBOUND_DONE`) is already
 proof-grade.
 

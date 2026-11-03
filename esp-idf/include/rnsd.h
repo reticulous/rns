@@ -1048,6 +1048,15 @@ void rnsdResourceRelease(void* buf);
  *  link's aspect). Returns true if the aux was queued to rnsd. */
 bool rnsdLinkIdentify(const char* tag, const char* identity_key = "");
 
+/** Say whether the peer on link `tag` proves the packets we send it. rnsd
+ *  tracks a delivery proof for each consumer packet by default (counted in
+ *  rnsd.links.<tag>.tx_proven / .proof_timeouts); a peer whose destination
+ *  proves nothing would only ever time those out, so `expect = false` stops
+ *  the tracking for the life of the link, and with it the second
+ *  LINKIDENTIFY sent when the first goes unproven. Callable the moment
+ *  rnsdLinkOpen() returns. Returns true if the aux was queued to rnsd. */
+bool rnsdLinkExpectProofs(const char* tag, bool expect);
+
 /* ──────────────── request / response (nomad page fetch) ────────────────
  *
  * Reticulum's request/response layer rides an established Link: the

@@ -5333,6 +5333,17 @@ bool rnsdLinkIdentify(const char* tag, const char* identity_key)
                       pdMS_TO_TICKS(1000));
 }
 
+bool rnsdLinkExpectProofs(const char* tag, bool expect)
+{
+    if (!tag || !*tag) { warn("rnsdLinkExpectProofs: bad args"); return false; }
+    rnsd_link_proofs_t p = {};
+    p.op = RNSD_LINK_AUX_PROOFS;
+    safeStrncpy(p.tag, tag, sizeof(p.tag));
+    p.expect = expect ? 1 : 0;
+    return itsSendAux("rnsd", RNSD_PORT_LINK, &p, sizeof(p),
+                      pdMS_TO_TICKS(1000));
+}
+
 bool rnsdDestListenLinks(int dest_handle, uint16_t target_port)
 {
     if (dest_handle < 0 || target_port == 0) {
@@ -5664,6 +5675,7 @@ struct link_conn_t {
      * so both outcomes are observed by polling. */
     RNS::PacketReceipt   tx_receipt{RNS::Type::NONE};
     double               tx_receipt_deadline;   /* 0 = none pending */
+    bool                 no_proofs;     /* the peer proves nothing (rnsdLinkExpectProofs) */
 
     /* Resource transfer. One in-flight resource per link in v1
      * (transfers are sequential). consumer_task is where the
@@ -5864,7 +5876,7 @@ static void linkBumpInt(link_conn_t& c, const char* field)
 /* Adopt the receipt of a just-sent consumer packet for proof tracking. */
 static void linkTrackTxReceipt(link_conn_t& c, const RNS::PacketReceipt& receipt)
 {
-    if (!receipt) return;
+    if (!receipt || c.no_proofs) return;
     if (c.tx_receipt) {
         /* A previous send is still unsettled (consumers are expected to
          * serialize) — close it out as unproven before replacing, so the
@@ -6700,6 +6712,7 @@ static void linkFreeSlot(link_conn_t& c)
     c.pend_bytes.clear();
     c.tx_receipt = RNS::PacketReceipt{RNS::Type::NONE};
     c.tx_receipt_deadline = 0;
+    c.no_proofs = false;
     if (c.pend_res_used && c.pend_res_buf) free(c.pend_res_buf);
     c.pend_res_used = false;
     c.pend_res_buf = nullptr;
@@ -6750,6 +6763,10 @@ static bool linkTxReceiptsPending(void)
 static void linkIdentifyTick(link_conn_t& c, double now)
 {
     if (!c.ident_packet) return;
+    if (c.no_proofs) {                  /* nor will it prove the identify */
+        c.ident_packet = RNS::Packet{RNS::Type::NONE};
+        return;
+    }
     RNS::PacketReceipt r = c.ident_packet.receipt();
     bool second = r && r.status() == RNS::Type::PacketReceipt::DELIVERED && c.ident_resent;
     bool first  = c.ident_first && c.ident_first.status() == RNS::Type::PacketReceipt::DELIVERED;
@@ -7191,6 +7208,24 @@ static void onLinkAux(TaskHandle_t sender, const void* data, size_t len)
             return;
         }
         linkIdentifyNow(*c, req.identity_key);
+        return;
+    }
+
+    if (op == RNSD_LINK_AUX_PROOFS) {
+        if (len < sizeof(rnsd_link_proofs_t)) {
+            warn("link: short PROOFS aux %zu", len);
+            return;
+        }
+        rnsd_link_proofs_t req;
+        memcpy(&req, data, sizeof(req));
+        req.tag[sizeof(req.tag) - 1] = '\0';
+        link_conn_t* c = linkFindByTag(req.tag);
+        if (!c) { warn("link[%s]: PROOFS for unknown link", req.tag); return; }
+        c->no_proofs = !req.expect;
+        if (c->no_proofs) {
+            c->tx_receipt = RNS::PacketReceipt{RNS::Type::NONE};
+            c->tx_receipt_deadline = 0;
+        }
         return;
     }
 

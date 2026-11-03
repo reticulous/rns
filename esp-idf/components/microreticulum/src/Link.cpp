@@ -1001,6 +1001,9 @@ void Link::link_watchdog() {
 					+ _object->_rtt * _object->_keepalive_timeout_factor
 					+ Type::Link::STALE_GRACE;
 				_object->_status = Type::Link::STALE;
+				INFOF("Link %s: stale, nothing heard for %.0fs (keepalive %us, stale %us); closing in %.0fs unless heard from",
+				      toString().c_str(), now - last_inbound, (unsigned)_object->_keepalive,
+				      (unsigned)_object->_stale_time, _object->_stale_deadline - now);
 			}
 		}
 	}
@@ -1138,6 +1141,7 @@ void Link::send_keepalive() {
 	RNS::Packet keepalive_packet(*this, Bytes("\xFF"), Type::Packet::DATA, Type::Packet::KEEPALIVE);
 	keepalive_packet.send();
 	had_outbound(true);
+	INFOF("Link %s: keepalive sent (nothing heard for %.0fs)", toString().c_str(), no_inbound_for());
 }
 
 void Link::handle_request(const Bytes& request_id, const ResourceRequest& resource_request) {
@@ -1826,6 +1830,11 @@ void Link::receive(const Packet& packet) {
 						Packet keepalive_packet(*this, Bytes("\xFE"), Type::Packet::DATA, Type::Packet::KEEPALIVE);
 						keepalive_packet.send();
 						had_outbound(true);
+						INFOF("Link %s: keepalive answered", toString().c_str());
+					}
+					else if (_object->_initiator) {
+						INFOF("Link %s: keepalive reply received (0x%02x)", toString().c_str(),
+						      packet.data().size() ? (unsigned)packet.data().data()[0] : 0u);
 					}
 					break;
 				}
