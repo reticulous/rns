@@ -1048,13 +1048,17 @@ void rnsdResourceRelease(void* buf);
  *  link's aspect). Returns true if the aux was queued to rnsd. */
 bool rnsdLinkIdentify(const char* tag, const char* identity_key = "");
 
-/** Say whether the peer on link `tag` proves the packets we send it. rnsd
+/** Say whether delivery proofs are part of the protocol on link `tag`. rnsd
  *  tracks a delivery proof for each consumer packet by default (counted in
- *  rnsd.links.<tag>.tx_proven / .proof_timeouts); a peer whose destination
- *  proves nothing would only ever time those out, so `expect = false` stops
- *  the tracking for the life of the link, and with it the second
- *  LINKIDENTIFY sent when the first goes unproven. Callable the moment
- *  rnsdLinkOpen() returns. Returns true if the aux was queued to rnsd. */
+ *  rnsd.links.<tag>.tx_proven / .proof_timeouts) and proves each packet it
+ *  hands the consumer (the s.rnsd.prove_incoming dial). A peer whose
+ *  destination proves nothing would only ever time ours out and has no use
+ *  for its own, so `expect = false`, for the life of the link, stops the
+ *  tracking and with it the second LINKIDENTIFY sent when the first goes
+ *  unproven, and stops proving the peer's packets — as the reference
+ *  implementation's link initiator never does. On a link that streams, that
+ *  halves the packets sent. Callable the moment rnsdLinkOpen() returns.
+ *  Returns true if the aux was queued to rnsd. */
 bool rnsdLinkExpectProofs(const char* tag, bool expect);
 
 /* ──────────────── request / response (nomad page fetch) ────────────────

@@ -1163,7 +1163,7 @@ neighbour declares a distance that shows it has not heard ours
 
 Addressing by **name prefix** rather than by handle is what makes one call per
 straddle enough: `ble` matches every per-peer registration, `tcp` matches
-`tcp/<n>` and `tcp_in/<addr:port>` alike, `lora/0` matches one radio, `""`
+`tcp/<n>` and `tcp_in/<addr>#<n>` alike, `lora/0` matches one radio, `""`
 matches the lot. A prefix nothing matches is a no-op, not an error — an
 interface whose beat fires while it happens to hold no registration is a normal
 state, and it will announce on its next one.
@@ -1266,9 +1266,12 @@ directory's `last_alive`, §1.1.2) and fewer than `RNSD_LINK_ATTEMPTS` (3) have
 been made. The window is the same at every distance, one hop included: a
 neighbour's answer can sit behind its own channel access (a SUPE wait) for
 longer than an attempt, and the frames it sends meanwhile are not Reticulum
-packets and stamp nothing. Each attempt gets
-the full budget above, goes back through the path wait if the route went with
-the last one, and is published as `rnsd.links.<tag>.attempt` and logged
+packets and stamp nothing. An attempt that times out expires the path to
+the destination first, as upstream does for a link that never established:
+the next hop may be gone (an interface down on the far side), so the next
+attempt rediscovers the route rather than re-dialling it. Each attempt gets
+the full budget above, goes back through the path wait when no path is
+held, and is published as `rnsd.links.<tag>.attempt` and logged
 `link[<tag>]: attempt N of 3`. When no further attempt is due the link fails
 with `last_error = establish_timeout` and `estab_budget = alive | unseen`, the
 word saying which rule ended it: a lost handshake frame is worth another try, a
@@ -1390,11 +1393,41 @@ everything for the life of the link, and on a LoRa link the difference between a
 
 `Link::rtt_sample()` therefore folds every delivered link proof's own round trip
 (`PacketReceipt::_concluded_at − _sent_at`, taken where `validate_link_proof`
-concludes) into a smoothed estimate at α = ¼, moving in both directions, and
-re-derives the keepalive and stale intervals from it. No sample is discarded for
-having been a retransmission: `Packet::resend` re-encrypts, so the resend's
-packet hash is new and the proof matching it is unambiguously that
-transmission's.
+concludes) into a smoothed estimate at α = ¼, moving in both directions. No
+sample is discarded for having been a retransmission: `Packet::resend`
+re-encrypts, so the resend's packet hash is new and the proof matching it is
+unambiguously that transmission's.
+
+The keepalive and stale intervals do not follow that estimate: they keep the
+establishment reading, because both ends derive theirs from the handshake and
+the reference never revises them. Agreement matters because the reference
+responder answers a keepalive only when its own interval has passed since it
+last sent anything (`Link.py`, `now >= last_outbound + keepalive`). The
+responder's round trip is max(its measurement, the one our RTT packet
+reports), and its measurement includes our proof validation, so an initiator
+reporting the bare proof round trip ends up with a shorter interval than the
+responder: every keepalive sent at the interval is ignored, only the one at
+stale time is answered, and a link goes stale every cycle and closes whenever
+that one goes out late. So the initiator reports the round trip measured
+through to the RTT packet's send (plus 20 ms for the send itself), the
+responder adopts that number, the interval is rounded up rather than down, and
+on the move to stale the initiator always sends a keepalive.
+
+The same responder rule ignores a keepalive sent while the responder itself is
+still talking to us. The initiator owes the responder inbound traffic too, so
+it sends a keepalive after an interval of its own outbound silence, and on a
+link the responder streams to (a partyline room relaying a peer's audio) that
+one goes out while the responder's last send is recent and draws no reply. The
+reference initiator gates every keepalive to one per interval, so its next one
+for inbound silence comes an interval later, at about stale time, and the link
+lives on whether that single reply arrives inside the grace. `Link::link_watchdog`
+keeps the two triggers apart: outbound silence sends on `_last_outbound`
+alone, inbound silence sends once it reaches the interval regardless of an
+earlier outbound-triggered keepalive (the responder's last send is then at
+least an interval old, so it answers), and while inbound stays silent the
+initiator repeats every quarter interval — an ignored keepalive does not move
+the responder's outbound clock, so a responder whose interval is somewhat
+longer than ours still answers well before stale.
 
 ### 5.4 Outbound delivery-proof tracking
 
@@ -1429,9 +1462,15 @@ transaction as a `tx_proven` increment and carries µR's own measurement of that
 packet's round trip, so a consumer that sees the counter move reads the
 measurement instead of timing the poll that noticed — `linkTick` runs at 1 Hz,
 which would round a 200 ms round trip up to a second. A consumer whose peer
-proves nothing (an RRC hub) says so with `rnsdLinkExpectProofs(tag, false)`;
-that link then tracks no receipts, its counters stay still, and an unproven
-LINKIDENTIFY is not sent a second time. Resource transfers don't use packet
+proves nothing (an RRC hub, a Partyline server) says so with
+`rnsdLinkExpectProofs(tag, false)`; that link then tracks no receipts and
+asks µR for none (`Packet::create_receipt(false)` on every send: an unsettled
+receipt holds internal RAM until it times out, and a 50 packets-a-second
+stream would exhaust the heap with them), its counters stay still, an unproven LINKIDENTIFY is not sent a second time, and
+the peer's packets are not proved either — the Python reference's link
+initiator never proves link packets, and on a link that streams (voice at 50
+packets a second) proving each one would double the packets sent. Resource
+transfers don't use packet
 receipts — the Resource ACK (`RNSD_LINK_RESOURCE_OUTBOUND_DONE`) is already
 proof-grade.
 
@@ -1535,7 +1574,9 @@ channel.
   recall()`**, not `recall()` alone: on a churning mesh a cached identity can
   outlive its path-table entry, and a Link request with no next hop is silently
   dropped (→ `establish_timeout`); `channelTick` keeps re-requesting the path
-  while awaiting. On `active` the slot calls `link.get_channel()`, registers the
+  while awaiting. A channel whose Link never establishes expires the path to
+  its destination as it fails, so the consumer's next open rediscovers it.
+  On `active` the slot calls `link.get_channel()`, registers the
   receive callback, and flushes a bounded pre-active **outbox** (up to 16
   messages — larger than the Link outbox because Channel is itself the
   reliability layer).

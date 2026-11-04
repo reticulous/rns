@@ -131,16 +131,16 @@ enum : uint8_t {
                                          * with (rnsdLinkOpen identity_key).
                                          * Sent via rnsdLinkIdentify(). */
     RNSD_LINK_AUX_PROOFS       = 0x05,  /* payload: rnsd_link_proofs_t —
-                                         * whether the peer proves our
-                                         * packets. Sent via
-                                         * rnsdLinkExpectProofs(). */
+                                         * whether the link's protocol has
+                                         * delivery proofs, either way. Sent
+                                         * via rnsdLinkExpectProofs(). */
 };
 
 /** Proof expectation (RNSD_PORT_LINK aux). Sent by rnsdLinkExpectProofs(). */
 typedef struct {
     uint8_t  op;            /* RNSD_LINK_AUX_PROOFS */
     char     tag[24];       /* link tag (rnsdLinkOpen) */
-    uint8_t  expect;        /* 0 = the peer proves nothing: don't track */
+    uint8_t  expect;        /* 0 = no proofs: don't track ours, don't prove theirs */
 } rnsd_link_proofs_t;
 static_assert(sizeof(rnsd_link_proofs_t) <= ITS_MAX_MSG_DATA,
               "rnsd_link_proofs_t must fit ITS_MAX_MSG_DATA");
@@ -295,7 +295,8 @@ enum rns_iface_mode : uint8_t {
  *  (Transport::derive_ifac). Both empty => an open (non-IFAC) interface.
  *  `ifac_netkey` is a secret — interfaces read it from `secrets.*` storage. */
 typedef struct {
-    char     name[24];      /* "tcp/0", "auto", "lora/0", "tcp_in/<addr:port>" */
+    char     name[24];      /* "tcp/0", "auto", "lora/0", "tcp_in/<addr>#<n>";
+                               unique among registered ifaces, or refused */
     uint16_t mtu;           /* bytes — RNS protocol MTU is 500 */
     uint32_t bitrate;       /* bits/sec on the wire */
     uint8_t  mode;          /* rns_iface_mode */

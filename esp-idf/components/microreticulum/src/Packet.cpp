@@ -901,7 +901,9 @@ bool PacketReceipt::validate_link_proof(const Bytes& proof, const Link& link, co
 				 * measurement every timer above the link is scaled by. */
 				const_cast<Link&>(link).rtt_sample(_object->_concluded_at - _object->_sent_at);
 				//z _object->_proof_packet = proof_packet;
-				//z link.last_proof(_object->_concluded_at);
+				/* A proof is the peer heard from: the watchdog's last_inbound
+				 * takes the later of it and the last packet, as in RNS. */
+				const_cast<Link&>(link).last_proof(_object->_concluded_at);
 
 				if (_object->_callbacks._delivery) {
 					try {

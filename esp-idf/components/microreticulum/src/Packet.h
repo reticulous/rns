@@ -307,6 +307,7 @@ namespace RNS {
 		inline void link(const Link& link) { assert(_object); _object->_link = link; }
 		inline void receiving_interface(const Interface& receiving_interface) { assert(_object); _object->_receiving_interface = receiving_interface; }
 		inline void sent(bool sent) { assert(_object); _object->_sent = sent; }
+		inline void create_receipt(bool create_receipt) { assert(_object); _object->_create_receipt = create_receipt; }
 		inline void sent_at(double sent_at) { assert(_object); _object->_sent_at = sent_at; }
 		inline void receipt(const PacketReceipt& receipt) { assert(_object); _object->_receipt = receipt; }
 		inline void hops(uint8_t hops) { assert(_object); _object->_hops = hops; }

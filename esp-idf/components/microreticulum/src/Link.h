@@ -314,6 +314,7 @@ namespace RNS {
 		void request_time(double time);
 		void last_inbound(double time);
 		void last_outbound(double time);
+		void last_proof(double time);
 		void increment_tx();
 		void increment_txbytes(uint16_t bytes);
 		void status(Type::Link::status status);

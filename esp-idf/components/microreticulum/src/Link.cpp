@@ -39,6 +39,8 @@ using namespace RNS::Type::Link;
 using namespace RNS::Cryptography;
 using namespace RNS::Utilities;
 
+static constexpr double RTT_SEND_ALLOWANCE = 0.02;   /* s */
+
 /*static*/ uint8_t Link::resource_strategies = ACCEPT_NONE | ACCEPT_APP | ACCEPT_ALL;
 
 /*static*/ std::set<link_mode> Link::ENABLED_MODES = {MODE_AES256_CBC};
@@ -525,8 +527,22 @@ void Link::validate_proof(const Packet& packet) {
 	}
 }
 
+/* The responder takes max(its own measurement, ours) as the link's round trip,
+ * and its measurement runs from the request's arrival to this packet's, so it
+ * includes our proof validation and this send. It derives its keepalive
+ * interval from that and answers a keepalive only once that interval has
+ * passed since it last sent anything. Reporting the round trip through to this
+ * send (plus an allowance for the send itself) makes the responder adopt our
+ * number, so both sides derive the same interval and our keepalives are not
+ * ignored as early. Repeats of this packet in handshake repair report the
+ * longer span the responder measures then. */
 void Link::send_rtt() {
 	assert(_object);
+	double through_now = OS::time() - _object->_request_time + RTT_SEND_ALLOWANCE;
+	if (through_now > _object->_rtt) {
+		_object->_rtt = through_now;
+		update_keepalive();
+	}
 	//p rtt_data = umsgpack.packb(self.rtt)
 	MsgPack::Packer packer;
 	packer.serialize(_object->_rtt);
@@ -747,7 +763,8 @@ uint16_t Link::get_mtu() {
 */
 uint16_t Link::get_mdu() {
 	assert(_object);
-	if (_object->_status == ACTIVE) {
+	/* A stale link still carries packets until it is closed, as in RNS. */
+	if (_object->_status == ACTIVE || _object->_status == STALE) {
 		return _object->_mdu;
 	}
 	return 0;
@@ -970,10 +987,12 @@ void Link::start_watchdog() {
 // enforced by Transport::jobs' half-open reap, so this covers only the
 // steady-state phases:
 //
-//   - The initiator sends a keepalive (0xFF) once nothing has been received,
-//     or nothing sent, for KEEPALIVE seconds; the responder answers with 0xFE
-//     (Link::receive), refreshing the initiator's _last_inbound. The
-//     responder never originates keepalives — it only watches for silence.
+//   - The initiator sends a keepalive (0xFF) once nothing has been sent for
+//     KEEPALIVE seconds, and once nothing has been received for KEEPALIVE
+//     seconds, repeating the latter every quarter interval while inbound
+//     stays silent; the responder answers with 0xFE (Link::receive),
+//     refreshing the initiator's _last_inbound. The responder never
+//     originates keepalives — it only watches for silence.
 //   - Either side that sees no inbound for STALE_TIME marks the link STALE
 //     and (initiator) sends a final keepalive, then tears the link down
 //     after an RTT-scaled grace if still silent. Any inbound packet flips
@@ -986,17 +1005,33 @@ void Link::link_watchdog() {
 		double last_inbound = std::max(std::max(_object->_last_inbound, _object->_last_proof),
 		                               _object->_activated_at);
 
-		if (now >= last_inbound + _object->_keepalive ||
-		    now >= _object->_last_outbound + _object->_keepalive) {
-			// A silent peer never advances _last_inbound and an outbound
-			// keepalive does not refresh our own inbound clock, so gate on
-			// _last_keepalive to emit at most one keepalive per interval.
-			if (_object->_initiator && now >= _object->_last_keepalive + _object->_keepalive) {
+		const double ka = _object->_keepalive;
+		if (now >= last_inbound + ka || now >= _object->_last_outbound + ka) {
+			// An upstream responder answers only once it has itself sent
+			// nothing for its keepalive interval. A keepalive sent for our
+			// outbound silence while the peer still talks to us refreshes
+			// its inbound clock but draws no reply, so it must not hold back
+			// the one for inbound silence; and while inbound stays silent we
+			// repeat every quarter interval (an ignored keepalive does not
+			// move the responder's outbound clock), so a responder whose
+			// interval is a little longer than ours still answers well
+			// before stale.
+			bool inbound_due = now >= last_inbound + ka &&
+				(_object->_last_keepalive < last_inbound + ka ||
+				 now >= _object->_last_keepalive + ka / 4);
+			bool outbound_due = now >= _object->_last_outbound + ka;
+			bool sent_keepalive = false;
+			if (_object->_initiator && (inbound_due || outbound_due)) {
 				send_keepalive();
 				_object->_last_keepalive = now;
+				sent_keepalive = true;
 			}
 
 			if (now >= last_inbound + _object->_stale_time) {
+				if (_object->_initiator && !sent_keepalive) {
+					send_keepalive();
+					_object->_last_keepalive = now;
+				}
 				_object->_stale_deadline = now
 					+ _object->_rtt * _object->_keepalive_timeout_factor
 					+ Type::Link::STALE_GRACE;
@@ -1116,14 +1151,16 @@ void Link::__watchdog_job() {
  * carries a new packet hash, so the proof that matches it is unambiguously the
  * one for that transmission and not for an earlier attempt.
  *
- * The keepalive and stale intervals are derived from the same number, so they
- * follow it here rather than keeping the establishment reading. */
+ * The keepalive and stale intervals keep the establishment reading: the peer
+ * derives its own from that same handshake and never revises them, and a
+ * responder answers a keepalive only once its own interval has passed, so
+ * intervals that drifted apart would have keepalives ignored or a link reaped
+ * early. */
 void Link::rtt_sample(double sample) {
 	assert(_object);
 	if (sample <= 0.0) return;
 	if (_object->_rtt <= 0.0) _object->_rtt = sample;
 	else                      _object->_rtt += 0.25 * (sample - _object->_rtt);
-	update_keepalive();
 }
 
 void Link::update_keepalive() {
@@ -1131,7 +1168,7 @@ void Link::update_keepalive() {
 	double ka = _object->_rtt * ((double)Type::Link::KEEPALIVE_MAX / Type::Link::KEEPALIVE_MAX_RTT);
 	if (ka > Type::Link::KEEPALIVE_MAX) ka = Type::Link::KEEPALIVE_MAX;
 	if (ka < Type::Link::KEEPALIVE_MIN) ka = Type::Link::KEEPALIVE_MIN;
-	_object->_keepalive  = (uint16_t)ka;
+	_object->_keepalive  = (uint16_t)ceil(ka);
 	_object->_stale_time = (uint16_t)(_object->_keepalive * Type::Link::STALE_FACTOR);
 }
 
@@ -2281,6 +2318,11 @@ void Link::request_time(double time) {
 void Link::last_inbound(double time) {
 	assert(_object);
 	_object->_last_inbound = time;
+}
+
+void Link::last_proof(double time) {
+	assert(_object);
+	_object->_last_proof = time;
 }
 
 void Link::last_outbound(double time) {

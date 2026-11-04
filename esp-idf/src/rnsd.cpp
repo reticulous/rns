@@ -375,6 +375,9 @@ static double ourDestRetryDelay(int attempts) {
 /* A link or channel waiting for a path asks again this often inside its budget. */
 #define RNSD_PATH_REASK_S             30.0
 
+/* The task's main loop yields one tick after this much work without blocking. */
+#define RNSD_BUSY_YIELD_US            100000
+
 /* ─────────────── Identity ─────────────── */
 
 static const char* mode_name(uint8_t mode)
@@ -5664,6 +5667,7 @@ struct link_conn_t {
     uint32_t             link_timeout_ms;/* consumer override; 0 = ref-impl budget */
     double               dead_at;       /* OS::time() entered CLOSED/FAILED; 0 = n/a */
     bool                 pend_used;     /* one-packet pre-active outbox */
+    uint32_t             pend_dropped;  /* sends dropped while the outbox was full */
     std::vector<uint8_t> pend_bytes;
 
     /* Delivery-proof tracking for consumer packets sent over this Link.
@@ -5675,7 +5679,14 @@ struct link_conn_t {
      * so both outcomes are observed by polling. */
     RNS::PacketReceipt   tx_receipt{RNS::Type::NONE};
     double               tx_receipt_deadline;   /* 0 = none pending */
-    bool                 no_proofs;     /* the peer proves nothing (rnsdLinkExpectProofs) */
+    bool                 no_proofs;     /* no delivery proofs either way (rnsdLinkExpectProofs) */
+
+    /* Consumer packet counters, kept here on the hot path and published to
+     * rnsd.links.<tag>.{tx,rx}_packets / last_{outbound,inbound}_s by linkTick,
+     * so a stream of packets costs no storage write per packet. */
+    uint32_t             tx_count, rx_count;
+    uint32_t             tx_published, rx_published;
+    double               last_out, last_in;
 
     /* Resource transfer. One in-flight resource per link in v1
      * (transfers are sequential). consumer_task is where the
@@ -5733,6 +5744,11 @@ struct link_conn_t {
     uint16_t             pend_req_port;
     TaskHandle_t         pend_req_task;
     bool                 pend_req_packed;
+
+    /* First hop as last published to rnsd.links.<tag>.{iface,bitrate}
+     * (linkPublishHop); "" / 0 = not yet published. */
+    char                 hop_iface[24];
+    uint32_t             hop_bitrate;
 };
 
 static link_conn_t* s_link_conns = nullptr;
@@ -5864,6 +5880,61 @@ static void linkSetInt(const link_conn_t& c, const char* field, int v)
     char k[96];
     linkKey(c, field, k, sizeof(k));
     storageSet(k, v);
+}
+
+/* The first hop the link's outbound packets take, as Transport::outbound
+ * picks it: the link's attached interface when it is one of our current OUT
+ * interfaces, else every OUT interface (the pin is unmatchable or not set
+ * yet, so the packet is broadcast) — then the slowest of them is the hop
+ * that bounds the stream. Publishes rnsd.links.<tag>.iface (interface short
+ * name) and .bitrate (that interface's registered nominal bitrate, bits/s;
+ * 0 = unknown) whenever either changes. Called on activation and from the
+ * 1 Hz linkTick, so a re-pin or an interface going away shows within a
+ * second. Caller brackets storage writes when batching. */
+static void linkPublishHop(link_conn_t& c)
+{
+    if (!c.link) return;
+    std::string name;
+    uint32_t    bitrate = 0;
+    try {
+        const RNS::Interface& pin = c.link.attached_interface();
+        std::string pin_name = pin ? pin.toString() : std::string();
+        bool matched = false;
+        if (!pin_name.empty()) {
+            for (auto& [h, ifc] : RNS::Transport::get_interfaces()) {
+                if (ifc.OUT() && ifc.toString() == pin_name) {
+                    name = ifaceShortName(pin_name);
+                    bitrate = ifc.bitrate();
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (!matched) {
+            bool any = false;
+            for (auto& [h, ifc] : RNS::Transport::get_interfaces()) {
+                if (!ifc.OUT()) continue;
+                uint32_t br = ifc.bitrate();
+                /* An unknown (0) bitrate never hides a known slow one. */
+                if (!any || (br && (bitrate == 0 || br < bitrate))) {
+                    name = ifaceShortName(ifc.toString());
+                    bitrate = br;
+                    any = true;
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        warn("link[%s]: first-hop lookup threw: %s", c.tag, e.what());
+        return;
+    }
+    if (bitrate == c.hop_bitrate && strcmp(name.c_str(), c.hop_iface) == 0) return;
+    if (c.hop_iface[0])
+        info("link[%s]: first hop now %s (%u bit/s, was %s)", c.tag,
+             name.empty() ? "<none>" : name.c_str(), (unsigned)bitrate, c.hop_iface);
+    safeStrncpy(c.hop_iface, name.c_str(), sizeof(c.hop_iface));
+    c.hop_bitrate = bitrate;
+    linkSetStr(c, "iface", c.hop_iface);
+    linkSetInt(c, "bitrate", (int)bitrate);
 }
 
 static void linkBumpInt(link_conn_t& c, const char* field)
@@ -6029,15 +6100,15 @@ static void onLinkEstablishedCb(RNS::Link& link)
     storageBegin();
     linkSetStr(*c, "link_id", lid.c_str());
     linkSetInt(*c, "mtu", (int)link.get_mtu());
+    linkSetInt(*c, "mdu", (int)link.get_mdu());
     linkSetInt(*c, "rtt_ms", (int)(link.rtt() * 1000.0));
     linkSetInt(*c, "activated_s", (int)RNS::Utilities::OS::time());
     /* Interface (raw mR short name) + hop count, so lxmf's resolveDirectSends can
      * record routing telemetry for an outbound DIRECT/Resource send (the pill +
-     * interface in the message-detail box). The link rides one interface, set on
-     * its LRPROOF ingress. */
+     * interface in the message-detail box). linkTick keeps iface/bitrate
+     * current as the link re-pins. */
     {
-        const RNS::Interface& lif = link.attached_interface();
-        if (lif) linkSetStr(*c, "iface", ifaceShortName(lif.toString()).c_str());
+        linkPublishHop(*c);
         if (c->dest_hash.size() == RNSD_DEST_HASH_LEN)
             linkSetInt(*c, "hops", (int)RNS::Transport::hops_to(c->dest_hash));
     }
@@ -6076,18 +6147,21 @@ static void onLinkEstablishedCb(RNS::Link& link)
         try {
             RNS::Packet pkt(c->link,
                             RNS::Bytes(c->pend_bytes.data(), c->pend_bytes.size()));
+            if (c->no_proofs) pkt.create_receipt(false);
             linkTrackTxReceipt(*c, pkt.send());
-            storageBegin();
-            linkSetInt(*c, "tx_packets", 1);
-            linkSetInt(*c, "last_outbound_s", (int)RNS::Utilities::OS::time());
-            storageEnd();
+            c->tx_count++;
+            c->last_out = RNS::Utilities::OS::time();
             info("link[%s]: flushed queued %zuB on establish",
                  c->tag, c->pend_bytes.size());
         } catch (const std::exception& e) {
             warn("link[%s]: flush send threw: %s", c->tag, e.what());
             linkSetError(*c, "flush_failed");
         }
+        if (c->pend_dropped)
+            info("link[%s]: %u newer sends were dropped while establishing",
+                 c->tag, (unsigned)c->pend_dropped);
         c->pend_used = false;
+        c->pend_dropped = 0;
         c->pend_bytes.clear();
     }
 
@@ -6210,15 +6284,13 @@ static void onLinkPacketCb(const RNS::Bytes& plaintext, const RNS::Packet& packe
     /* Delivered to the consumer task → emit the delivery proof now, mirroring
      * upstream LXMF (which proves inside its delivery callback). A failed
      * hand-off above returns without proving, so a black-holed message is
-     * never acked and the sender retries. Gated on the operator dial. */
-    if (s_prove_incoming)
+     * never acked and the sender retries. Gated on the operator dial, and
+     * never done on a link whose protocol has no proofs (rnsdLinkExpectProofs
+     * false) — the reference initiator never proves link packets. */
+    if (s_prove_incoming && !c->no_proofs)
         const_cast<RNS::Packet&>(packet).prove();
-    char k[96];
-    storageBegin();
-    linkKey(*c, "rx_packets", k, sizeof(k));
-    storageSet(k, storageGetInt(k, 0) + 1);
-    linkSetInt(*c, "last_inbound_s", (int)RNS::Utilities::OS::time());
-    storageEnd();
+    c->rx_count++;
+    c->last_in = RNS::Utilities::OS::time();
 }
 
 /* ─────────────── Resource transfer ───────────────
@@ -6699,6 +6771,15 @@ static void linkFreeSlot(link_conn_t& c)
 
     char prefix[64];
     snprintf(prefix, sizeof(prefix), "rnsd.links.%s", c.tag);
+    {
+        char k[96], lid[72];
+        snprintf(k, sizeof(k), "%s.link_id", prefix);
+        storageGetStr(k, lid, sizeof(lid), "");
+        if (lid[0]) {
+            snprintf(k, sizeof(k), "rnsd.links.byid.%s", lid);
+            storageUnset(k);
+        }
+    }
     storageDeleteTree(prefix);
     if (c.handle >= 0) itsDisconnect(c.handle);
     c.used = false;
@@ -6709,10 +6790,13 @@ static void linkFreeSlot(link_conn_t& c)
     c.aspect.clear();
     c.identity_key.clear();
     c.pend_used = false;
+    c.pend_dropped = 0;
     c.pend_bytes.clear();
     c.tx_receipt = RNS::PacketReceipt{RNS::Type::NONE};
     c.tx_receipt_deadline = 0;
     c.no_proofs = false;
+    c.tx_count = c.rx_count = c.tx_published = c.rx_published = 0;
+    c.last_out = c.last_in = 0;
     if (c.pend_res_used && c.pend_res_buf) free(c.pend_res_buf);
     c.pend_res_used = false;
     c.pend_res_buf = nullptr;
@@ -6733,6 +6817,8 @@ static void linkFreeSlot(link_conn_t& c)
     c.pend_req_cid = 0;
     c.pend_req_port = 0;
     c.pend_req_task = nullptr;
+    c.hop_iface[0] = '\0';
+    c.hop_bitrate = 0;
     c.pend_req_packed = false;
     c.pend_identify = false;
     c.pend_identify_key.clear();
@@ -6848,6 +6934,24 @@ static void linkTick(void)
         link_conn_t& c = s_link_conns[j];
         if (!c.used) continue;
 
+        /* Publish the consumer packet counters (counted on the hot path). */
+        if (c.tx_count != c.tx_published || c.rx_count != c.rx_published) {
+            storageBegin();
+            if (c.tx_count != c.tx_published) {
+                linkSetInt(c, "tx_packets", (int)c.tx_count);
+                linkSetInt(c, "last_outbound_s", (int)c.last_out);
+            }
+            if (c.rx_count != c.rx_published) {
+                linkSetInt(c, "rx_packets", (int)c.rx_count);
+                linkSetInt(c, "last_inbound_s", (int)c.last_in);
+            }
+            storageEnd();
+            c.tx_published = c.tx_count;
+            c.rx_published = c.rx_count;
+        }
+
+        if (c.state == LST_ACTIVE) linkPublishHop(c);
+
         /* Settle the outstanding packet delivery-proof receipt, if any.
          * mR validates link-packet proofs (flipping the receipt to
          * DELIVERED) but never fires timeout callbacks, so poll status —
@@ -6927,11 +7031,16 @@ static void linkTick(void)
                 RNS::Link old = c.link;
                 c.link = RNS::Link{RNS::Type::NONE};
                 try { if (old) old.teardown(); } catch (...) {}
+                /* As upstream does for a link that never established: the next
+                 * hop may be gone (an interface down on the far side), so a
+                 * retry rediscovers the path instead of re-dialling it. */
+                try { RNS::Transport::expire_path(c.dest_hash); }
+                catch (const std::exception& e) { warn("link[%s]: expire_path threw: %s", c.tag, e.what()); }
                 int age = -1;
                 bool alive = linkPeerAlive(c, now, &age);
                 if (alive && c.attempts < RNSD_LINK_ATTEMPTS) {
-                    info("link[%s]: establishment timed out; peer alive %ds ago, trying a fresh link",
-                         c.tag, age);
+                    info("link[%s]: establishment timed out; peer alive %ds ago, "
+                         "path expired, trying a fresh link", c.tag, age);
                     linkRetry(c, now);
                     break;
                 }
@@ -7001,6 +7110,7 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     c->dead_at      = 0;
     c->estab_deadline = 0;
     c->pend_used    = false;
+    c->pend_dropped = 0;
     c->pend_bytes.clear();
     c->pend_res_used = false;
     c->pend_res_buf = nullptr;
@@ -7072,30 +7182,24 @@ static int onLinkConnect(int handle, const void* data, size_t len)
     return c->ref;
 }
 
-static void onLinkRecv(int handle, size_t /*bytesAvail*/)
+static void linkConsumerSend(link_conn_t* c, const uint8_t* buf, size_t n)
 {
-    link_conn_t* c = linkFindByHandle(handle);
-    if (!c) return;
-    PSRAM_BSS static uint8_t buf[2048];
-    size_t n = itsRecv(handle, buf, sizeof(buf), 0);
-    if (n == 0) return;
-
     if (c->state == LST_ACTIVE && c->link) {
-        if (n > RNS::Type::Link::MDU) {
+        if (n > c->link.get_mdu()) {
             warn("link[%s]: oversize send %zuB", c->tag, n);
             linkSetError(*c, "oversize");
             return;
         }
         try {
             RNS::Packet pkt(c->link, RNS::Bytes(buf, n));
+            /* A receipt no proof will settle still sits in internal RAM until
+             * it times out; at a streaming consumer's packet rate those
+             * exhaust the heap. */
+            if (c->no_proofs) pkt.create_receipt(false);
             linkTrackTxReceipt(*c, pkt.send());
             linkTouch(*c);
-            char k[96];
-            storageBegin();
-            linkKey(*c, "tx_packets", k, sizeof(k));
-            storageSet(k, storageGetInt(k, 0) + 1);
-            linkSetInt(*c, "last_outbound_s", (int)RNS::Utilities::OS::time());
-            storageEnd();
+            c->tx_count++;
+            c->last_out = RNS::Utilities::OS::time();
         } catch (const std::exception& e) {
             warn("link[%s]: send threw: %s", c->tag, e.what());
             linkSetError(*c, "send_threw");
@@ -7105,12 +7209,28 @@ static void onLinkRecv(int handle, size_t /*bytesAvail*/)
 
     /* Pre-active: one-packet outbox, drop-newer. */
     if (c->pend_used) {
-        warn("link[%s]: send queue full, dropping newer %zuB", c->tag, n);
-        linkSetError(*c, "send_queue_full");
+        if (c->pend_dropped++ == 0) {
+            warn("link[%s]: send queue full, dropping newer %zuB", c->tag, n);
+            linkSetError(*c, "send_queue_full");
+        }
         return;
     }
     c->pend_used = true;
     c->pend_bytes.assign(buf, buf + n);
+}
+
+/* Drains every queued packet: a recv dispatch is not owed per packet, so a
+ * consumer sending a steady stream would otherwise back up its port. */
+static void onLinkRecv(int handle, size_t /*bytesAvail*/)
+{
+    PSRAM_BSS static uint8_t buf[2048];
+    for (;;) {
+        link_conn_t* c = linkFindByHandle(handle);
+        if (!c) return;
+        size_t n = itsRecv(handle, buf, sizeof(buf), 0);
+        if (n == 0) return;
+        linkConsumerSend(c, buf, n);
+    }
 }
 
 static void onLinkDisconnect(int ref)
@@ -7324,6 +7444,7 @@ static void onIncomingLinkEstablished(RNS::Link& link)
     c->dead_at      = 0;
     c->estab_deadline = 0;
     c->pend_used    = false;
+    c->pend_dropped = 0;
     c->pend_bytes.clear();
     c->pend_res_used = false;
     c->pend_res_buf = nullptr;
@@ -7369,6 +7490,7 @@ static void onIncomingLinkEstablished(RNS::Link& link)
     linkSetInt(*c, "opened_s", (int)c->opened_at);
     linkSetInt(*c, "activated_s", (int)c->opened_at);
     linkSetStr(*c, "last_error", "");
+    linkPublishHop(*c);
     linkPublishState(*c);
     {
         char k[96];
@@ -7505,7 +7627,17 @@ static void chanFreeSlot(chan_conn_t& c) {
     if (c.link) { try { c.link.teardown(); } catch (...) {} }
     c.channel = RNS::Channel{RNS::Type::NONE};
     c.link    = RNS::Link{RNS::Type::NONE};
-    if (c.tag[0]) { char p[64]; snprintf(p, sizeof(p), "rnsd.chan.%s", c.tag); storageDeleteTree(p); }
+    if (c.tag[0]) {
+        char p[64], k[96], lid[72];
+        snprintf(p, sizeof(p), "rnsd.chan.%s", c.tag);
+        snprintf(k, sizeof(k), "%s.link_id", p);
+        storageGetStr(k, lid, sizeof(lid), "");
+        if (lid[0]) {
+            snprintf(k, sizeof(k), "rnsd.chan.byid.%s", lid);
+            storageUnset(k);
+        }
+        storageDeleteTree(p);
+    }
     if (c.handle >= 0) { itsDisconnect(c.handle); }
     c.used = false; c.handle = -1; c.ref = -1; c.tag[0] = '\0'; c.pub_outstanding = -1;
     c.dest_hash = RNS::Bytes(); c.aspect.clear(); c.identity_key.clear();
@@ -8144,6 +8276,9 @@ static void channelTick() {
             case LST_ESTABLISHING:
                 if (now >= c.estab_deadline) {
                     if (c.link) { try { c.link.teardown(); } catch (...) {} }
+                    /* A link that never established expires its path, so the
+                     * consumer's next open rediscovers it. */
+                    try { RNS::Transport::expire_path(c.dest_hash); } catch (...) {}
                     c.state = LST_FAILED; chanSetError(c, "establish_timeout"); chanPublishState(c); c.dead_at = now;
                 }
                 break;
@@ -8931,8 +9066,25 @@ static void rnsdTaskMain(void*)
     uint32_t jobsPrevPktsIn = s_stats.packets_in;
     int      jobsDeferred   = 0;
 
+    /* itsPoll only blocks when nothing is pending, so a peer that keeps the
+     * inbound rings non-empty (each announce costs a signature check, each
+     * link packet a decrypt) would keep this task runnable indefinitely and
+     * starve every lower-priority task on its core, IDLE included, into the
+     * task watchdog. Each wake first polls without blocking: finding nothing
+     * to do means the rings ran dry, so the task is idle and blocks for the
+     * next deadline. Past RNSD_BUSY_YIELD_US without such an idle moment,
+     * give the core up for one tick; the backlog waits in the rings
+     * meanwhile. A steady stream the task keeps up with never yields. */
+    int64_t busySince = esp_timer_get_time();
+
     for (;;) {
-        itsPoll(nextDeadline());
+        if (!itsPoll(0)) {
+            busySince = esp_timer_get_time();
+            itsPoll(nextDeadline());
+        } else if (esp_timer_get_time() - busySince >= RNSD_BUSY_YIELD_US) {
+            vTaskDelay(1);
+            busySince = esp_timer_get_time();
+        }
 
         /* Drive Channel reliability every wake — proof arrivals wake itsPoll,
          * so delivery detection and window-freeing are prompt. */
