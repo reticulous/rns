@@ -5749,6 +5749,11 @@ struct link_conn_t {
      * (linkPublishHop); "" / 0 = not yet published. */
     char                 hop_iface[24];
     uint32_t             hop_bitrate;
+
+    /* As last published to rnsd.links.<tag>.{heard_s,keepalive_s}
+     * (linkPublishHeard); 0 = not yet published. */
+    int                  heard_published;
+    int                  ka_published;
 };
 
 static link_conn_t* s_link_conns = nullptr;
@@ -5935,6 +5940,29 @@ static void linkPublishHop(link_conn_t& c)
     c.hop_bitrate = bitrate;
     linkSetStr(c, "iface", c.hop_iface);
     linkSetInt(c, "bitrate", (int)bitrate);
+}
+
+/* When the link last heard its peer, any packet including keepalives
+ * (heard_s, OS::time seconds), and the keepalive interval it runs on
+ * (keepalive_s, with rtt_ms beside it: on an inbound link both come from the
+ * initiator's RTT packet). A responder cannot probe a silent initiator, so a
+ * consumer that must judge one sooner than the link's own stale timer reads
+ * these. Published on change by the link tick. */
+static void linkPublishHeard(link_conn_t& c, double now)
+{
+    if (!c.link) return;
+    int heard = (int)(now - c.link.no_inbound_for());
+    int ka    = (int)c.link.keepalive();
+    if (heard == c.heard_published && ka == c.ka_published) return;
+    storageBegin();
+    if (heard != c.heard_published) linkSetInt(c, "heard_s", heard);
+    if (ka != c.ka_published) {
+        linkSetInt(c, "keepalive_s", ka);
+        linkSetInt(c, "rtt_ms", (int)(c.link.rtt() * 1000.0));
+    }
+    storageEnd();
+    c.heard_published = heard;
+    c.ka_published = ka;
 }
 
 static void linkBumpInt(link_conn_t& c, const char* field)
@@ -6819,6 +6847,8 @@ static void linkFreeSlot(link_conn_t& c)
     c.pend_req_task = nullptr;
     c.hop_iface[0] = '\0';
     c.hop_bitrate = 0;
+    c.heard_published = 0;
+    c.ka_published = 0;
     c.pend_req_packed = false;
     c.pend_identify = false;
     c.pend_identify_key.clear();
@@ -6950,7 +6980,10 @@ static void linkTick(void)
             c.rx_published = c.rx_count;
         }
 
-        if (c.state == LST_ACTIVE) linkPublishHop(c);
+        if (c.state == LST_ACTIVE) {
+            linkPublishHop(c);
+            linkPublishHeard(c, now);
+        }
 
         /* Settle the outstanding packet delivery-proof receipt, if any.
          * mR validates link-packet proofs (flipping the receipt to

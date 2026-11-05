@@ -482,15 +482,21 @@ void Destination::receive(const Packet& packet) {
 		}
 		else {
 			// Spangap diagnostic: a packet Transport already matched to this
-			// local destination failed to decrypt. Upstream logs the reason
-			// at DEBUG (Identity::decrypt), invisible at info level — so a
-			// "destination is local" with no delivery looked like silence.
-			// Surface it: this is the signature of a key/identity mismatch
-			// (sender encrypted to a stale/wrong pubkey for this dest).
-			INFOF("Destination %s: inbound %s decrypt FAILED (%zuB ciphertext) — packet dropped (key/identity mismatch?)",
+			// local destination failed to decrypt, logged at info level with
+			// where it came from. A token is ephemeral key 32 + IV 16 +
+			// n*16 + HMAC 32, so a token length that is not a multiple of 16
+			// marks bytes lost or added in transit, not a key mismatch.
+			const Bytes& token = packet.data();
+			const Interface& iface = packet.receiving_interface();
+			INFOF("Destination %s: inbound %s decrypt FAILED (%zuB ciphertext%s) via %s hops %u raw %zuB head %s — packet dropped",
 			      toString().c_str(),
 			      packet.packet_type() == Type::Packet::DATA ? "DATA" : "non-DATA",
-			      packet.data().size());
+			      token.size(),
+			      (token.size() % 16) ? ", not a multiple of 16: truncated/corrupt" : "",
+			      iface ? iface.name().c_str() : "?",
+			      (unsigned)packet.hops(),
+			      packet.raw().size(),
+			      token.left(8).toHex().c_str());
 		}
 	}
 }
